@@ -36,6 +36,12 @@ class MockModel:
     def get_device(self):
         return self._device
 
+    def kv_cache_spec(self):
+        """Matches nanochat.model.base.BaseModel.kv_cache_spec, which Engine.generate calls to
+        size the KV cache."""
+        m = self.config
+        return {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+
     def forward(self, ids, kv_cache=None):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape

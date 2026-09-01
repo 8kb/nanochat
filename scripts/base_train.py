@@ -18,14 +18,14 @@ import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.model import get_model_class, get_config_class
+from nanochat.model.components.linear import Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -47,6 +47,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
+parser.add_argument("--arch", type=str, default="gpt", help="architecture name, registered under nanochat/model/ (see nanochat.model.registry)")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -127,25 +128,28 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data).
+    Architecture is selected via --arch; the config class it registers must implement
+    from_depth(...) (the --depth/--aspect-ratio/--head-dim muP-style dial), matching
+    GPTConfig.from_depth in nanochat/model/gpt/config.py."""
+    config_cls = get_config_class(args.arch)
+    model_cls = get_model_class(args.arch)
+    assert hasattr(config_cls, "from_depth"), (
+        f"Architecture {args.arch!r} ({config_cls.__name__}) has no from_depth(...) classmethod; "
+        "the --depth/--aspect-ratio/--head-dim CLI dial requires one (see GPTConfig.from_depth)."
+    )
+    config = config_cls.from_depth(
+        depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+        max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
-        model_meta = GPT(config)
+        model_meta = model_cls(config)
     return model_meta
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
-model_config_kwargs = asdict(model_config)
+model_config_kwargs = model_config.to_dict()
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized

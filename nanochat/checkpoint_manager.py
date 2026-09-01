@@ -8,7 +8,7 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.model import get_model_class, config_from_dict
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -18,25 +18,6 @@ logger = logging.getLogger(__name__)
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
-
-def _patch_missing_config_keys(model_config_kwargs):
-    """Add default values for new config keys missing in old checkpoints."""
-    # Old models were trained with full context (no sliding window)
-    if "window_pattern" not in model_config_kwargs:
-        model_config_kwargs["window_pattern"] = "L"
-        log0(f"Patching missing window_pattern in model config to 'L'")
-
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
-    n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -91,13 +72,15 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    model_config_kwargs = dict(meta_data["model_config"]) # copy, don't mutate meta_data in place
+    arch = model_config_kwargs.get("arch", "gpt") # old checkpoints predate the "arch" key
+    model_cls = get_model_class(arch)
+    model_config_kwargs = model_cls.patch_config_dict(model_config_kwargs, log=log0)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
+    model_config = config_from_dict(model_config_kwargs)
+    model_data = model_cls.patch_state_dict(model_data, model_config, log=log0)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = model_cls(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init

@@ -100,13 +100,15 @@ class KVCache:
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         # Current sequence length per batch element (FA3 needs int32)
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        # Previous token's normalized embedding for smear (set by model forward pass)
-        self.prev_embedding = None
+        # Extra per-model state that isn't shaped like a k/v tensor (e.g. GPT's "smear" reads/
+        # writes state["prev_embedding"]). Generic so architectures can stash whatever they need
+        # without KVCache knowing about any one architecture.
+        self.state = {}
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
-        self.prev_embedding = None
+        self.state = {}
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -132,9 +134,9 @@ class KVCache:
         self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
         self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
-        # Copy smear state: expand batch=1 prev_embedding to num_samples
-        if other.prev_embedding is not None:
-            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+        # Expand any batch=1 extra state (e.g. GPT's smear prev_embedding) to num_samples rows
+        for key, value in other.state.items():
+            self.state[key] = value.expand(self.batch_size, -1, -1).clone()
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -154,6 +156,38 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1, generator=rng)
+
+# -----------------------------------------------------------------------------
+
+@torch.inference_mode()
+def generate_naive(model, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+    """
+    Naive autoregressive streaming inference (no KV cache): recomputes the full forward pass at
+    every step. Useful as a slow-but-simple reference to check the fast KV-cached Engine.generate
+    path against (see the __main__ block below). To keep this simple, assumes:
+    - batch size is 1
+    - ids and the yielded tokens are simple Python lists and ints
+
+    Note: sampling here goes through sample_next_token, which (for top_k > 0) draws from the
+    renormalized top-k distribution via torch.multinomial. This gives the same distribution as,
+    but not necessarily the same draw as, masking to -inf and sampling over the full vocab (the
+    scheme model.generate used before this was extracted) -- greedy (temperature=0) is unaffected
+    and remains bit-identical.
+    """
+    assert isinstance(tokens, list)
+    device = model.get_device()
+    rng = None
+    if temperature > 0:
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+    ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+    for _ in range(max_tokens):
+        logits = model.forward(ids) # (B, T, vocab_size)
+        logits = logits[:, -1, :] # (B, vocab_size)
+        next_ids = sample_next_token(logits, rng, temperature, top_k)
+        ids = torch.cat((ids, next_ids), dim=1)
+        token = next_ids.item()
+        yield token
 
 # -----------------------------------------------------------------------------
 
@@ -192,8 +226,7 @@ class Engine:
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
         # 1) Run a batch 1 prefill of the prompt tokens
-        m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = self.model.kv_cache_spec()
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
@@ -301,7 +334,7 @@ class Engine:
 
 if __name__ == "__main__":
     """
-    Quick inline test to make sure that the naive/slow model.generate function
+    Quick inline test to make sure that the naive/slow generate_naive function
     is equivalent to the faster Engine.generate function here.
     """
     import time
@@ -315,11 +348,11 @@ if __name__ == "__main__":
     kwargs = dict(max_tokens=64, temperature=0.0)
     # set the starting prompt
     prompt_tokens = tokenizer.encode("The chemical formula of water is", prepend=bos_token_id)
-    # generate the reference sequence using the model.generate() function
+    # generate the reference sequence using the generate_naive function
     generated_tokens = []
     torch.cuda.synchronize()
     t0 = time.time()
-    stream = model.generate(prompt_tokens, **kwargs)
+    stream = generate_naive(model, prompt_tokens, **kwargs)
     for token in stream:
         generated_tokens.append(token)
         chunk = tokenizer.decode([token])

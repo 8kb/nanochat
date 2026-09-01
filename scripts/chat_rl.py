@@ -310,13 +310,14 @@ for step in range(num_steps):
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        model_config_kwargs = model.config.to_dict()
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
+                "step": step, # base_eval.py and infer_bench.py both read meta["step"]
                 "model_config": model_config_kwargs,
             }
         )

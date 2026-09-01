@@ -1,0 +1,80 @@
+# Syncing with upstream (karpathy/nanochat)
+
+This fork restructures `nanochat/gpt.py` into `nanochat/model/` to support multiple
+architectures side by side (see [architecture.md](architecture.md)). We still intend to pull
+changes from upstream, so this page exists to make that tractable: where upstream code ended up,
+what changed on the way, and how to bring in a new upstream commit.
+
+There is currently no `upstream` git remote configured. Add one with:
+
+```bash
+git remote add upstream https://github.com/karpathy/nanochat.git
+git fetch upstream
+```
+
+## Where `nanochat/gpt.py` went
+
+Every symbol below was moved **verbatim** (same body, same comments) unless noted. Line numbers
+are from the pre-refactor `nanochat/gpt.py` (555 lines).
+
+| Upstream (`nanochat/gpt.py`) | Now lives in |
+|---|---|
+| `GPTConfig` (28-39) | `nanochat/model/gpt/config.py` — now subclasses `BaseModelConfig`; gained a `from_depth()` classmethod (moved out of `scripts/base_train.py`'s `build_model_meta`, not upstream code) |
+| `norm()` (42-43) | `nanochat/model/components/norm.py` |
+| `Linear` (45-50) | `nanochat/model/components/linear.py` |
+| `has_ve()` (53-55) | `nanochat/model/components/attention.py` |
+| `apply_rotary_emb()` (57-65) | `nanochat/model/components/rope.py` |
+| `CausalSelfAttention` (67-128) | `nanochat/model/components/attention.py` |
+| `MLP` (131-141) | `nanochat/model/components/mlp.py` |
+| `Block` (144-153) | `nanochat/model/components/block.py` |
+| `GPT.__init__` (157-201) | `nanochat/model/gpt/model.py`, `GPT.__init__` |
+| `GPT.init_weights` (203-268) | same, `GPT.init_weights` |
+| `GPT._precompute_rotary_embeddings` (270-285) | `nanochat/model/components/rope.py`, `precompute_rotary_embeddings()` — turned into a free function; call sites now pass `device`/`dtype` explicitly instead of the method inferring them from `self` |
+| `GPT._compute_window_sizes` (287-314) | `nanochat/model/components/windows.py`, `compute_window_sizes()` — free function, same signature shape (`pattern, n_layer, sequence_len`) |
+| `GPT.get_device` (316-317) | `nanochat/model/base.py`, `BaseModel.get_device` — generalized to `next(self.parameters()).device` (same value, not GPT-specific) |
+| `GPT.estimate_flops` / `num_matmul_params` / `estimate_decode_flops` / `estimate_prefill_flops` / `kv_bytes_per_token` / `kv_read_bytes` (319-388) | `nanochat/model/flops.py`, plus thin wrapper methods on `BaseModel` — reworked to operate on `layer_specs()` (a list of `AttentionLayerSpec`) instead of `self.config`/`self.window_sizes` directly. Produces identical numbers for GPT (checked against a real checkpoint, see the "Verification" note below) |
+| `GPT.num_scaling_params` (390-417) | `nanochat/model/gpt/model.py`, `GPT.num_scaling_params` — unchanged, GPT-specific (declared abstract on `BaseModel`) |
+| `GPT.setup_optimizer` (419-457) | same file, unchanged |
+| `GPT.forward` (459-524) | same file, mostly unchanged; the trunk loop (494-507) is factored out into `GPT._forward_trunk` so future depth/residual-topology architectures can override just that piece. `kv_cache.prev_embedding` reads/writes became `kv_cache.state["prev_embedding"]` (see `nanochat/engine.py` below) |
+| `GPT.generate` (526-555) | `nanochat/engine.py`, `generate_naive(model, tokens, ...)` — now a free function (was a model method), reuses `sample_next_token` instead of duplicating temperature/top-k logic. **The one intentional behavior change**: top-k sampling now draws from the renormalized top-k distribution via `multinomial` (same as `Engine.generate` always did) instead of masking to `-inf` and sampling over the full vocab. Same distribution, different draw for a given seed when `top_k > 0`. Greedy (`temperature=0`) is bit-identical. |
+
+`nanochat/gpt.py` itself still exists as a **compatibility shim** re-exporting `GPT`, `GPTConfig`,
+`Linear`, `norm`, `apply_rotary_emb`, `has_ve`, `CausalSelfAttention`, `MLP`, `Block` — so an
+upstream diff that touches `nanochat/gpt.py` and does `from nanochat.gpt import GPT` elsewhere
+still resolves.
+
+## Other call sites that changed
+
+- `nanochat/checkpoint_manager.py` no longer imports `GPT`/`GPTConfig` directly. It looks up the
+  architecture via `nanochat.model.get_model_class` / `config_from_dict`, keyed on an `"arch"`
+  field in `meta["model_config"]` (defaults to `"gpt"` if absent, so old checkpoints keep
+  loading). The old module-private `_patch_missing_config_keys` / `_patch_missing_keys` became
+  `GPT.patch_config_dict` / `GPT.patch_state_dict` classmethods, backed by
+  `nanochat/model/gpt/migrations.py`.
+- `nanochat/engine.py`'s `KVCache.prev_embedding` became a generic `KVCache.state: dict`; GPT's
+  smear reads/writes `state["prev_embedding"]`. `Engine.generate` gets KV-cache geometry from
+  `model.kv_cache_spec()` instead of reading `model.config.n_kv_head` / `n_embd` / `n_head` /
+  `n_layer` directly.
+- `scripts/base_train.py` gained an `--arch` flag (default `"gpt"`); `build_model_meta` looks up
+  the config/model classes via the registry instead of importing `GPT`/`GPTConfig`; checkpoint
+  serialization uses `model_config.to_dict()` instead of `dataclasses.asdict(model_config)` (the
+  only difference is the added `"arch"` key).
+- `scripts/chat_sft.py` and `scripts/chat_rl.py` had their hand-rolled `model_config` dicts
+  (`chat_sft.py` built one field-by-field; `chat_rl.py` used `model.config.__dict__`) replaced
+  with `model.config.to_dict()`. `chat_rl.py`'s save block also gained a `"step"` key that was
+  previously missing (a pre-existing bug: `scripts/base_eval.py` and `scripts/infer_bench.py`
+  both read `meta["step"]` and would `KeyError` on an RL checkpoint).
+
+## Merge procedure for a new upstream commit
+
+1. `git fetch upstream && git log HEAD..upstream/master -- nanochat/gpt.py` to see what changed.
+2. For a change inside one of the functions/classes in the table above: find the new home via
+   the table, apply the diff there by hand (the code is verbatim, so upstream's diff context
+   should still line up almost exactly).
+3. For a change to `nanochat/checkpoint_manager.py`, `nanochat/engine.py`, or the training
+   scripts: check "Other call sites that changed" above first — the surrounding code moved, so a
+   textual patch may not apply, but the same edit intent almost always still makes sense.
+4. For a genuinely new file or a change elsewhere in the repo: apply directly, no mapping needed.
+5. After merging, re-run the golden-checkpoint regression check (see the model card in
+   [architecture.md](architecture.md#verifying-a-change-is-behavior-preserving)) before trusting
+   the result.
