@@ -12,9 +12,10 @@ from nanochat.model.registry import register_model, get_model_class, get_config_
 
 # Import architecture packages so their @register_model decorators run and populate the registry.
 from nanochat.model.gpt import GPT, GPTConfig
+from nanochat.model.llama import Llama, LlamaConfig
 
 __all__ = [
     "BaseModel", "BaseModelConfig", "AttentionLayerSpec", "BaseEmbedding", "BaseBlock", "BaseUnembedding",
     "register_model", "get_model_class", "get_config_class", "config_from_dict",
-    "GPT", "GPTConfig",
+    "GPT", "GPTConfig", "Llama", "LlamaConfig",
 ]

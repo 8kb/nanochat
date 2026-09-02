@@ -97,11 +97,18 @@ def build_model(checkpoint_dir, step, device, phase):
     return model, tokenizer, meta_data
 
 
-def find_largest_model(checkpoints_dir):
+def find_largest_model(checkpoints_dir, arch=None):
     # attempt to guess the model tag: take the biggest model available
     model_tags = [f for f in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, f))]
     if not model_tags:
         raise FileNotFoundError(f"No checkpoints found in {checkpoints_dir}")
+    if arch is not None:
+        # Filter to tags whose latest saved checkpoint is actually this architecture, so two
+        # architectures trained at the same --depth (e.g. gpt's "d12" and llama's "llama_d12")
+        # don't get confused for each other by callers that don't pass an explicit model_tag.
+        model_tags = [t for t in model_tags if _checkpoint_arch(checkpoints_dir, t) == arch]
+        if not model_tags:
+            raise FileNotFoundError(f"No {arch!r} checkpoints found in {checkpoints_dir}")
     # 1) normally all model tags are of the form d<number>, try that first:
     candidates = []
     for model_tag in model_tags:
@@ -125,13 +132,32 @@ def find_last_step(checkpoint_dir):
     last_step = max(int(f.split("_")[-1].split(".")[0]) for f in checkpoint_files)
     return last_step
 
+
+def _checkpoint_arch(checkpoints_dir, model_tag):
+    """Best-effort: the "arch" of a checkpoint tag's latest saved step (meta.json's
+    model_config.arch, defaulting to "gpt" for checkpoints predating that key -- see
+    nanochat.model.base.BaseModelConfig.to_dict). Returns None if the tag has no valid
+    checkpoint at all (an empty or malformed directory), so it never matches a real arch filter."""
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+    try:
+        step = find_last_step(checkpoint_dir)
+    except FileNotFoundError:
+        return None
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return meta.get("model_config", {}).get("arch", "gpt")
+
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, arch=None):
     if model_tag is None:
-        # guess the model tag by defaulting to the largest model
-        model_tag = find_largest_model(checkpoints_dir)
+        # guess the model tag by defaulting to the largest model (of the given arch, if any)
+        model_tag = find_largest_model(checkpoints_dir, arch=arch)
         log0(f"No model tag provided, guessing model tag: {model_tag}")
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     if step is None:
@@ -143,7 +169,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
     return model, tokenizer, meta_data
 
-def load_model(source, *args, **kwargs):
+def load_model(source, *args, arch=None, **kwargs):
     model_dir = {
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
@@ -151,9 +177,9 @@ def load_model(source, *args, **kwargs):
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+    return load_model_from_dir(checkpoints_dir, *args, arch=arch, **kwargs)
 
-def load_optimizer_state(source, device, rank, model_tag=None, step=None):
+def load_optimizer_state(source, device, rank, model_tag=None, step=None, arch=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
     model_dir = {
         "base": "base_checkpoints",
@@ -163,7 +189,7 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
     if model_tag is None:
-        model_tag = find_largest_model(checkpoints_dir)
+        model_tag = find_largest_model(checkpoints_dir, arch=arch)
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     if step is None:
         step = find_last_step(checkpoint_dir)

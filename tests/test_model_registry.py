@@ -8,14 +8,20 @@ python -m pytest tests/test_model_registry.py -v
 
 import pytest
 
-from nanochat.model import GPT, GPTConfig, get_model_class, get_config_class, config_from_dict
-from tests.conftest import TINY_GPT_KWARGS
+from nanochat.model import GPT, GPTConfig, Llama, LlamaConfig, get_model_class, get_config_class, config_from_dict
+from tests.conftest import TINY_GPT_KWARGS, TINY_KWARGS_BY_ARCH
 
 
 def test_gpt_is_registered_under_arch_name():
     assert GPTConfig.arch == "gpt"
     assert get_model_class("gpt") is GPT
     assert get_config_class("gpt") is GPTConfig
+
+
+def test_llama_is_registered_under_arch_name():
+    assert LlamaConfig.arch == "llama"
+    assert get_model_class("llama") is Llama
+    assert get_config_class("llama") is LlamaConfig
 
 
 def test_unknown_arch_raises():
@@ -25,10 +31,12 @@ def test_unknown_arch_raises():
         get_config_class("does-not-exist")
 
 
-def test_to_dict_config_from_dict_roundtrip():
-    config = GPTConfig(**TINY_GPT_KWARGS)
+@pytest.mark.parametrize("arch", ["gpt", "llama"])
+def test_to_dict_config_from_dict_roundtrip(arch):
+    config_cls = get_config_class(arch)
+    config = config_cls(**TINY_KWARGS_BY_ARCH[arch])
     d = config.to_dict()
-    assert d["arch"] == "gpt"
+    assert d["arch"] == arch
     rebuilt = config_from_dict(d)
     assert rebuilt == config
 

@@ -31,17 +31,35 @@ so they're reusable by an architecture with a different config's field names. Se
 [architecture.md](architecture.md) for the resulting contracts and
 [upstream-sync.md](upstream-sync.md) for the full mapping of what moved where.
 
-## Stage 3 — prove the seam with a second architecture
+## Stage 3 — prove the seam with a second architecture (done)
 
-Add `nanochat/model/llama/`: SwiGLU MLP, plain pre-norm blocks, no value embeddings / smear /
-backout / per-layer resid-x0 lambdas — a deliberately boring baseline whose only job is to prove
-`BaseModel` (and Stage 2's `BaseEmbedding`/`BaseBlock`/`BaseUnembedding`) are real interfaces and
-not just GPT with extra indirection. Wire `--arch=llama` through `scripts/base_train.py` end to
-end (train, checkpoint, eval, generate). Parametrize the model tests
-(`tests/test_model_gpt.py`-style) over both architectures. Make
-`checkpoint_manager.find_largest_model` arch-aware — it currently assumes checkpoint tags look
-like `d<depth>` regardless of architecture, so a `gpt` and a `llama` run at the same depth would
-collide.
+Added `nanochat/model/llama/`: SwiGLU MLP, plain pre-norm blocks (`PlainBlock`), no value
+embeddings / smear / backout / per-layer resid-x0 lambdas — reusing `CausalSelfAttention`,
+`RotaryEmbedding`, `TokenEmbedding` (smear disabled) and `LMHead` from `nanochat/model/components/`
+completely unmodified. Confirms `BaseModel`/`BaseEmbedding`/`BaseBlock`/`BaseUnembedding` are real
+interfaces: Llama needed zero `PARAM_ROLES` declarations anywhere (every parameter it owns is
+either a `Linear` weight, defaulting to role `"matrix"`, or reused directly from a GPT component
+that already declares its own roles), and `BaseModel` gained a generic `num_scaling_params()`
+default (`{role: numel, ..., "total": ...}`, built on `collect_param_roles`) that Llama just
+inherits — GPT overrides it to keep its legacy six-key dict.
+
+`--arch=llama` is wired through `scripts/base_train.py` end to end (train, checkpoint, eval,
+generate); `scripts/base_eval.py` gained a matching `--arch` flag. Fixed the checkpoint tag
+collision the previous version of this stage description flagged (`d<depth>` regardless of
+architecture): the default save tag is now arch-qualified (`{arch}_d{depth}` for anything but
+`gpt`, which keeps its original naming), and `checkpoint_manager.find_largest_model` gained an
+optional `arch=` filter (peeks at each candidate's `meta.json`, no directory renaming). Also fixed
+a real bug found while wiring this up: `scripts/base_train.py`'s `get_scaling_params` indexed
+`num_scaling_params()` by GPT's legacy dict keys, which `KeyError`'d for any architecture using
+the generic default — it now reads `collect_param_roles`'s stable role names directly. The 5 (of
+7) architecture-generic model tests moved from `tests/test_model_gpt.py` into
+`tests/test_model_common.py`, parametrized over `["gpt", "llama"]`.
+
+**Out of scope, intentionally**: the SFT/RL/serving pipeline (`chat_sft.py`, `chat_rl.py`,
+`chat_cli.py`, `infer_bench.py`, `chat_eval.py`) does not have `--arch` flags yet and still relies
+on unfiltered checkpoint auto-discovery — fine for now since there's normally only one architecture
+"in flight" through that pipeline at a time, but a future stage that actually SFTs a second
+architecture will need to revisit this.
 
 ## Stage 4 — attention variants
 

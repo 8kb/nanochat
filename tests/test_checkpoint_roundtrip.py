@@ -10,7 +10,7 @@ import torch
 
 from nanochat import checkpoint_manager
 from nanochat.checkpoint_manager import save_checkpoint, build_model
-from tests.conftest import build_tiny_gpt, TINY_GPT_KWARGS
+from tests.conftest import build_tiny_gpt, build_tiny_model, TINY_GPT_KWARGS
 from tests.test_migrations import _old_layout_state_dict
 
 
@@ -34,6 +34,40 @@ def test_checkpoint_roundtrip_preserves_weights_and_forward_output(tmp_path, mon
     reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
 
     assert meta["model_config"]["arch"] == "gpt"
+    assert type(reloaded) is type(model)
+    assert reloaded.config == model.config
+
+    original_state = model.state_dict()
+    reloaded_state = reloaded.state_dict()
+    assert original_state.keys() == reloaded_state.keys()
+    for key in original_state:
+        assert torch.equal(original_state[key], reloaded_state[key]), f"mismatch in {key}"
+
+    idx = torch.randint(0, model.config.vocab_size, (1, 5))
+    with torch.no_grad():
+        original_logits = model.forward(idx)
+        reloaded_logits = reloaded.forward(idx)
+    assert torch.equal(original_logits, reloaded_logits)
+
+
+def test_checkpoint_roundtrip_llama_preserves_weights_and_forward_output(tmp_path, monkeypatch):
+    """Same as the GPT roundtrip above, but for a second architecture -- proves build_model's
+    registry-driven reconstruction (no GPT/GPTConfig import) is genuinely arch-agnostic, and that
+    Llama needs no patch_config_dict/patch_state_dict overrides (BaseModel's no-op defaults are
+    correct for a brand-new architecture with no legacy checkpoints)."""
+    monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer())
+
+    model = build_tiny_model("llama")
+    checkpoint_dir = str(tmp_path / "llama_d_tiny")
+    save_checkpoint(
+        checkpoint_dir, step=0,
+        model_data=model.state_dict(), optimizer_data=None,
+        meta_data={"step": 0, "model_config": model.config.to_dict()},
+    )
+
+    reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
+
+    assert meta["model_config"]["arch"] == "llama"
     assert type(reloaded) is type(model)
     assert reloaded.config == model.config
 

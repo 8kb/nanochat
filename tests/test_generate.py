@@ -2,8 +2,8 @@
 Test that nanochat.engine.generate_naive (no KV cache, recomputes the full forward every step)
 and Engine.generate (KV cache, prefill + decode) agree exactly at temperature=0. This exercises
 KV cache allocation via kv_cache_spec(), the RoPE position offset from kv_cache.get_pos(), and
-the smear decode path (kv_cache.state["prev_embedding"]) together, for both a full-context and a
-sliding-window attention pattern.
+(for GPT) the smear decode path (kv_cache.state["prev_embedding"]) together, for both a
+full-context and a sliding-window attention pattern, and for every registered architecture.
 
 python -m pytest tests/test_generate.py -v
 """
@@ -11,7 +11,7 @@ python -m pytest tests/test_generate.py -v
 import pytest
 
 from nanochat.engine import Engine, generate_naive
-from tests.conftest import build_tiny_gpt
+from tests.conftest import build_tiny_model
 
 
 class _FakeTokenizer:
@@ -40,9 +40,10 @@ class _FakeTokenizer:
         return "".join(str(i) for i in ids)
 
 
+@pytest.mark.parametrize("arch", ["gpt", "llama"])
 @pytest.mark.parametrize("window_pattern", ["L", "SSSL"])
-def test_generate_naive_matches_engine_generate_at_temperature_zero(window_pattern):
-    model = build_tiny_gpt(window_pattern=window_pattern)
+def test_generate_naive_matches_engine_generate_at_temperature_zero(window_pattern, arch):
+    model = build_tiny_model(arch, window_pattern=window_pattern)
     tokenizer = _FakeTokenizer(model.config.vocab_size)
     prompt = [1, 2, 3, 4]
 

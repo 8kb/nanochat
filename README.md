@@ -15,12 +15,15 @@ Original upstream documentation (README, dev log, leaderboard) is preserved at
 ## What's different from upstream
 
 `nanochat/gpt.py`'s single GPT model became `nanochat/model/`: a `BaseModel` interface, an
-architecture registry, and GPT's reusable pieces (attention, MLP, RoPE, norm, sliding-window
-patterns, FLOPs accounting) split out so a second architecture can reuse them instead of
-forking the whole file. See [`docs/architecture.md`](docs/architecture.md) for the contract and
-how to add an architecture, and [`docs/roadmap.md`](docs/roadmap.md) for what's built so far
-versus planned. We still track upstream — see [`docs/upstream-sync.md`](docs/upstream-sync.md)
-for where every piece of `gpt.py` ended up and how to merge a new upstream commit.
+architecture registry, and reusable pieces (attention, MLP, RoPE, norm, sliding-window patterns,
+FLOPs accounting) that a second architecture reuses instead of forking the whole file — proven by
+`nanochat/model/llama/`, a second architecture (SwiGLU MLP, plain pre-norm blocks) that reuses
+GPT's attention/RoPE/embedding/unembedding components verbatim. `--arch=gpt` (default) or
+`--arch=llama` selects which one `scripts/base_train.py` trains. See
+[`docs/architecture.md`](docs/architecture.md) for the contract and how to add an architecture,
+and [`docs/roadmap.md`](docs/roadmap.md) for what's built so far versus planned. We still track
+upstream — see [`docs/upstream-sync.md`](docs/upstream-sync.md) for where every piece of `gpt.py`
+ended up and how to merge a new upstream commit.
 
 ## Setup (this fork's dev machine: Apple Silicon, no CUDA)
 
@@ -61,7 +64,8 @@ nanochat/model/
 ├── flops.py              FLOPs / KV-cache-bytes accounting, generic over any architecture
 ├── components/             reusable pieces: Linear, norm, RoPE, rotary, attention, MLP, block,
 │                           embedding (+smear), unembedding, windows
-└── gpt/                      the default (and currently only) architecture
+├── gpt/                      the original architecture
+└── llama/                      the second architecture (SwiGLU MLP, plain pre-norm blocks)
 ```
 
 ## Adding an architecture, briefly

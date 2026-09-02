@@ -70,6 +70,15 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
 - **Checkpoint `model_config` carries an `"arch"` key** (from `BaseModelConfig.to_dict()`), read
   by `nanochat.model.registry.config_from_dict` to pick the right config/model class. Missing
   `"arch"` (checkpoints saved before Stage 1) defaults to `"gpt"`.
+- **Checkpoint tag naming is architecture-aware; auto-discovery isn't, by default.**
+  `scripts/base_train.py`'s default save tag is `d<depth>` for `gpt` (unchanged) and
+  `<arch>_d<depth>` otherwise — two architectures at the same `--depth` would otherwise write into
+  the same directory. `checkpoint_manager.find_largest_model` (and `load_model`/
+  `load_model_from_dir`/`load_optimizer_state`, which forward to it) accepts an optional `arch=`
+  filter for callers that don't have an explicit `--model-tag`; passing nothing (the default
+  everywhere except `scripts/base_train.py`/`scripts/base_eval.py`) picks the largest checkpoint
+  regardless of architecture. See [docs/architecture.md](docs/architecture.md) "Checkpoint tags
+  and architecture-aware discovery".
 - **Optimizer state is checkpointed and reloaded positionally.** `torch.optim.Optimizer.state_dict()`
   flattens every parameter across every group into one global index order; a parameter that
   splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state

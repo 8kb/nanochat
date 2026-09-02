@@ -114,13 +114,6 @@ class BaseModel(nn.Module):
         and the estimate_*/kv_*_bytes methods below directly instead."""
         raise NotImplementedError
 
-    def num_scaling_params(self) -> dict:
-        """Detailed parameter counts for scaling-law analysis (see the GPT implementation for
-        the expected shape of the returned dict: named groups summing to a 'total' key). Typically
-        derived from nanochat.model.param_roles.collect_param_roles(self) by summing p.numel()
-        per role -- see GPT.num_scaling_params."""
-        raise NotImplementedError
-
     # -- backward-compat hooks for old checkpoints; no-ops by default --
 
     @classmethod
@@ -145,7 +138,21 @@ class BaseModel(nn.Module):
         GPT's Stage 2 resid/x0-lambda split."""
         return optimizer_data
 
-    # -- generic implementations built on layer_specs(); rarely need overriding --
+    # -- generic implementations; rarely need overriding --
+
+    def num_scaling_params(self) -> dict:
+        """Detailed parameter counts for scaling-law analysis: one key per role name actually
+        present in the model (see nanochat.model.param_roles), plus a 'total' key. Override to
+        present a different (e.g. fixed, legacy) key set -- GPT does, to preserve the six-key
+        dict runs/scaling_laws.sh greps out of scripts/base_train.py's stdout; see
+        GPT.num_scaling_params. Code that wants the underlying counts without caring which
+        architecture's key-naming convention applies (e.g. scripts/base_train.py's
+        get_scaling_params) should call nanochat.model.param_roles.collect_param_roles(self)
+        directly instead -- role *names* are stable across architectures by construction, unlike
+        this dict's presentation-layer keys."""
+        from nanochat.model.param_roles import collect_param_roles
+        n = {role: sum(p.numel() for p in params) for role, params in collect_param_roles(self).items()}
+        return {**n, "total": sum(n.values())}
 
     def get_device(self):
         return next(self.parameters()).device

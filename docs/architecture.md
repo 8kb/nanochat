@@ -26,10 +26,15 @@ nanochat/model/
 │   ├── embedding.py                   Smear, TokenEmbedding  -- BaseEmbedding
 │   ├── unembedding.py                   LMHead      -- BaseUnembedding
 │   └── windows.py                        compute_window_sizes()  -- sliding-window pattern tiling
-└── gpt/                    the default architecture
-    ├── config.py             GPTConfig(BaseModelConfig)
-    ├── model.py                GPT(BaseModel) -- wires Embedding/Block/Unembedding together
-    └── migrations.py            old-checkpoint backward-compat patches (config/state/optimizer)
+├── gpt/                    the original architecture
+│   ├── config.py             GPTConfig(BaseModelConfig)
+│   ├── model.py                GPT(BaseModel) -- wires Embedding/Block/Unembedding together
+│   └── migrations.py            old-checkpoint backward-compat patches (config/state/optimizer)
+└── llama/                  the second architecture -- see "Worked example: llama" below
+    ├── config.py             LlamaConfig(BaseModelConfig)
+    ├── model.py                Llama(BaseModel) -- reuses most of components/ verbatim
+    ├── block.py                  PlainBlock(BaseBlock) -- no resid/x0-lambda mixing
+    └── mlp.py                      SwiGLUMLP
 ```
 
 ## The three module contracts
@@ -204,11 +209,18 @@ policy = {   # order is load-bearing -- see "Optimizer state is checkpointed pos
 param_groups = build_param_groups(collect_param_roles(self), policy)
 ```
 
-`num_scaling_params()` sums `p.numel()` per role from the same `collect_param_roles(self)` call.
-Its six returned dict keys (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`, `scalars`,
-`total`) are a fixed, greppable output mapping — see "Two more load-bearing contracts" below — kept
-stable even though the underlying role names are more granular (`scalars` sums three roles:
-`resid_scalar` + `x0_scalar` + `smear`).
+`BaseModel.num_scaling_params()` has a generic default, also built on `collect_param_roles`:
+`{role: numel, ..., "total": ...}`, one key per role name actually present. `GPT` overrides it to
+sum `p.numel()` per role into a **fixed, six-key legacy dict** (`wte`, `value_embeds`, `lm_head`,
+`transformer_matrices`, `scalars`, `total` — `scalars` sums three roles: `resid_scalar` +
+`x0_scalar` + `smear`) — see "Two more load-bearing contracts" below for why that dict's exact key
+names matter and can't just follow the role names. `Llama` has no override and just returns the
+generic `{"embedding": ..., "matrix": ..., "unembedding": ..., "total": ...}` shape. Code that
+wants the underlying counts without caring which dict shape applies (e.g.
+`scripts/base_train.py`'s `get_scaling_params`, which needs "matrix + unembedding params") should
+call `collect_param_roles(self)` directly and sum by role name — role names are stable across
+architectures by construction; `num_scaling_params()`'s dict keys are a presentation layer GPT
+happens to override.
 
 ### Optimizer state is checkpointed positionally
 
@@ -263,11 +275,59 @@ registry existed) defaults to `"gpt"`.
 4. Add the import to `nanochat/model/__init__.py` so `@register_model` actually runs.
 5. Declare a role for every parameter you introduce (`PARAM_ROLES` or `param_roles()`) — see
    "Parameter roles" above.
-6. Add a fixture + a couple of tests mirroring `tests/conftest.py`'s `tiny_gpt` /
-   `tests/test_model_gpt.py` (forward shape, loss finite, backward populates every parameter's
-   grad, `setup_optimizer` partitions all parameters exactly once).
+6. Add your architecture's kwargs to `tests/conftest.py`'s `TINY_KWARGS_BY_ARCH` — it then
+   automatically gets a `tiny_<arch>` fixture and is included in the `tiny_model` fixture's
+   `["gpt", "llama", ...]` parametrization, so `tests/test_model_common.py`'s architecture-generic
+   suite (forward shape, loss finite, backward grad coverage, `setup_optimizer` partition,
+   `layer_specs`/`kv_cache_spec` consistency) runs against it for free. Add a
+   `tests/test_model_<arch>.py` for anything specific to your architecture.
 7. Try it: `python -m scripts.base_train --arch=my_arch --depth=2 --num-iterations=3 ...` (see
-   the CPU smoke-test invocation in "Verifying a change is behavior-preserving" below).
+   the CPU smoke-test invocation in "Verifying a change is behavior-preserving" below). If your
+   architecture isn't `"gpt"`, checkpoints save under `<arch>_d<depth>` by default (see
+   "Checkpoint tags and architecture-aware discovery" below), so a same-depth `gpt` run won't
+   collide with it.
+
+### Worked example: `llama`
+
+`nanochat/model/llama/` (SwiGLU MLP, plain pre-norm blocks, none of GPT's value embeddings /
+smear / backout / per-layer resid-x0 lambdas) exists specifically to test whether the contracts
+above are real interfaces or just GPT with extra indirection. What it reused verbatim from
+`nanochat/model/components/`: `CausalSelfAttention` (GQA/RoPE/QK-norm are not GPT-specific —
+constructed with `has_value_embed=False`), `RotaryEmbedding`, `TokenEmbedding` (constructed with
+`smear=False`), `LMHead`. What it wrote fresh: `SwiGLUMLP` (`nanochat/model/llama/mlp.py`) and
+`PlainBlock` (`nanochat/model/llama/block.py`, `BaseBlock`'s `x0` argument accepted but unused —
+this topology has no `x0` residual). `Llama` itself (`nanochat/model/llama/model.py`) needed **no
+`PARAM_ROLES` declarations anywhere** in its whole tree: every parameter it owns is either a
+`Linear` weight (defaults to role `"matrix"`) or reused directly from a GPT component that already
+declares its own roles. It also needed no `patch_config_dict`/`patch_state_dict`/
+`patch_optimizer_state_dict` overrides — a brand-new architecture has no legacy checkpoints, so
+`BaseModel`'s no-op defaults are exactly correct. This is what the contracts are supposed to make
+possible: a second architecture is mostly reuse, with new code only where it's genuinely different.
+
+## Checkpoint tags and architecture-aware discovery
+
+A checkpoint's directory name (its "tag") defaults to `d<depth>` for `gpt`, and
+`<arch>_d<depth>` for anything else (`scripts/base_train.py`; unaffected by an explicit
+`--model-tag`). This keeps `gpt`'s existing checkpoints' names unchanged, while giving every other
+architecture a distinct default — without it, `--arch=llama --depth=2` after a `--arch=gpt
+--depth=2` run would land in the *same* directory and overwrite the first run's files (not just
+confuse auto-discovery; genuine data corruption, since both would write `model_005000.pt` etc. to
+the same path).
+
+Callers that don't pass an explicit tag (`model_tag=None`) fall back to
+`checkpoint_manager.find_largest_model`, which by default just picks the largest `d<number>`
+directory it finds — regardless of architecture. Pass `arch=` (to `find_largest_model` itself, or
+through `load_model`/`load_model_from_dir`/`load_optimizer_state`, which all accept and forward
+it) to filter candidates to that architecture first: it peeks at each candidate tag's latest
+`meta_*.json` (`model_config.arch`, defaulting to `"gpt"` for checkpoints predating that key) via
+`checkpoint_manager._checkpoint_arch`, no directory-naming assumption required. `scripts/
+base_train.py` and `scripts/base_eval.py` both have a `--arch` flag wired to this.
+
+Not yet done: the SFT/RL/serving pipeline (`scripts/chat_sft.py`, `chat_rl.py`, `chat_cli.py`,
+`infer_bench.py`, `chat_eval.py`) doesn't pass `arch=` anywhere, so its auto-discovery is still
+architecture-blind — fine as long as only one architecture's checkpoints exist under a given
+`*_checkpoints/` directory at a time, but worth revisiting once a second architecture actually goes
+through SFT.
 
 ## Old-checkpoint migrations
 
@@ -345,11 +405,13 @@ rather than a raw `nn.Linear`, both for this precision policy and so FLOPs accou
 
 ## Two more load-bearing contracts
 
-- **`num_scaling_params()`'s six dict keys** (`wte`, `value_embeds`, `lm_head`,
+- **`GPT.num_scaling_params()`'s six dict keys** (`wte`, `value_embeds`, `lm_head`,
   `transformer_matrices`, `scalars`, `total`) are greppable output: `runs/scaling_laws.sh` greps
   `^key ` lines out of `scripts/base_train.py`'s stdout dump of this dict, and
   `dev/scaling_analysis.ipynb` reads the resulting CSV columns. Keep these exact key names even if
-  the underlying role names (see "Parameter roles" above) are more granular.
+  the underlying role names (see "Parameter roles" above) are more granular. Other architectures
+  don't need to match this shape — it's specifically what GPT's override preserves; see "Parameter
+  roles" above for the generic default every other architecture gets instead.
 - **The `setup_optimizer()` policy dict's key order** is the on-disk optimizer `param_group`
   layout — see "Optimizer state is checkpointed positionally" above.
 
@@ -381,7 +443,8 @@ a freshly built optimizer without error (a same-size group reorder passes size v
 corrupts silently — see "Optimizer state is checkpointed positionally" above, and
 `nanochat/model/gpt/migrations.py:patch_optimizer_state_dict` for the pattern if it doesn't).
 
-For an end-to-end smoke test of the training path on CPU/MPS:
+For an end-to-end smoke test of the training path on CPU/MPS (add `--arch=llama` or any other
+registered architecture to exercise it instead — the same command works unmodified):
 
 ```bash
 python -m scripts.base_train --depth=2 --head-dim=32 --window-pattern=L --max-seq-len=128 \
@@ -390,3 +453,10 @@ python -m scripts.base_train --depth=2 --head-dim=32 --window-pattern=L --max-se
 ```
 
 Delete `~/.cache/nanochat/base_checkpoints/smoke` afterward — it's a throwaway.
+
+A brand-new architecture has no golden checkpoint to diff against; verify it directly instead —
+`model.setup_optimizer()`'s groups partition `model.parameters()` exactly (see
+`tests/test_model_common.py`), a forward/backward pass produces finite output and populates every
+gradient, and (per "Checkpoint tags and architecture-aware discovery" above) two architectures
+smoke-trained at the same `--depth` land in different checkpoint directories and
+`find_largest_model(dir, arch=...)` resolves each independently.

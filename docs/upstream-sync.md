@@ -106,6 +106,20 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
   (Stage 2): `runs/miniseries.sh` greps that exact text and it had gone missing at some point
   before Stage 1, silently producing empty CSV columns — a pre-existing bug, fixed here since it's
   adjacent to the `num_scaling_params()` changes.
+- **Stage 3** (second architecture, `nanochat/model/llama/`): `nanochat/checkpoint_manager.py`'s
+  `find_largest_model` gained an optional `arch=` filter (peeks at each candidate tag's
+  `meta_*.json`), threaded through as an optional kwarg on `load_model`/`load_model_from_dir`/
+  `load_optimizer_state` (default `None` everywhere — no existing call site's behavior changes).
+  `scripts/base_train.py`'s default checkpoint tag became architecture-aware (`d<depth>` for
+  `gpt`, unchanged; `<arch>_d<depth>` otherwise) to prevent two architectures at the same
+  `--depth` from writing into the same directory. `scripts/base_eval.py` gained a matching
+  `--arch` flag. `scripts/base_train.py`'s `get_scaling_params` (a training-horizon helper, not
+  upstream code) was changed to read parameter-role sums directly via
+  `nanochat.model.param_roles.collect_param_roles` instead of indexing `num_scaling_params()` by
+  GPT's legacy dict keys, which doesn't generalize to other architectures' key sets — see
+  "Parameter roles" in [architecture.md](architecture.md). `nanochat/model/base.py`'s
+  `num_scaling_params()` went from abstract to a generic role-summing default, which GPT overrides
+  to keep its legacy six-key dict (no GPT behavior change).
 
 ## Merge procedure for a new upstream commit
 

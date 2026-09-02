@@ -128,6 +128,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
+    parser.add_argument('--arch', type=str, default='gpt', help='architecture name to filter auto-discovery by when --model-tag is not given (see nanochat.model.registry); ignored if --model-tag is set')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
@@ -147,7 +148,7 @@ def main():
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     # Load model and tokenizer
-    model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+    model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step, arch=args.arch)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)
     model_name = f"base_model (step {meta['step']})"

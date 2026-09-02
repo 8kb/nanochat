@@ -156,7 +156,7 @@ model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+output_dirname = args.model_tag if args.model_tag else (f"d{args.depth}" if args.arch == "gpt" else f"{args.arch}_d{args.depth}") # e.g. d12, or llama_d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -266,10 +266,18 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
 # We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
 def get_scaling_params(m):
-    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
-    params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
-    return scaling_params
+    # As for which params to use exactly, matrix + unembedding params gives cleanest scaling laws
+    # (see dev/LOG.md Jan 27, 2026). Reads role names directly via collect_param_roles rather than
+    # m.num_scaling_params()'s dict keys: role names ("matrix", "unembedding") are stable across
+    # architectures by construction, but num_scaling_params()'s keys are a presentation layer --
+    # GPT overrides it to keep legacy names ("transformer_matrices", "lm_head") that
+    # runs/scaling_laws.sh greps, while other architectures use BaseModel's generic role-named
+    # default (see nanochat/model/base.py).
+    from nanochat.model.param_roles import collect_param_roles
+    roles = collect_param_roles(m)
+    matrix = sum(p.numel() for p in roles.get('matrix', []))
+    unembedding = sum(p.numel() for p in roles.get('unembedding', []))
+    return matrix + unembedding
 num_scaling_params = get_scaling_params(model)
 print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})") # runs/miniseries.sh greps this exact line
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
