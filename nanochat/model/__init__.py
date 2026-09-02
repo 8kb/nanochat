@@ -7,14 +7,14 @@ Use the registry (register_model / get_model_class / get_config_class / config_f
 add or look up other architectures. See docs/architecture.md for the full contract.
 """
 
-from nanochat.model.base import BaseModel, BaseModelConfig, AttentionLayerSpec
+from nanochat.model.base import BaseModel, BaseModelConfig, AttentionLayerSpec, BaseEmbedding, BaseBlock, BaseUnembedding
 from nanochat.model.registry import register_model, get_model_class, get_config_class, config_from_dict
 
 # Import architecture packages so their @register_model decorators run and populate the registry.
 from nanochat.model.gpt import GPT, GPTConfig
 
 __all__ = [
-    "BaseModel", "BaseModelConfig", "AttentionLayerSpec",
+    "BaseModel", "BaseModelConfig", "AttentionLayerSpec", "BaseEmbedding", "BaseBlock", "BaseUnembedding",
     "register_model", "get_model_class", "get_config_class", "config_from_dict",
     "GPT", "GPTConfig",
 ]

@@ -43,6 +43,44 @@ are from the pre-refactor `nanochat/gpt.py` (555 lines).
 upstream diff that touches `nanochat/gpt.py` and does `from nanochat.gpt import GPT` elsewhere
 still resolves.
 
+## Stage 2: parameters and per-layer logic moved into their owning modules
+
+Stage 1 moved `gpt.py`'s code into `nanochat/model/`, but `GPT` still owned most of the *state* at
+the top level (resid/x0 lambdas as `[n_layer]` tensors, `value_embeds` as a `ModuleDict`,
+`smear_gate`/`smear_lambda`, `lm_head`, and an `init_weights()` that reached into every submodule's
+parameters by path). Stage 2 pushes that down into three module contracts
+(`BaseEmbedding`/`BaseBlock`/`BaseUnembedding` — see [architecture.md](architecture.md)) and a
+parameter-role protocol (`nanochat/model/param_roles.py`) replacing the hand-maintained optimizer
+grouping. Mapping from Stage 1's locations to Stage 2's:
+
+| Stage 1 location | Now lives in |
+|---|---|
+| `GPT.__init__`'s `self.transformer.wte` / smear params | `nanochat/model/components/embedding.py`, `TokenEmbedding` (+ `Smear`) |
+| `GPT.__init__`'s `self.lm_head` | `nanochat/model/components/unembedding.py`, `LMHead` |
+| `GPT.__init__`'s `self.cos`/`self.sin` buffers, `_precompute_rotary_embeddings` call | `nanochat/model/components/rotary.py`, `RotaryEmbedding` — one shared instance, injected into every attention layer |
+| `GPT.__init__`'s `self.resid_lambdas`/`self.x0_lambdas` (`[n_layer]` tensors) | `nanochat/model/components/block.py`, `Block.resid_lambda`/`Block.x0_lambda` (per-block scalars); the per-layer schedule is still computed by `GPT.__init__` and passed to each `Block` |
+| `GPT.__init__`'s `self.value_embeds` (`ModuleDict`) | `nanochat/model/components/attention.py`, `CausalSelfAttention.value_embed` (per-layer, constructor-injected `has_value_embed` bool) |
+| `GPT.__init__`'s `self.backout_lambda` | unchanged (still a top-level `GPT` parameter — backout is trunk-level, not per-layer) |
+| `GPT.init_weights`'s per-submodule init logic | distributed to each submodule's own `init_weights()` (`TokenEmbedding`, `Smear`, `RotaryEmbedding`, `CausalSelfAttention`, `MLP`, `Block`, `LMHead`); `GPT.init_weights` now just calls them in order plus the `backout_lambda` constant. **One behavior change**: the sequence of RNG calls during a from-scratch init differs from before Stage 2 (same calls, different order) — see "The meta-device footgun" in [architecture.md](architecture.md) |
+| `CausalSelfAttention(config, layer_idx)` | same file, now `CausalSelfAttention(n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size, has_value_embed)` — explicit dims instead of a config object, so a different architecture's config (different field names) can still reuse it; owns `layer_spec()` |
+| `MLP(config)` | same file, now `MLP(n_embd)` |
+| `Block(config, layer_idx)` | same file, now `Block(n_embd, n_head, n_kv_head, layer_idx, n_layer, window, rope, padded_vocab_size, resid_lambda_init, x0_lambda_init)`; owns the resid/x0 mixing (moved out of `GPT._forward_trunk`) |
+| `GPT._forward_trunk`'s `ve = self.value_embeds[...]` lookup, `self.window_sizes[i]` indexing | gone — each `Block`/`CausalSelfAttention` already knows its own value-embed table and window; `_forward_trunk` now only loops, and computes `x0 = x` itself (moved out of `GPT.forward`, since `x0` is trunk-level state, not embedding-level) |
+| `GPT.forward`'s smear branch, lm_head/softcap/loss code | moved into `TokenEmbedding`/`Smear` and `LMHead` respectively; `GPT.forward` is now three lines: `embedding` -> `_forward_trunk` -> `unembedding` |
+| `GPT.num_scaling_params` / `GPT.setup_optimizer`'s hand-partitioned `self.parameters()` | `nanochat/model/param_roles.py`'s `collect_param_roles`/`build_param_groups`, driven by each module's `PARAM_ROLES` (see "Parameter roles" in [architecture.md](architecture.md)); `setup_optimizer` is now a `{role: hyperparameters}` policy table, same six output keys and same on-disk group layout as before |
+
+`nanochat/model/gpt/migrations.py` gained two new patches for checkpoints saved before this
+restructure: `patch_state_dict_layout` (renames every moved state-dict key — see its docstring for
+the full table) and `patch_optimizer_state_dict` (splits the resid/x0 scalar groups' optimizer
+moments from one `[n_layer]`-shaped entry into `n_layer` per-block entries). Both are no-ops on an
+already-new-layout checkpoint. `scripts/base_train.py`'s `--resume-from-step` path and
+`scripts/chat_sft.py`'s `--load-optimizer` path both now call `patch_optimizer_state_dict`
+explicitly right before `optimizer.load_state_dict(...)` (it isn't wired into
+`checkpoint_manager.build_model` like the other two hooks, since optimizer state loads through a
+separate path — see `load_optimizer_state`). `scripts/base_train.py`'s `--resume-from-step` model
+load also now calls `patch_state_dict` (previously it called `model.load_state_dict` directly,
+bypassing migrations — a pre-existing gap, fixed alongside this).
+
 ## Other call sites that changed
 
 - `nanochat/checkpoint_manager.py` no longer imports `GPT`/`GPTConfig` directly. It looks up the
@@ -64,6 +102,10 @@ still resolves.
   with `model.config.to_dict()`. `chat_rl.py`'s save block also gained a `"step"` key that was
   previously missing (a pre-existing bug: `scripts/base_eval.py` and `scripts/infer_bench.py`
   both read `meta["step"]` and would `KeyError` on an RL checkpoint).
+- `scripts/base_train.py` gained back a `Number of parameters: N (scaling: M)` print line
+  (Stage 2): `runs/miniseries.sh` greps that exact text and it had gone missing at some point
+  before Stage 1, silently producing empty CSV columns — a pre-existing bug, fixed here since it's
+  adjacent to the `num_scaling_params()` changes.
 
 ## Merge procedure for a new upstream commit
 

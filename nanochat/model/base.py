@@ -43,6 +43,48 @@ class AttentionLayerSpec:
     window: int = -1
 
 
+class BaseEmbedding(nn.Module):
+    """Token ids -> residual-stream activations, ready for the trunk. Owns everything about
+    getting from ids to that first activation: the token embedding table, and any input-side
+    per-token mixing (e.g. GPT's smear) that needs read/write access to kv_cache.state."""
+
+    def init_weights(self):
+        raise NotImplementedError
+
+    def forward(self, idx, kv_cache=None):
+        raise NotImplementedError
+
+
+class BaseBlock(nn.Module):
+    """One residual-stream transform step. Owns everything about its own layer: attention
+    geometry (via layer_spec()), any per-layer scalars (e.g. GPT's resid/x0 lambdas), and any
+    per-layer parameter table (e.g. a value-embedding lookup)."""
+
+    def init_weights(self):
+        raise NotImplementedError
+
+    def forward(self, x, x0, idx, kv_cache):
+        raise NotImplementedError
+
+    def layer_spec(self):
+        """AttentionLayerSpec for this layer, or None if this block isn't attention-shaped. A
+        model whose blocks are all attention-shaped can implement layer_specs() as
+        [b.layer_spec() for b in self.blocks]; a model with no attention-shaped blocks at all
+        overrides layer_specs()/kv_cache_spec()/the FLOPs estimators directly instead."""
+        return None
+
+
+class BaseUnembedding(nn.Module):
+    """Residual-stream activations -> logits, or loss when targets are given. Owns the final
+    norm, the output projection, and the loss computation."""
+
+    def init_weights(self):
+        raise NotImplementedError
+
+    def forward(self, x, targets=None, loss_reduction="mean"):
+        raise NotImplementedError
+
+
 class BaseModel(nn.Module):
     """Interface every architecture must implement, plus generic accounting helpers that work
     off of layer_specs() so a new architecture gets FLOPs/KV-cache-bytes estimation for free."""
@@ -67,7 +109,9 @@ class BaseModel(nn.Module):
     def layer_specs(self) -> list[AttentionLayerSpec]:
         """One AttentionLayerSpec per transformer layer, in forward-pass order. Backs
         kv_cache_spec() (used by nanochat.engine.Engine to size the KV cache) and every
-        FLOPs/KV-cache-bytes method below."""
+        FLOPs/KV-cache-bytes method below. An architecture with no attention-shaped layers at
+        all (not a goal today, but not precluded) returns [] here and overrides kv_cache_spec()
+        and the estimate_*/kv_*_bytes methods below directly instead."""
         raise NotImplementedError
 
     def num_scaling_params(self) -> dict:
@@ -90,6 +134,16 @@ class BaseModel(nn.Module):
         """Mutate a raw state dict in place (and return it) before load_state_dict, to backfill
         parameters that didn't exist when older checkpoints were saved."""
         return model_data
+
+    @classmethod
+    def patch_optimizer_state_dict(cls, optimizer_data, model_config, log=lambda msg: None):
+        """Mutate a raw optimizer state dict (the shape torch.optim.Optimizer.state_dict()
+        returns: {"state": {flat_param_index: {...}}, "param_groups": [...]}) before
+        optimizer.load_state_dict, to account for parameters that split, merged, or moved since
+        the checkpoint was saved (e.g. one [n_layer] scalar parameter becoming n_layer
+        independent per-block scalars). No-op by default; see nanochat.model.gpt.migrations for
+        GPT's Stage 2 resid/x0-lambda split."""
+        return optimizer_data
 
     # -- generic implementations built on layer_specs(); rarely need overriding --
 

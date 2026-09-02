@@ -54,11 +54,14 @@ bash runs/runcpu.sh
 
 ```
 nanochat/model/
-├── base.py          BaseModel / BaseModelConfig / AttentionLayerSpec — the contract
+├── base.py          BaseModel/BaseModelConfig/AttentionLayerSpec + BaseEmbedding/BaseBlock/
+│                    BaseUnembedding — the contracts
 ├── registry.py       arch name -> (config class, model class)
-├── flops.py            FLOPs / KV-cache-bytes accounting, generic over any architecture
-├── components/          reusable pieces: Linear, norm, RoPE, attention, MLP, block, windows
-└── gpt/                  the default (and currently only) architecture
+├── param_roles.py      parameter-role protocol backing setup_optimizer()/num_scaling_params()
+├── flops.py              FLOPs / KV-cache-bytes accounting, generic over any architecture
+├── components/             reusable pieces: Linear, norm, RoPE, rotary, attention, MLP, block,
+│                           embedding (+smear), unembedding, windows
+└── gpt/                      the default (and currently only) architecture
 ```
 
 ## Adding an architecture, briefly
@@ -66,7 +69,9 @@ nanochat/model/
 1. `nanochat/model/<arch>/{config.py,model.py,__init__.py}`, mirroring `gpt/`.
 2. `config.py`: a `BaseModelConfig` subclass with your fields.
 3. `model.py`: a `BaseModel` subclass, `@register_model("<arch>", YourConfig)`-decorated, reusing
-   whatever fits from `nanochat/model/components/`.
+   whatever fits from `nanochat/model/components/` (attention/MLP take explicit dims, not a
+   config object, so they're reusable regardless of your config's field names). Declare a
+   `PARAM_ROLES` (or `param_roles()`) for every parameter you introduce.
 4. Import it from `nanochat/model/__init__.py` so the decorator runs.
 5. `python -m scripts.base_train --arch=<arch> --depth=2 --num-iterations=3 ...`
 

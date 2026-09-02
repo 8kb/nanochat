@@ -6,12 +6,16 @@ python -m pytest tests/test_model_components.py -v
 """
 
 import torch
+import torch.nn.functional as F
 import pytest
 
 from nanochat.model.components.rope import apply_rotary_emb, precompute_rotary_embeddings
 from nanochat.model.components.norm import norm
 from nanochat.model.components.linear import Linear
 from nanochat.model.components.windows import compute_window_sizes
+from nanochat.model.components.embedding import Smear
+from nanochat.model.components.unembedding import LMHead
+from nanochat.model.components.rotary import RotaryEmbedding
 
 
 # -----------------------------------------------------------------------------
@@ -95,3 +99,113 @@ def test_compute_window_sizes_tiles_pattern_across_layers():
 def test_compute_window_sizes_invalid_chars_assert():
     with pytest.raises(AssertionError):
         compute_window_sizes("X", n_layer=2, sequence_len=128)
+
+
+# -----------------------------------------------------------------------------
+# Smear (nanochat.model.components.embedding)
+
+def test_smear_token_by_token_decode_matches_full_sequence():
+    """Feeding one token at a time through the KV-cache decode path must reproduce, position by
+    position, the same result as running the full sequence through the training path at once."""
+    torch.manual_seed(0)
+    n_embd, T = 8, 5
+    smear = Smear(gate_channels=4)
+    smear.init_weights()
+    x = torch.randn(1, T, n_embd)
+
+    full = smear(x, kv_cache=None)
+
+    class FakeCache:
+        def __init__(self):
+            self.state = {}
+
+    cache = FakeCache()
+    decoded = torch.cat([smear(x[:, t:t + 1], kv_cache=cache) for t in range(T)], dim=1)
+    assert torch.allclose(full, decoded, atol=1e-6)
+
+
+def test_smear_prefill_matches_full_sequence_and_caches_last_position():
+    """The kv_cache-present, T>1 (prefill) branch computes the identical formula as the
+    kv_cache=None (training) branch, plus writing kv_cache.state for the next decode step."""
+    torch.manual_seed(0)
+    n_embd, T = 8, 5
+    smear = Smear(gate_channels=4)
+    smear.init_weights()
+    x = torch.randn(1, T, n_embd)
+
+    full = smear(x, kv_cache=None)
+
+    class FakeCache:
+        def __init__(self):
+            self.state = {}
+
+    cache = FakeCache()
+    prefill = smear(x, kv_cache=cache)
+    assert torch.allclose(full, prefill, atol=1e-6)
+    assert torch.equal(cache.state["prev_embedding"], x[:, -1:, :])
+
+
+# -----------------------------------------------------------------------------
+# LMHead (nanochat.model.components.unembedding)
+
+def test_lm_head_softcap_bounds_logits_and_crops_vocab():
+    n_embd, vocab_size, padded = 8, 20, 32
+    head = LMHead(n_embd, vocab_size, padded, softcap=15)
+    torch.manual_seed(0)
+    torch.nn.init.normal_(head.lm_head.weight, mean=0.0, std=100.0)  # force large pre-softcap logits
+    x = torch.randn(2, 3, n_embd) * 50
+    logits = head(x)
+    assert logits.shape == (2, 3, vocab_size)
+    assert torch.all(logits.abs() <= 15.0 + 1e-4)
+
+
+def test_lm_head_loss_path_matches_manual_cross_entropy():
+    n_embd, vocab_size, padded = 8, 20, 32
+    head = LMHead(n_embd, vocab_size, padded)
+    head.init_weights()
+    x = torch.randn(2, 3, n_embd)
+    targets = torch.randint(0, vocab_size, (2, 3))
+    loss = head(x, targets=targets)
+    logits = head(x)
+    manual = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), ignore_index=-1)
+    assert torch.allclose(loss, manual, atol=1e-5)
+
+
+def test_lm_head_tied_weight_shares_storage_and_declares_no_role():
+    n_embd, vocab_size, padded = 8, 20, 32
+    shared = torch.nn.Parameter(torch.randn(padded, n_embd))
+    head = LMHead(n_embd, vocab_size, padded, weight=shared)
+    assert head.lm_head.weight is shared
+    assert head.param_roles() == {}
+
+
+# -----------------------------------------------------------------------------
+# RotaryEmbedding (nanochat.model.components.rotary)
+
+def test_rotary_embedding_offset_matches_manual_slice():
+    head_dim, seq_len = 8, 16
+    rope = RotaryEmbedding(head_dim, seq_len)
+    rope.init_weights()
+    T0, T = 5, 4
+    q = torch.randn(1, T, 2, head_dim)
+    k = torch.randn(1, T, 2, head_dim)
+
+    class FakeCache:
+        def get_pos(self):
+            return T0
+
+    q_rot, k_rot = rope(q, k, FakeCache())
+    cos_manual, sin_manual = rope.cos[:, T0:T0 + T], rope.sin[:, T0:T0 + T]
+    assert torch.equal(q_rot, apply_rotary_emb(q, cos_manual, sin_manual))
+    assert torch.equal(k_rot, apply_rotary_emb(k, cos_manual, sin_manual))
+
+
+def test_rotary_embedding_no_cache_uses_zero_offset():
+    head_dim, seq_len = 8, 16
+    rope = RotaryEmbedding(head_dim, seq_len)
+    rope.init_weights()
+    q = torch.randn(1, 3, 2, head_dim)
+    k = torch.randn(1, 3, 2, head_dim)
+    q_rot, k_rot = rope(q, k, kv_cache=None)
+    assert torch.equal(q_rot, apply_rotary_emb(q, rope.cos[:, :3], rope.sin[:, :3]))
+    assert torch.equal(k_rot, apply_rotary_emb(k, rope.cos[:, :3], rope.sin[:, :3]))

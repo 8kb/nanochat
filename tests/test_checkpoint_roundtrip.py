@@ -11,6 +11,7 @@ import torch
 from nanochat import checkpoint_manager
 from nanochat.checkpoint_manager import save_checkpoint, build_model
 from tests.conftest import build_tiny_gpt, TINY_GPT_KWARGS
+from tests.test_migrations import _old_layout_state_dict
 
 
 class _FakeTokenizer:
@@ -66,3 +67,33 @@ def test_checkpoint_roundtrip_legacy_config_without_arch_key(tmp_path, monkeypat
 
     reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
     assert reloaded.config == model.config
+
+
+def test_checkpoint_roundtrip_old_module_layout_state_dict(tmp_path, monkeypatch):
+    """A checkpoint saved before the Stage 2 module restructure has flat/top-level state_dict
+    keys (transformer.wte.weight, resid_lambdas, ...); it must still load, migrated to the new
+    per-module layout, with identical values and forward output."""
+    monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer())
+
+    model = build_tiny_gpt()
+    old_state = _old_layout_state_dict(model)
+    checkpoint_dir = str(tmp_path / "d_old_layout")
+    save_checkpoint(
+        checkpoint_dir, step=0,
+        model_data=old_state, optimizer_data=None,
+        meta_data={"step": 0, "model_config": model.config.to_dict()},
+    )
+
+    reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
+
+    original_state = model.state_dict()
+    reloaded_state = reloaded.state_dict()
+    assert original_state.keys() == reloaded_state.keys()
+    for key in original_state:
+        assert torch.equal(original_state[key], reloaded_state[key]), f"mismatch in {key}"
+
+    idx = torch.randint(0, model.config.vocab_size, (1, 5))
+    with torch.no_grad():
+        original_logits = model.forward(idx)
+        reloaded_logits = reloaded.forward(idx)
+    assert torch.equal(original_logits, reloaded_logits)

@@ -162,6 +162,7 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model_data = get_model_class(args.arch).patch_state_dict(model_data, model_config, log=print0)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -270,6 +271,7 @@ def get_scaling_params(m):
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
+print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})") # runs/miniseries.sh greps this exact line
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
@@ -320,6 +322,7 @@ optimizer = model.setup_optimizer(
 )
 
 if resuming:
+    optimizer_data = get_model_class(args.arch).patch_optimizer_state_dict(optimizer_data, model_config, log=print0)
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 

@@ -139,6 +139,7 @@ base_dir = get_base_dir()
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
+        optimizer_data = type(orig_model).patch_optimizer_state_dict(optimizer_data, orig_model.config, log=print0)
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data

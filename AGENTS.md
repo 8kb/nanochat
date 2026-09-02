@@ -50,19 +50,36 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   `isinstance(m, Linear)`. A new matmul that uses a raw `nn.Linear` or bare `nn.Parameter`
   silently disappears from `estimate_flops`, `estimate_decode_flops`, `estimate_prefill_flops`,
   and every FLOPs/s or MFU number derived from them.
-- **`GPT.num_scaling_params()` and `GPT.setup_optimizer()` both assert they cover every
-  parameter exactly once.** Add a new `nn.Parameter` or submodule to `GPT` and forget to add it
-  to both, and you get an `AssertionError` at model construction or at optimizer setup — annoying,
-  but far better than a parameter silently missing from the optimizer or the parameter count.
+- **Every parameter needs a declared role.** `nanochat.model.param_roles.collect_param_roles`
+  walks the module tree and raises on any parameter it can't assign a role to (a `Linear.weight`
+  defaults to `"matrix"`; anything else needs a `PARAM_ROLES` class attribute or a `param_roles()`
+  override). `setup_optimizer()`/`num_scaling_params()` are built on this, so a new `nn.Parameter`
+  or submodule that forgets to declare a role raises at construction — far better than it silently
+  defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping). See
+  [docs/architecture.md](docs/architecture.md#parameter-roles).
 - **`runs/scaling_laws.sh` and `runs/miniseries.sh` grep exact stdout text** out of
-  `scripts/base_train.py` (lines matching `^wte `, `^lm_head `, `CORE metric:`,
-  `Validation bpb:`). Changing those print statements' format breaks those scripts silently.
+  `scripts/base_train.py`: `runs/scaling_laws.sh` greps six `^key ` lines from the
+  `num_scaling_params()` dump (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`,
+  `scalars`, `total` — all load-bearing key names, even though the underlying role names are more
+  granular); `runs/miniseries.sh` greps a single `"Number of parameters: N (scaling: M)"` line.
+  Both also grep `"Calculated number of iterations"`, `"Total batch size"`, `"Validation bpb:"`,
+  `"CORE metric:"`. Changing those print statements' format breaks those scripts silently.
 - **Rotary `cos`/`sin` buffers are `persistent=False`** (not saved in checkpoints) — this is why
   `checkpoint_manager.build_model` calls `model.init_weights()` even when *loading* a checkpoint,
   right before `load_state_dict(..., assign=True)` overwrites everything else.
 - **Checkpoint `model_config` carries an `"arch"` key** (from `BaseModelConfig.to_dict()`), read
   by `nanochat.model.registry.config_from_dict` to pick the right config/model class. Missing
   `"arch"` (checkpoints saved before Stage 1) defaults to `"gpt"`.
+- **Optimizer state is checkpointed and reloaded positionally.** `torch.optim.Optimizer.state_dict()`
+  flattens every parameter across every group into one global index order; a parameter that
+  splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state
+  silently (no shape-mismatch error) rather than loudly. `setup_optimizer()`'s policy dict order
+  is therefore part of the on-disk format, not just a style choice — see
+  [docs/architecture.md](docs/architecture.md#parameter-roles). A change that does reorder or
+  resplit needs a `patch_optimizer_state_dict` migration (see
+  `nanochat/model/gpt/migrations.py`'s Stage 2 resid/x0-lambda split for the pattern) or old
+  optimizer shards fail to load — `scripts/base_train.py`'s `--resume-from-step` and
+  `scripts/chat_sft.py`'s `--load-optimizer` are the two call sites that route through it.
 
 ## What runs on this Mac
 
