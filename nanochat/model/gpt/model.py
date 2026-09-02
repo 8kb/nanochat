@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from nanochat.common import print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
 from nanochat.model.base import BaseModel, AttentionLayerSpec
+from nanochat.model.param_roles import collect_param_roles, build_param_groups
 from nanochat.model.registry import register_model
 from nanochat.model.components.linear import Linear
 from nanochat.model.components.norm import norm
@@ -155,6 +156,21 @@ class GPT(BaseModel):
             for window, _ in self.window_sizes
         ]
 
+    def param_roles(self):
+        """Escape-hatch override (see nanochat.model.param_roles): reproduces today's grouping
+        verbatim, by module path, since the params it names haven't moved into their owning
+        submodules yet. A future commit deletes this once each submodule declares its own
+        PARAM_ROLES and this can fall back to the generic recursive walk."""
+        return {
+            "unembedding": list(self.lm_head.parameters()),
+            "embedding": list(self.transformer.wte.parameters()),
+            "value_embedding": list(self.value_embeds.parameters()),
+            "resid_scalar": [self.resid_lambdas],
+            "x0_scalar": [self.x0_lambdas],
+            "smear": [self.smear_gate.weight, self.smear_lambda, self.backout_lambda],
+            "matrix": list(self.transformer.h.parameters()),
+        }
+
     def num_scaling_params(self):
         """
         Return detailed parameter counts for scaling law analysis.
@@ -165,59 +181,38 @@ class GPT(BaseModel):
         Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
 
         Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
+        can experiment with which combination gives the cleanest scaling laws. Keys are
+        load-bearing: runs/scaling_laws.sh greps them out of base_train.py's stdout.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizer)
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        n = {role: sum(p.numel() for p in params) for role, params in collect_param_roles(self).items()}
         return {
-            'wte': wte,
-            'value_embeds': value_embeds,
-            'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices,
-            'scalars': scalars,
-            'total': total,
+            'wte': n.get('embedding', 0),
+            'value_embeds': n.get('value_embedding', 0),
+            'lm_head': n.get('unembedding', 0),
+            'transformer_matrices': n.get('matrix', 0),
+            'scalars': n.get('resid_scalar', 0) + n.get('x0_scalar', 0) + n.get('smear', 0),
+            'total': sum(n.values()),
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
 
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
-
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+        # Role -> optimizer hyperparameters. Order is load-bearing: it is the on-disk
+        # optimizer param_group layout (see nanochat.model.param_roles.build_param_groups).
+        policy = {
+            "unembedding": dict(kind='adamw', lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            "embedding": dict(kind='adamw', lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            "value_embedding": dict(kind='adamw', lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            "resid_scalar": dict(kind='adamw', lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            "x0_scalar": dict(kind='adamw', lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            "smear": dict(kind='adamw', lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            "matrix": dict(kind='muon', lr=matrix_lr, momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay),
+        }
+        param_groups = build_param_groups(collect_param_roles(self), policy)
 
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:

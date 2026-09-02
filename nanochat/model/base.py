@@ -58,6 +58,10 @@ class BaseModel(nn.Module):
         raise NotImplementedError
 
     def setup_optimizer(self, **kwargs):
+        """Typically built from nanochat.model.param_roles: collect_param_roles(self) gives
+        {role: [params]}, and build_param_groups(roles, policy) turns that plus an ordered
+        {role: hyperparameters} policy dict into nanochat.optim.MuonAdamW param_groups. See
+        GPT.setup_optimizer for the reference implementation."""
         raise NotImplementedError
 
     def layer_specs(self) -> list[AttentionLayerSpec]:
@@ -68,7 +72,9 @@ class BaseModel(nn.Module):
 
     def num_scaling_params(self) -> dict:
         """Detailed parameter counts for scaling-law analysis (see the GPT implementation for
-        the expected shape of the returned dict: named groups summing to a 'total' key)."""
+        the expected shape of the returned dict: named groups summing to a 'total' key). Typically
+        derived from nanochat.model.param_roles.collect_param_roles(self) by summing p.numel()
+        per role -- see GPT.num_scaling_params."""
         raise NotImplementedError
 
     # -- backward-compat hooks for old checkpoints; no-ops by default --
