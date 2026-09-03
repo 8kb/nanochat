@@ -105,12 +105,17 @@ price_per_gpu_hour = float(sys.argv[1])
 rows = [json.load(open(f))[0] for f in sys.argv[2:]]
 print(f"\n{'arch':16s} {'d':>3s} {'params(total)':>14s} {'params(scaling)':>16s} {'FLOPs/tok':>11s} {'KV slots':>9s} {'GPU-hours':>10s}")
 total_gpu_hours = 0.0
+total_wall_clock_hours = 0.0  # rows run sequentially, so summing each row's wall time is correct
 for r in rows:
     p, f, k, t = r['params'], r['flops'], r['shape'], r['training_plan']
     gpu_hours = t['gpu_hours'] or 0.0
     total_gpu_hours += gpu_hours
+    total_wall_clock_hours += t['wall_clock_hours'] or 0.0
     print(f"{r['arch']:16s} {r['depth']:3d} {p['total']:14,d} {p['scaling']:16,d} {f['per_token']:11.3e} {k['num_kv_slots']:9d} {gpu_hours:10.2f}")
-print(f"\nTotal: {total_gpu_hours:.2f} GPU-hours  ~=  ${total_gpu_hours * price_per_gpu_hour:.2f} at ${price_per_gpu_hour:.2f}/GPU-hour")
+# gpu_hours is total GPU-resource-hours (what you're billed at a per-GPU-hour rate); it does NOT
+# shrink with more GPUs. wall-clock is how long the sequential run of all rows actually takes.
+print(f"\nTotal: {total_gpu_hours:.2f} GPU-hours  ~=  ${total_gpu_hours * price_per_gpu_hour:.2f} at ${price_per_gpu_hour:.2f}/GPU-hour"
+      f"  |  ~{total_wall_clock_hours*60:.0f} min wall-clock ({total_wall_clock_hours:.2f}h)")
 PYEOF
 
 if [ -n "${DRY_RUN:-}" ]; then

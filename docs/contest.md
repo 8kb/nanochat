@@ -11,9 +11,14 @@ spend before a single GPU-second runs.
 
 ## 1. Pod spec
 
-- **4x A100 40GB** (RunPod community or secure cloud, whichever's available). The defaults below
-  (`TARGET_FLOPS=5e18`, `d16`, `--device-batch-size=16`) are sized for this; see "Sizing" below to
-  change it.
+- **4x A100 80GB** (SXM or PCIe, secure or community cloud, whichever's in stock) —
+  **4x A100 40GB is the nominal target but is frequently NOT orderable**: RunPod's real 40GB SKU
+  (`NVIDIA A100-SXM4-40GB`) caps out at 2 GPUs in community cloud and 0 in secure, with LOW stock,
+  as of this doc. 80GB works fine at the same settings (`--device-batch-size=16` was already
+  conservative for 40GB, so it fits with headroom on 80GB) and was what the verified run in
+  "Verified on real cloud GPUs" below actually used, at $1.39/hr (community) to $1.59/hr (secure)
+  per GPU. Check live stock with `list-gpu-types`/`get-gpu-type` (Runpod MCP) or `runpodctl gpu
+  list` before committing to a data center.
 - **~100GB persistent volume** at `/workspace`. Budget: ~9GB for 100 pretraining data shards,
   ~4.3GB for the three d16 model checkpoints (fp32 weights: `params * 4 bytes`, so llama_kvshare's
   smaller parameter count is smaller on disk too), ~26MB for the CORE eval bundle, plus optimizer
@@ -34,6 +39,19 @@ wandb login   # optional but recommended -- see "Logging" below; skip and use WA
 `runs/contest.sh` handles the rest of setup (venv, dataset shards, tokenizer) itself unless you
 pass `SKIP_SETUP=1`.
 
+**`wandb login` gotcha: run it interactively, not via a scripted/non-interactive SSH command.**
+A RunPod account Secret referenced as `{{ RUNPOD_SECRET_WANDB_API_KEY }}` in a pod's env
+(create-pod's `env` field) does **not** resolve into the process environment the way you'd expect
+via the API used by the RunPod MCP/`create-pod` tool as of this doc — it lands in
+`/etc/rp_environment` on the pod, which `~/.bashrc` only sources under an **interactive**-shell
+guard. A plain `ssh host 'cmd'` (or any script launching training) runs a *non*-interactive shell
+and never sees it, even though an interactive `ssh host` login session does — which is exactly why
+`wandb login` can report "already logged in" in an interactive session while a script launched
+right after (via a separate non-interactive `ssh host 'cmd'`) still crashes with `api_key not
+configured (no-tty)`. If you must launch training non-interactively, `source /etc/rp_environment`
+first in that same command — but the simplest fix is to `wandb login` yourself, interactively, once
+per pod, and paste the key at the prompt.
+
 ## 3. Always dry-run first
 
 ```bash
@@ -44,18 +62,32 @@ This downloads nothing extra, trains nothing, and prints exactly what `scripts/m
 (Stage 4) computes for every row: shape, params, FLOPs/token, KV slots, and a GPU-hours / dollar
 estimate (`GPU_NAME`/`MFU`/`PRICE_PER_GPU_HOUR` env vars feed that last part — the defaults are
 `"NVIDIA A100"`, `0.4`, `$1.50/GPU-hour`; adjust `PRICE_PER_GPU_HOUR` to your actual RunPod rate).
-At the defaults (`TARGET_FLOPS=5e18`, d16, 4x A100), expect:
+`GPU-hours` here is total GPU-*resource* consumption — what you're billed at a per-GPU-hour rate —
+which does **not** shrink with more GPUs (the same total FLOPs cost the same resource-hours whether
+spread across 1 GPU or 8); the preflight table also prints a separate wall-clock estimate, which
+*does* shrink with `NPROC_PER_NODE`. (An earlier version of this script conflated the two — divided
+by `num_gpus` once to get wall-clock time, then labeled that number "GPU-hours" and fed it straight
+into a per-GPU-hour price, undercounting the real dollar cost by a factor of `num_gpus`. Fixed; if
+you see a `"GPU-hours"` figure elsewhere that's roughly `1/num_gpus` of the numbers below, it's the
+old bug's output.)
+
+At the defaults (`TARGET_FLOPS=5e18`, d16, 4x A100, `--mfu 0.4`), expect:
 
 | arch | scaling params | FLOPs/token | KV slots | GPU-hours |
 |---|---|---|---|---|
-| gpt | 234.9M | 1.585e9 | 16 | ~2.78 |
-| llama | 239.1M | 1.837e9 | 16 | ~2.78 |
-| llama_kvshare | 222.3M | 1.736e9 | 8 | ~2.78 |
+| gpt | 234.9M | 1.585e9 | 16 | ~11.13 |
+| llama | 239.1M | 1.837e9 | 16 | ~11.13 |
+| llama_kvshare | 222.3M | 1.736e9 | 8 | ~11.13 |
 
-Total ≈ 8.4 GPU-hours ≈ 2.1h wall clock on 4 GPUs ≈ $12–15 at community-cloud A100 rates. (All
-three land at the same GPU-hours by construction — `TARGET_FLOPS` is the same for every row,
-that's what "iso-FLOPs" means; a cheaper architecture spends the saved compute on more tokens
-instead of finishing early.)
+Total ≈ **33.4 GPU-hours** ≈ **8.4h wall clock** on 4 GPUs ≈ **$46–53** at 80GB-A100 rates
+($1.39/hr community to $1.59/hr secure, per GPU — see "Pod spec" above). (All three land at the
+same GPU-hours by construction — `TARGET_FLOPS` is the same for every row, that's what "iso-FLOPs"
+means; a cheaper architecture spends the saved compute on more tokens instead of finishing early.)
+`--mfu 0.4` is optimistic for the SDPA fallback (see "What to watch for" below) — the verified d12
+shakedown below measured 33–58% depending on architecture; at a more conservative `--mfu 0.33` the
+same contest is ≈40.5 GPU-hours ≈ 10.1h wall clock ≈ $56–64. **This is a real, half-day, ~$50 run —
+size accordingly, and consider the d12 shakedown (below) first if you haven't run this harness on
+real cloud GPUs yet.**
 
 If the numbers look wrong (wrong depth, wrong GPU count, unexpected `--arch-opt`), fix the
 `CONTEST_ROWS` array at the top of `runs/contest.sh` or the env vars and dry-run again. Only once
@@ -200,3 +232,40 @@ reports the true trained shape, since it reads the checkpoint's own saved config
 preflight file. This mismatch cannot happen in a real contest run, which never overrides `--depth`
 this way. `NPROC_PER_NODE=1` also switches the launcher to plain `python -m scripts.base_train`
 (no `torchrun`), so this works on a CPU/MPS machine with no CUDA at all.
+
+## Cloud shakedown: `runs/contest_d12.sh`
+
+Before spending ~$50 on the real d16 contest, prove the harness on real cloud GPUs cheaply: same
+three rows, `--depth=12` and `TARGET_FLOPS=1e18` instead of `--depth=16`/`5e18` — about **1/33rd**
+the GPU-hours (a d12 row is both shallower *and*, at a fixed FLOPs budget, needs proportionally
+fewer tokens than d16 despite the "cheaper architectures get more tokens" effect within a single
+depth). Kept as its own file (`runs/contest_d12.sh`) rather than a `CONTEST_ROWS` edit to
+`runs/contest.sh`, so that script's committed defaults stay the real d16 contest:
+
+```bash
+DRY_RUN=1 bash runs/contest_d12.sh d12test   # always dry-run first, same as the real contest
+bash runs/contest_d12.sh d12test             # ~1.7 GPU-hours, ~$10 at $1.50/GPU-hour reference rate
+```
+
+**Verified end-to-end on a real 4x A100-SXM4-80GB pod** (secure cloud, US-MD-1, $6.36/hr for the
+pod):
+
+| arch | val bpb | CORE | wall-clock | MFU achieved |
+|---|---|---|---|---|
+| gpt | 0.8388 | **0.1509** | 40.4 min | 33% |
+| llama | 0.8746 | 0.1110 | 23.2 min | 57% |
+| llama_kvshare | 0.8732 | 0.1191 | 23.1 min | 58% |
+
+FA3 did not load on this pod (SDPA fallback, as this doc already warns is possible) — gpt's
+`SSSL` sliding-window pattern paid for that noticeably more than llama's/llama_kvshare's plain full
+attention (33% MFU vs 57–58%), which is exactly the "GPT will simply be slower per step" case
+called out in "What to watch for" above. gpt still won on quality (best val bpb and CORE) despite
+being slowest — a genuine result, not a harness artifact. Total wall clock for all three rows:
+86.6 minutes; total pod time including setup (venv, 46 shards, tokenizer training) was closer to
+100 minutes, at $6.36/hr ≈ **$10.60** — close to the corrected estimate above.
+
+Real gotchas hit running this for real (all fixed in the code/docs you're reading now, documented
+here so they don't need rediscovering): the GPU-hours/cost formula bug described in "Always
+dry-run first" above; the `wandb login`-must-be-interactive gotcha in "One-time setup" above; and
+**4x A100 40GB was not orderable** at the time of this run (see "Pod spec" above) — used 4x
+A100-SXM4-80GB instead, which needed no other changes.

@@ -138,16 +138,25 @@ def inspect_one(arch, depth, args, vocab_size):
         weight_decay=args.weight_decay,
     )
 
+    # gpu_hours is total GPU-*resource* consumption (what you're billed for: GPU-hours x
+    # price-per-GPU-hour) -- it does NOT depend on num_gpus, since the same total FLOPs cost the
+    # same resource-hours whether spread across 1 GPU or 100. wall_clock_hours is how long that
+    # takes to *finish*, which does depend on num_gpus (more GPUs in parallel -> less wall time,
+    # same total spend). Conflating the two previously mislabeled wall_clock_hours as "GPU-hours"
+    # and fed it straight into a per-GPU-hour price, undercounting real cost by a factor of
+    # num_gpus (caught the hard way training the real Stage 5 contest -- see docs/contest.md).
     gpu_hours = None
+    wall_clock_hours = None
     if args.gpu is not None:
         peak_flops = get_peak_flops(args.gpu)
-        gpu_hours = plan.total_flops / (peak_flops * args.mfu * args.num_gpus) / 3600
+        gpu_hours = plan.total_flops / (peak_flops * args.mfu) / 3600
+        wall_clock_hours = gpu_hours / args.num_gpus
 
     row["training_plan"] = {
         "target_tokens": plan.target_tokens, "total_batch_size": plan.total_batch_size,
         "auto_batch_size": plan.auto_batch_size, "num_iterations": plan.num_iterations,
         "horizon_source": plan.horizon_source, "total_tokens": plan.total_tokens,
-        "total_flops": plan.total_flops, "gpu_hours": gpu_hours,
+        "total_flops": plan.total_flops, "gpu_hours": gpu_hours, "wall_clock_hours": wall_clock_hours,
     }
     return row
 
@@ -227,7 +236,7 @@ def print_human(row):
         print(f"  Training plan: {plan['total_tokens']:,} tokens ({plan['horizon_source']}) over {plan['num_iterations']:,} iters "
               f"@ batch={plan['total_batch_size']:,}{' (auto)' if plan['auto_batch_size'] else ''}  |  {plan['total_flops']:.3e} FLOPs")
         if plan["gpu_hours"] is not None:
-            print(f"  Estimated GPU-hours: {plan['gpu_hours']:.2f}")
+            print(f"  Estimated GPU-hours: {plan['gpu_hours']:.2f}  (~{plan['wall_clock_hours']*60:.0f} min wall-clock)")
     if "trained" in row:
         t = row["trained"]
         tokens_str = f"{t['tokens_trained']:,}" if t["tokens_trained"] is not None else "?"
