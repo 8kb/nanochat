@@ -94,6 +94,15 @@ def build_model(checkpoint_dir, step, device, phase):
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+    # Same vocab_size doesn't mean same vocab (e.g. a checkpoint trained on a different machine's
+    # tokenizer): checkpoints saved before this fingerprint existed have no key to check, so this
+    # only warns, and only when there's something to compare.
+    checkpoint_fingerprint = meta_data.get("tokenizer_fingerprint")
+    if checkpoint_fingerprint is not None and checkpoint_fingerprint != tokenizer.fingerprint():
+        log0(f"WARNING: tokenizer fingerprint mismatch -- this checkpoint was trained with a "
+             f"different tokenizer than the one loaded here ({checkpoint_fingerprint} != "
+             f"{tokenizer.fingerprint()}). Vocab size matches, but token ids may mean different "
+             f"things; expect garbage output.")
     return model, tokenizer, meta_data
 
 
@@ -167,6 +176,7 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    meta_data["model_tag"] = model_tag # so a caller with no explicit --model-tag still knows which checkpoint was picked
     return model, tokenizer, meta_data
 
 def load_model(source, *args, arch=None, **kwargs):

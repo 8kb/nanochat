@@ -6,6 +6,8 @@ GPT/GPTConfig import in checkpoint_manager itself.
 python -m pytest tests/test_checkpoint_roundtrip.py -v
 """
 
+import logging
+
 import torch
 
 from nanochat import checkpoint_manager
@@ -15,9 +17,13 @@ from tests.test_migrations import _old_layout_state_dict
 
 
 class _FakeTokenizer:
-    """Stub matching the one method build_model needs: the vocab-size compatibility check."""
+    """Stub matching the methods build_model needs: the vocab-size compatibility check and the
+    tokenizer-fingerprint mismatch warning."""
     def get_vocab_size(self):
         return TINY_GPT_KWARGS["vocab_size"]
+
+    def fingerprint(self):
+        return "local0000000000"
 
 
 def test_checkpoint_roundtrip_preserves_weights_and_forward_output(tmp_path, monkeypatch):
@@ -133,6 +139,59 @@ def test_checkpoint_roundtrip_legacy_config_without_arch_key(tmp_path, monkeypat
 
     reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
     assert reloaded.config == model.config
+
+
+def test_checkpoint_roundtrip_warns_on_tokenizer_fingerprint_mismatch(tmp_path, monkeypatch, caplog):
+    """A checkpoint whose tokenizer_fingerprint disagrees with the local tokenizer's must still
+    load (vocab_size still matches) but should warn loudly -- this is the trap a contest run would
+    otherwise hit silently: same vocab size, different token ids, garbage output."""
+    monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer())
+
+    model = build_tiny_gpt()
+    checkpoint_dir = str(tmp_path / "d_mismatch")
+    save_checkpoint(
+        checkpoint_dir, step=0,
+        model_data=model.state_dict(), optimizer_data=None,
+        meta_data={"step": 0, "model_config": model.config.to_dict(), "tokenizer_fingerprint": "cloud0000000000"},
+    )
+
+    with caplog.at_level(logging.INFO, logger="nanochat.checkpoint_manager"):
+        build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
+    assert any("tokenizer fingerprint mismatch" in record.message for record in caplog.records)
+
+
+def test_checkpoint_roundtrip_silent_on_tokenizer_fingerprint_match(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer())
+
+    model = build_tiny_gpt()
+    checkpoint_dir = str(tmp_path / "d_match")
+    save_checkpoint(
+        checkpoint_dir, step=0,
+        model_data=model.state_dict(), optimizer_data=None,
+        meta_data={"step": 0, "model_config": model.config.to_dict(), "tokenizer_fingerprint": "local0000000000"},
+    )
+
+    with caplog.at_level(logging.INFO, logger="nanochat.checkpoint_manager"):
+        build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
+    assert not any("tokenizer fingerprint mismatch" in record.message for record in caplog.records)
+
+
+def test_checkpoint_roundtrip_silent_when_fingerprint_key_absent(tmp_path, monkeypatch, caplog):
+    """Checkpoints saved before Part C (this stage) have no tokenizer_fingerprint key at all --
+    nothing to compare, so no warning (not every old checkpoint should look suspicious)."""
+    monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer())
+
+    model = build_tiny_gpt()
+    checkpoint_dir = str(tmp_path / "d_no_fingerprint")
+    save_checkpoint(
+        checkpoint_dir, step=0,
+        model_data=model.state_dict(), optimizer_data=None,
+        meta_data={"step": 0, "model_config": model.config.to_dict()},
+    )
+
+    with caplog.at_level(logging.INFO, logger="nanochat.checkpoint_manager"):
+        build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
+    assert not any("tokenizer fingerprint mismatch" in record.message for record in caplog.records)
 
 
 def test_checkpoint_roundtrip_old_module_layout_state_dict(tmp_path, monkeypatch):

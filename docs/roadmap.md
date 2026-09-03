@@ -94,17 +94,50 @@ real training script compute identical numbers — the inspector's output was ch
 the prerequisite for Stage 5's architecture contest: choosing matched configs was guesswork before
 this existed.
 
-## Stage 5 — architecture contest
+## Stage 5 — architecture contest (harness done; the cloud runs themselves are not)
 
-Train all three architectures (`gpt`, `llama`, `llama_kvshare`) at a matched medium size (d12–d16
-range) on rented multi-GPU cloud hardware (e.g. 4x A100 40GB on RunPod/Lambda), using
-`scripts/model_info.py` (Stage 4) to pick configs that land within a few percent of each other on
-whichever axis matters (params, FLOPs, or shape — the inspector reports all three). One shared
-tokenizer across all three runs (`NANOCHAT_BASE_DIR` shared, only `--arch`/`--model-tag` differ).
-Download checkpoints and compare locally (val bpb, CORE, qualitative samples via `chat_cli.py`).
-Needs: an arch-aware version of `runs/scaling_laws.sh`/`runs/miniseries.sh` (or a new
-`runs/contest.sh`) that records which architecture produced each row, and provisioning notes for
-whichever cloud provider ends up used.
+Train all three architectures (`gpt`, `llama`, `llama_kvshare`) on the same tokenizer and the same
+iso-FLOPs compute budget, so the comparison is real. The harness for this is done: `runs/contest.sh`
+(architecture-aware, unlike `runs/scaling_laws.sh`/`runs/miniseries.sh`, which grep GPT-only stdout
+keys) declares one row per architecture, previews every row's params/FLOPs/KV-cache/GPU-hours via
+`scripts/model_info.py` (Stage 4) before training anything (`DRY_RUN=1`, always run first), then
+trains, records dynamic results (val bpb, CORE, wall-clock) into a CSV keyed by architecture, and
+prints exactly what to `rsync` home. `scripts/model_info.py --checkpoints` (new this stage) closes
+the loop: it inspects an *already-trained* checkpoint from its own saved meta.json (no weights
+loaded), reporting the same params/FLOPs/KV block plus what training actually produced. Full
+runbook, RunPod pod spec, and cost table: [docs/contest.md](contest.md).
+
+Two real correctness traps this stage's plan-mode research and verification found, both fixed
+generically:
+- **Two checkpoints could share a vocab *size* but not a vocab.** Nothing enforced that a
+  cloud-trained checkpoint and this machine's local tokenizer are the *same* tokenizer, and the
+  failure mode is silent garbage output, not an error. Fixed with
+  `RustBPETokenizer.fingerprint()` (a content hash of the vocab), written into checkpoint meta by
+  `scripts/base_train.py` and checked (warn, not raise, so old checkpoints still load) by
+  `checkpoint_manager.build_model`.
+- **`base_eval.py`'s CORE-eval CSV was named only after the step number**, so evaluating all three
+  contest checkpoints in one `NANOCHAT_BASE_DIR` overwrote the same file three times.
+  `load_model_from_dir` now returns the resolved model tag in `meta["model_tag"]`, and
+  `base_eval.py`'s output filename includes it.
+
+The harness was verified entirely locally (no GPU rented): a `DRY_RUN=1` dry run reproduced the
+reference cost table below to the GPU-hour, and a full end-to-end CPU/MPS rehearsal
+(`NPROC_PER_NODE=1`, `EXTRA_TRAIN_ARGS` forcing a 3-step toy run) trained all three architectures,
+produced distinct checkpoints and a real results CSV, and `scripts/model_info.py --checkpoints`
+correctly read back each checkpoint's true trained shape and a `match` tokenizer fingerprint — see
+docs/contest.md's "Local rehearsal" section for the exact command and its one known caveat (the
+rehearsal's CSV *static* columns reflect each row's nominal depth, not the depth
+`EXTRA_TRAIN_ARGS` actually trained; the dynamic columns and `model_info --checkpoints` are both
+correct regardless). Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100):
+
+| arch | scaling params | FLOPs/token | KV slots | GPU-hours |
+|---|---|---|---|---|
+| gpt | 234.9M | 1.585e9 | 16 | ~2.78 |
+| llama | 239.1M | 1.837e9 | 16 | ~2.78 |
+| llama_kvshare | 222.3M | 1.736e9 | 8 | ~2.78 |
+
+**What's left, deliberately not done in this session**: actually renting a RunPod pod and running
+`runs/contest.sh` for real (real money) — a separate, explicitly-confirmed step.
 
 ## Stage 6 — attention variants
 

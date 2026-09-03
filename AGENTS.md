@@ -104,6 +104,16 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   [docs/architecture.md](docs/architecture.md) for the full mechanism, including a real FA3-vs-SDPA
   divergence in what `k=None` means to `flash_attn_with_kvcache` that a naive sharing
   implementation would hit.
+- **Checkpoint meta carries `tokenizer_fingerprint` and `core_metric`.**
+  `RustBPETokenizer.fingerprint()` (`nanochat/tokenizer.py`) is a content hash of the vocab, not
+  the pickle file -- it identifies *what a token id means*. `scripts/base_train.py` writes it (plus
+  whatever `core_metric` the final-step CORE eval produced, `None` if that eval didn't run)
+  alongside every checkpoint. `checkpoint_manager.build_model` only *warns* (doesn't raise) on a
+  mismatch against the local tokenizer, and stays silent when the key is absent (every checkpoint
+  saved before this existed) -- the vocab_size-only compatibility check it had before this would
+  happily load a checkpoint trained against a *different* tokenizer of the same size and produce
+  silent garbage, which is exactly the failure mode a multi-machine architecture comparison
+  (`runs/contest.sh`, see [docs/contest.md](docs/contest.md)) would otherwise hit undetected.
 
 ## What runs on this Mac
 

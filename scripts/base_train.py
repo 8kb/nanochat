@@ -122,6 +122,7 @@ else:
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
+tokenizer_fingerprint = tokenizer.fingerprint()
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -485,6 +486,8 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
+                "core_metric": results.get("core_metric"), # None unless a CORE eval ran this exact step
+                "tokenizer_fingerprint": tokenizer_fingerprint,
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,

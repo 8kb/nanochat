@@ -4,6 +4,7 @@ BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken
 
 import os
 import copy
+import hashlib
 from functools import lru_cache
 
 SPECIAL_TOKENS = [
@@ -128,6 +129,17 @@ class RustBPETokenizer:
 
     def decode_single_token_bytes(self, token_id):
         return self.enc.decode_single_token_bytes(token_id)
+
+    def fingerprint(self):
+        """Content hash of the vocab (first 16 hex chars of sha256 over every token's bytes, in id
+        order) -- identifies *what a token id means*, not the file it happens to be pickled as.
+        Used to catch two checkpoints trained against different tokenizers, e.g. a cloud-trained
+        model and this machine's own tokenizer, which would otherwise both pass the vocab_size-only
+        compatibility check in checkpoint_manager.build_model and silently produce garbage."""
+        h = hashlib.sha256()
+        for token_id in range(self.get_vocab_size()):
+            h.update(self.decode_single_token_bytes(token_id))
+        return h.hexdigest()[:16]
 
     def save(self, tokenizer_dir):
         # save the encoding object to disk

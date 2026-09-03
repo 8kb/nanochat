@@ -151,8 +151,8 @@ def main():
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step, arch=args.arch)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)
-    model_name = f"base_model (step {meta['step']})"
-    model_slug = f"base_model_{meta['step']:06d}"
+    model_name = f"{meta['model_tag']} (step {meta['step']})"
+    model_slug = f"{meta['model_tag']}_{meta['step']:06d}" # includes the tag so two architectures evaluated in the same run don't overwrite each other's CSV
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")

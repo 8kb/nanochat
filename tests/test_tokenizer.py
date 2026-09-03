@@ -51,6 +51,15 @@ def test_encode_prepend_append(tokenizer):
     assert ids[-1] == tokenizer.encode_special("<|user_end|>")
 
 
+def test_fingerprint_is_deterministic(tokenizer):
+    assert tokenizer.fingerprint() == tokenizer.fingerprint()
+
+
+def test_fingerprint_differs_for_a_different_tokenizer(tokenizer):
+    other = RustBPETokenizer.train_from_iterator(iter(["completely different corpus, no overlap at all"] * 8), tokenizer.get_vocab_size())
+    assert other.fingerprint() != tokenizer.fingerprint()
+
+
 def test_encode_batch(tokenizer):
     texts = ["hello", "world"]
     ids = tokenizer.encode(texts)

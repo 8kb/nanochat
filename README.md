@@ -100,7 +100,15 @@ python -m scripts.model_info --arch gpt,llama,llama_kvshare --depth 12
 
 Prints parameter counts (by role), FLOPs/token, KV-cache bytes, and the derived training horizon
 for each — no GPU, no cached training data, no training. `--json` for scripted comparisons,
-`--gpu "NVIDIA A100" --num-gpus 4` for a GPU-hours estimate.
+`--gpu "NVIDIA A100" --num-gpus 4` for a GPU-hours estimate. `--checkpoints` switches to
+inspecting *already-trained* checkpoints instead (params/FLOPs plus val bpb/CORE/wall-clock and a
+tokenizer-fingerprint match check, read from each checkpoint's own meta.json — still no weights
+loaded): `python -m scripts.model_info --checkpoints` inspects every checkpoint under
+`base_checkpoints/`, or pass a comma-separated list of tags.
+
+`runs/contest.sh` runs all three architectures on the same tokenizer and the same iso-FLOPs
+compute budget on rented cloud GPUs — see [`docs/contest.md`](docs/contest.md) for the full
+RunPod runbook (always `DRY_RUN=1` first; nothing rents anything on its own).
 
 ## Docs index
 
@@ -109,6 +117,7 @@ for each — no GPU, no cached training data, no training. `--json` for scripted
 | [`AGENTS.md`](AGENTS.md) | Repo map, invariants that will bite you, what runs on this Mac |
 | [`docs/architecture.md`](docs/architecture.md) | The `BaseModel`/registry contract, how to add an architecture, cross-layer KV sharing |
 | [`docs/roadmap.md`](docs/roadmap.md) | Staged plan: what's done, what's next |
+| [`docs/contest.md`](docs/contest.md) | Running the architecture contest on RunPod: pod spec, budgeting, comparing results |
 | [`docs/upstream-sync.md`](docs/upstream-sync.md) | Where `gpt.py` code went, how to merge upstream |
 | [`docs/upstream/README.md`](docs/upstream/README.md) | Original nanochat README (speedrun, leaderboard, research workflow) |
 | [`docs/upstream/LOG.md`](docs/upstream/LOG.md) | Upstream's running experiment log |

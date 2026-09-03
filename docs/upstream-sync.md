@@ -144,6 +144,23 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
     gained `--arch-opt KEY=VALUE` (`nanochat.model.registry.apply_arch_opts`) and changed
     `--window-pattern`'s default from `"SSSL"` to `None` (only passed to `from_depth` when given,
     so each architecture's own default applies instead of GPT's silently overriding it).
+- **Stage 5** (architecture contest harness, `runs/contest.sh`, [contest.md](contest.md)): four
+  small touch points, all upstream-adjacent:
+  - `nanochat/tokenizer.py`'s `RustBPETokenizer` gained `fingerprint()` (a content hash of the
+    vocab, sha256 over every token's bytes in id order).
+  - `scripts/base_train.py`'s checkpoint-save metadata dict gained two keys:
+    `tokenizer_fingerprint` (from the tokenizer already loaded for training) and `core_metric`
+    (from `results.get("core_metric")` — `None` unless a CORE eval happened to run on that exact
+    step, which it always does at the final step when `--core-metric-every > 0`).
+  - `nanochat/checkpoint_manager.py`'s `build_model` gained a fingerprint check after its existing
+    vocab-size assert: if `meta_data["tokenizer_fingerprint"]` is present and disagrees with the
+    currently-loaded tokenizer's, it logs a warning (not an assert — loading still succeeds; old
+    checkpoints without the key are silently skipped). `load_model_from_dir` now also stamps the
+    resolved `model_tag` into the returned meta dict (`meta["model_tag"]`), since callers that
+    don't pass an explicit `--model-tag` previously had no way to know which checkpoint got picked.
+  - `scripts/base_eval.py`'s CORE-eval CSV filename changed from `base_model_<step>.csv` to
+    `<model_tag>_<step>.csv` (using the newly-stamped `meta["model_tag"]`), since three
+    architectures evaluated in one `NANOCHAT_BASE_DIR` previously all wrote the same filename.
 
 ## Merge procedure for a new upstream commit
 
