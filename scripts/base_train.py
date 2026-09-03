@@ -24,7 +24,9 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.model import get_model_class, get_config_class
+from nanochat.model import get_model_class, get_config_class, apply_arch_opts
+from nanochat.model.param_roles import collect_param_roles
+from nanochat.scaling import derive_training_plan, B_REF
 from nanochat.model.components.linear import Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
@@ -52,7 +54,8 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default=None, help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'); default is the architecture's own from_depth default (GPT: SSSL, Llama/LlamaKVShare: L) rather than one arch's default overriding another's")
+parser.add_argument("--arch-opt", action="append", default=None, metavar="KEY=VALUE", help="override an architecture-specific config field beyond from_depth's fixed kwargs, e.g. --arch-opt kv_share_frac=0.667 (repeatable)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -112,9 +115,6 @@ else:
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
@@ -131,17 +131,22 @@ def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data).
     Architecture is selected via --arch; the config class it registers must implement
     from_depth(...) (the --depth/--aspect-ratio/--head-dim muP-style dial), matching
-    GPTConfig.from_depth in nanochat/model/gpt/config.py."""
+    GPTConfig.from_depth in nanochat/model/gpt/config.py. --window-pattern is only passed through
+    when explicitly given, so each architecture's own from_depth default (e.g. GPT's SSSL vs.
+    Llama's L) applies rather than one arch's CLI default silently overriding another's.
+    --arch-opt KEY=VALUE overrides reach fields from_depth's fixed kwarg set doesn't know about
+    (e.g. LlamaKVShareConfig.kv_share_frac)."""
     config_cls = get_config_class(args.arch)
     model_cls = get_model_class(args.arch)
     assert hasattr(config_cls, "from_depth"), (
         f"Architecture {args.arch!r} ({config_cls.__name__}) has no from_depth(...) classmethod; "
         "the --depth/--aspect-ratio/--head-dim CLI dial requires one (see GPTConfig.from_depth)."
     )
-    config = config_cls.from_depth(
-        depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
-        max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
-    )
+    from_depth_kwargs = dict(aspect_ratio=args.aspect_ratio, head_dim=args.head_dim, max_seq_len=args.max_seq_len, vocab_size=vocab_size)
+    if args.window_pattern is not None:
+        from_depth_kwargs["window_pattern"] = args.window_pattern
+    config = config_cls.from_depth(depth, **from_depth_kwargs)
+    config = apply_arch_opts(config, args.arch_opt)
     with torch.device("meta"):
         model_meta = model_cls(config)
     return model_meta
@@ -151,6 +156,9 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = model_config.to_dict()
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+if not using_fa3 and model_config_kwargs.get("window_pattern", "L") != "L":
+    print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{model_config_kwargs['window_pattern']}'). Your GPU utilization will be terrible.")
+    print0("WARNING: Recommend --window-pattern L for full context attention without alternating sliding window patterns.")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
@@ -251,7 +259,11 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
-# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
+# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size,
+# learning rates, weight decay. The math itself lives in nanochat/scaling.py (architecture-
+# agnostic, no I/O) so scripts/model_info.py can report the same numbers without training
+# anything; this script owns every print statement (some are grepped verbatim by
+# runs/scaling_laws.sh and runs/miniseries.sh -- see AGENTS.md).
 
 # Get the parameter counts of our model
 param_counts = model.num_scaling_params()
@@ -262,9 +274,6 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# 1) Use scaling laws to determine the optimal training horizon in tokens
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
 def get_scaling_params(m):
     # As for which params to use exactly, matrix + unembedding params gives cleanest scaling laws
     # (see dev/LOG.md Jan 27, 2026). Reads role names directly via collect_param_roles rather than
@@ -273,49 +282,47 @@ def get_scaling_params(m):
     # GPT overrides it to keep legacy names ("transformer_matrices", "lm_head") that
     # runs/scaling_laws.sh greps, while other architectures use BaseModel's generic role-named
     # default (see nanochat/model/base.py).
-    from nanochat.model.param_roles import collect_param_roles
     roles = collect_param_roles(m)
     matrix = sum(p.numel() for p in roles.get('matrix', []))
     unembedding = sum(p.numel() for p in roles.get('unembedding', []))
     return matrix + unembedding
 num_scaling_params = get_scaling_params(model)
 print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})") # runs/miniseries.sh greps this exact line
-target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
-D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
-B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
-# 2) Now that we have the token horizon, we can calculate the optimal batch size
-# We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-# The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
-total_batch_size = args.total_batch_size # user-provided override is possible
-if total_batch_size == -1:
-    batch_size_ratio = target_tokens / D_REF
-    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
+plan = derive_training_plan(
+    num_scaling_params=num_scaling_params,
+    d_ref_scaling_params=get_scaling_params(d12_ref),
+    num_flops_per_token=num_flops_per_token,
+    target_param_data_ratio=args.target_param_data_ratio,
+    target_flops=args.target_flops,
+    num_iterations=args.num_iterations,
+    total_batch_size=args.total_batch_size,
+    weight_decay=args.weight_decay,
+)
+target_tokens = plan.target_tokens
+total_batch_size = plan.total_batch_size
+if plan.auto_batch_size:
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
-
-# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
-batch_lr_scale = 1.0
-batch_ratio = total_batch_size / B_REF # B/B_ref
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
-    batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
+batch_lr_scale = plan.batch_lr_scale
+if batch_lr_scale != 1.0:
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
-
-# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
-# λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
-weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+weight_decay_scaled = plan.weight_decay_scaled
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+num_iterations = plan.num_iterations
+if plan.horizon_source == "user":
+    print0(f"Using user-provided number of iterations: {num_iterations:,}")
+elif plan.horizon_source == "target_flops":
+    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+elif plan.horizon_source == "target_param_data_ratio":
+    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+total_tokens = plan.total_tokens
+print0(f"Total number of training tokens: {total_tokens:,}")
+print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Total training FLOPs estimate: {plan.total_flops:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
@@ -348,28 +355,8 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokeni
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
-
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
-    num_iterations = args.num_iterations
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
-elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
-    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
-elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
-    num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
-else:
-    raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+# Set up the LR/momentum/weight-decay schedulers (num_iterations was already derived above, via
+# nanochat.scaling.derive_training_plan, before the optimizer was built)
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):

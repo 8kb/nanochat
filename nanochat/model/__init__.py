@@ -8,14 +8,15 @@ add or look up other architectures. See docs/architecture.md for the full contra
 """
 
 from nanochat.model.base import BaseModel, BaseModelConfig, AttentionLayerSpec, BaseEmbedding, BaseBlock, BaseUnembedding
-from nanochat.model.registry import register_model, get_model_class, get_config_class, config_from_dict
+from nanochat.model.registry import register_model, get_model_class, get_config_class, config_from_dict, apply_arch_opts
 
 # Import architecture packages so their @register_model decorators run and populate the registry.
 from nanochat.model.gpt import GPT, GPTConfig
 from nanochat.model.llama import Llama, LlamaConfig
+from nanochat.model.llama_kvshare import LlamaKVShare, LlamaKVShareConfig
 
 __all__ = [
     "BaseModel", "BaseModelConfig", "AttentionLayerSpec", "BaseEmbedding", "BaseBlock", "BaseUnembedding",
-    "register_model", "get_model_class", "get_config_class", "config_from_dict",
-    "GPT", "GPTConfig", "Llama", "LlamaConfig",
+    "register_model", "get_model_class", "get_config_class", "config_from_dict", "apply_arch_opts",
+    "GPT", "GPTConfig", "Llama", "LlamaConfig", "LlamaKVShare", "LlamaKVShareConfig",
 ]

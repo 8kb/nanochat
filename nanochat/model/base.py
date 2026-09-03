@@ -36,11 +36,16 @@ class AttentionLayerSpec:
     """Per-layer attention geometry: what the KV cache needs to allocate for this layer, and
     what the FLOPs/KV-bytes accounting in nanochat.model.flops needs to charge for it.
     window=-1 means unlimited/full context; a non-negative window is the number of preceding
-    tokens attended to (matches the FA3 "left window" convention used by CausalSelfAttention)."""
+    tokens attended to (matches the FA3 "left window" convention used by CausalSelfAttention).
+    kv_slot identifies which KVCache slot this layer reads/writes; None means "this layer owns a
+    slot at its own position in layer_specs()" (the default, one-slot-per-layer case). A layer
+    that reuses an earlier layer's K/V (cross-layer KV sharing) sets kv_slot to that layer's slot
+    instead, so kv_cache_spec() allocates fewer slots than there are layers."""
     n_head: int
     n_kv_head: int
     head_dim: int
     window: int = -1
+    kv_slot: int | None = None
 
 
 class BaseEmbedding(nn.Module):
@@ -158,7 +163,9 @@ class BaseModel(nn.Module):
         return next(self.parameters()).device
 
     def kv_cache_spec(self) -> dict:
-        """What nanochat.engine.KVCache needs to allocate: num_layers, num_heads, head_dim.
+        """What nanochat.engine.KVCache needs to allocate: num_kv_slots, num_heads, head_dim.
+        num_kv_slots is the number of *distinct* KV caches, which can be fewer than len(layer_specs())
+        when layers share a slot (see AttentionLayerSpec.kv_slot) -- e.g. cross-layer KV sharing.
         Requires uniform n_kv_head/head_dim across layers; architectures with heterogeneous
         per-layer KV geometry (e.g. mixed local/global head dims) should override this."""
         specs = self.layer_specs()
@@ -169,7 +176,12 @@ class BaseModel(nn.Module):
             "kv_cache_spec() requires uniform n_kv_head/head_dim across layers; "
             "override kv_cache_spec() for heterogeneous architectures"
         )
-        return {"num_heads": specs[0].n_kv_head, "head_dim": specs[0].head_dim, "num_layers": len(specs)}
+        slots = {i if s.kv_slot is None else s.kv_slot for i, s in enumerate(specs)}
+        assert slots == set(range(len(slots))), (
+            "kv_cache_spec() requires kv slots to be a contiguous 0..M-1 range; "
+            "override kv_cache_spec() for other slot layouts"
+        )
+        return {"num_heads": specs[0].n_kv_head, "head_dim": specs[0].head_dim, "num_kv_slots": len(slots)}
 
     def num_matmul_params(self):
         from nanochat.model import flops

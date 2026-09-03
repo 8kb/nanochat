@@ -10,7 +10,7 @@ python -m pytest tests/test_model_llama.py -v
 import torch
 
 from nanochat.model.param_roles import collect_param_roles
-from nanochat.model.llama.mlp import SwiGLUMLP
+from nanochat.model.components.mlp import SwiGLUMLP
 
 
 def test_num_scaling_params_uses_generic_role_based_shape(tiny_llama):

@@ -89,6 +89,21 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   `nanochat/model/gpt/migrations.py`'s Stage 2 resid/x0-lambda split for the pattern) or old
   optimizer shards fail to load — `scripts/base_train.py`'s `--resume-from-step` and
   `scripts/chat_sft.py`'s `--load-optimizer` are the two call sites that route through it.
+- **`kv_cache.advance()` belongs to `Model.forward`, not the last attention layer.** It used to
+  fire inside `CausalSelfAttention.forward` on `self.layer_idx == kv_cache.n_layers - 1` -- broken
+  the moment a model has fewer KV slots than layers (cross-layer KV sharing), since no layer's
+  index then equals the slot count. Every `BaseModel.forward` now calls
+  `kv_cache.advance(idx.size(1))` itself, once, after its whole block loop runs (see
+  `GPT.forward`/`Llama.forward`/`LlamaKVShare.forward`).
+- **`AttentionLayerSpec.kv_slot` decouples layer index from KV-cache slot.**
+  `BaseModel.kv_cache_spec()["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
+  at an earlier layer's slot (cross-layer KV sharing, `nanochat.model.llama_kvshare`) shares that
+  `nanochat.engine.KVCache` allocation instead of getting its own. `KVCache`'s constructor kwarg
+  and attribute are `num_kv_slots`/`n_slots` (not `num_layers`/`n_layers`), and
+  `get_layer_cache(layer_idx)` is now `get_slot_cache(slot)` -- see "Cross-layer KV sharing" in
+  [docs/architecture.md](docs/architecture.md) for the full mechanism, including a real FA3-vs-SDPA
+  divergence in what `k=None` means to `flash_attn_with_kvcache` that a naive sharing
+  implementation would hit.
 
 ## What runs on this Mac
 

@@ -66,14 +66,33 @@ def estimate_prefill_flops(layer_specs, num_matmul_params, num_tokens):
     return 2 * num_matmul_params * num_tokens + attn_flops
 
 
+def distinct_kv_specs(layer_specs):
+    """One spec per distinct KV cache slot (see AttentionLayerSpec.kv_slot), rather than one per
+    layer -- layers that share a slot (cross-layer KV sharing) must not be double-counted when
+    accounting for what's actually *stored*. Layer order is preserved; a layer with kv_slot=None
+    is its own slot at its own position, matching BaseModel.kv_cache_spec()'s convention."""
+    seen = set()
+    distinct = []
+    for i, spec in enumerate(layer_specs):
+        slot = i if spec.kv_slot is None else spec.kv_slot
+        if slot not in seen:
+            seen.add(slot)
+            distinct.append(spec)
+    return distinct
+
+
 def kv_bytes_per_token(layer_specs, dtype_itemsize):
-    """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
-    return sum(2 * spec.n_kv_head * spec.head_dim * dtype_itemsize for spec in layer_specs)
+    """Bytes to *store* one token of KV cache during inference, per row -- one contribution per
+    distinct KV slot, not per layer, so cross-layer KV sharing correctly shows a smaller footprint
+    than one-slot-per-layer at the same layer count."""
+    return sum(2 * spec.n_kv_head * spec.head_dim * dtype_itemsize for spec in distinct_kv_specs(layer_specs))
 
 
 def kv_read_bytes(layer_specs, dtype_itemsize, context_len):
-    """Bytes of KV cache *read* by one decode step at a given context length, per row.
-    Sliding window layers only attend to (and read) the last `window` tokens."""
+    """Bytes of KV cache *read* by one decode step at a given context length, per row. Summed per
+    layer (not per slot): a layer that reuses another layer's stored K/V still issues its own read
+    of that cache during its own attention call. Sliding window layers only attend to (and read)
+    the last `window` tokens."""
     total = 0
     for spec in layer_specs:
         w = _effective_window(spec.window, context_len)

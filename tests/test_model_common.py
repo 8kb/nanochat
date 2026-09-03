@@ -1,9 +1,9 @@
 """
 Architecture-agnostic model tests, parametrized over every registered architecture via the
-tiny_model fixture (tests/conftest.py, currently ["gpt", "llama"]). Passing for every
-architecture is the actual proof that nanochat.model.base's contracts (BaseModel, BaseEmbedding,
-BaseBlock, BaseUnembedding, the parameter-role protocol) are real interfaces, not just GPT with
-extra indirection. Architecture-specific behavior lives in tests/test_model_<arch>.py.
+tiny_model fixture (tests/conftest.py's TINY_KWARGS_BY_ARCH). Passing for every architecture is
+the actual proof that nanochat.model.base's contracts (BaseModel, BaseEmbedding, BaseBlock,
+BaseUnembedding, the parameter-role protocol) are real interfaces, not just GPT with extra
+indirection. Architecture-specific behavior lives in tests/test_model_<arch>.py.
 
 python -m pytest tests/test_model_common.py -v
 """
@@ -71,14 +71,20 @@ def test_setup_optimizer_param_groups_partition_all_parameters_exactly(tiny_mode
 
 
 def test_layer_specs_and_kv_cache_spec_are_consistent(tiny_model):
+    """num_kv_slots can be <= len(specs): an architecture with cross-layer KV sharing (see
+    nanochat.model.llama_kvshare) allocates fewer KVCache slots than it has layers, with each
+    layer's kv_slot pointing into a contiguous 0..M-1 range."""
     specs = tiny_model.layer_specs()
     assert len(specs) == tiny_model.config.n_layer
     n_kv_heads = {s.n_kv_head for s in specs}
     head_dims = {s.head_dim for s in specs}
     assert len(n_kv_heads) == 1 and len(head_dims) == 1
+    slots = {i if s.kv_slot is None else s.kv_slot for i, s in enumerate(specs)}
+    assert slots == set(range(len(slots))), "kv slots must be a contiguous 0..M-1 range"
     cache_spec = tiny_model.kv_cache_spec()
     assert cache_spec == {
         "num_heads": specs[0].n_kv_head,
         "head_dim": specs[0].head_dim,
-        "num_layers": len(specs),
+        "num_kv_slots": len(slots),
     }
+    assert cache_spec["num_kv_slots"] <= len(specs)

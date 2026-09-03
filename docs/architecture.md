@@ -9,10 +9,11 @@ those call sites.
 nanochat/model/
 ├── __init__.py            public API: BaseModel, BaseModelConfig, AttentionLayerSpec,
 │                          BaseEmbedding, BaseBlock, BaseUnembedding, register_model,
-│                          get_model_class, get_config_class, config_from_dict, GPT, GPTConfig
+│                          get_model_class, get_config_class, config_from_dict, apply_arch_opts,
+│                          GPT, GPTConfig, Llama, LlamaConfig, LlamaKVShare, LlamaKVShareConfig
 ├── base.py                the contract: BaseModelConfig, BaseModel, BaseEmbedding, BaseBlock,
-│                          BaseUnembedding, AttentionLayerSpec
-├── registry.py             arch name -> (config class, model class)
+│                          BaseUnembedding, AttentionLayerSpec (incl. kv_slot)
+├── registry.py             arch name -> (config class, model class); apply_arch_opts()
 ├── param_roles.py           parameter-role protocol backing setup_optimizer()/num_scaling_params()
 ├── flops.py                  FLOPs / KV-cache-bytes accounting, generic over layer_specs()
 ├── components/            reusable building blocks any architecture can import
@@ -20,22 +21,31 @@ nanochat/model/
 │   ├── norm.py               norm()         -- parameter-free RMSNorm
 │   ├── rope.py                 apply_rotary_emb(), precompute_rotary_embeddings() (free functions)
 │   ├── rotary.py                 RotaryEmbedding  -- owns cos/sin buffers, shared across layers
-│   ├── attention.py               has_ve(), CausalSelfAttention  (FA3/SDPA, GQA, value residual)
-│   ├── mlp.py                      MLP           -- relu² MLP
-│   ├── block.py                     Block         -- BaseBlock: attn + MLP + resid/x0 lambdas
+│   ├── attention.py               has_ve(), CausalSelfAttention  (FA3/SDPA, GQA, value residual,
+│   │                                cross-layer KV sharing -- see "Cross-layer KV sharing" below)
+│   ├── mlp.py                      MLP, SwiGLUMLP  -- relu² MLP, Llama-style gated MLP
+│   ├── block.py                     Block, PlainBlock  -- BaseBlock implementations
 │   ├── embedding.py                   Smear, TokenEmbedding  -- BaseEmbedding
 │   ├── unembedding.py                   LMHead      -- BaseUnembedding
-│   └── windows.py                        compute_window_sizes()  -- sliding-window pattern tiling
+│   ├── windows.py                        compute_window_sizes()  -- sliding-window pattern tiling
+│   └── kv_sharing.py                       compute_kv_slots()  -- cross-layer KV-slot assignment
 ├── gpt/                    the original architecture
 │   ├── config.py             GPTConfig(BaseModelConfig)
 │   ├── model.py                GPT(BaseModel) -- wires Embedding/Block/Unembedding together
 │   └── migrations.py            old-checkpoint backward-compat patches (config/state/optimizer)
-└── llama/                  the second architecture -- see "Worked example: llama" below
-    ├── config.py             LlamaConfig(BaseModelConfig)
-    ├── model.py                Llama(BaseModel) -- reuses most of components/ verbatim
-    ├── block.py                  PlainBlock(BaseBlock) -- no resid/x0-lambda mixing
-    └── mlp.py                      SwiGLUMLP
+├── llama/                  the second architecture -- see "Worked example: llama" below
+│   ├── config.py             LlamaConfig(BaseModelConfig)
+│   └── model.py                Llama(BaseModel) -- reuses components/ verbatim, incl. PlainBlock
+└── llama_kvshare/          the third architecture -- see "Worked example: llama_kvshare" below
+    ├── config.py             LlamaKVShareConfig(LlamaConfig) -- adds kv_share_frac
+    └── model.py                LlamaKVShare(BaseModel) -- Llama + cross-layer KV sharing
 ```
+
+`nanochat/scaling.py` (`derive_training_plan`) and `scripts/model_info.py` are outside `nanochat/model/`
+but round out the same contract: the former is the training-horizon math `scripts/base_train.py`
+and `scripts/model_info.py` both call, the latter reports every number in this doc (params, FLOPs,
+KV bytes, training horizon) for any registered architecture purely from a meta-device build --
+no GPU, no data, no training. See "Verifying a change is behavior-preserving" below.
 
 ## The three module contracts
 
@@ -99,6 +109,8 @@ class AttentionLayerSpec:         # a dataclass, one per transformer layer
     n_kv_head: int
     head_dim: int
     window: int = -1              # -1 = full/unlimited context
+    kv_slot: int | None = None    # None = "owns a slot at its own position"; see "Cross-layer
+                                   # KV sharing" below for a layer that reuses another's slot
 
 class BaseModel(nn.Module):
     # you implement these:
@@ -118,7 +130,7 @@ class BaseModel(nn.Module):
 
     # you get these for free, built on layer_specs():
     def get_device(self)
-    def kv_cache_spec(self) -> dict          # {num_heads, head_dim, num_layers}
+    def kv_cache_spec(self) -> dict          # {num_heads, head_dim, num_kv_slots}
     def num_matmul_params(self)
     def estimate_flops(self)
     def estimate_decode_flops(self, context_len)
@@ -136,7 +148,9 @@ matter how its per-layer attention geometry varies.
 
 `kv_cache_spec()`'s default implementation requires uniform `n_kv_head`/`head_dim` across layers
 (true for GPT). An architecture with heterogeneous per-layer KV geometry (e.g. mixed local/global
-attention with different head dims) should override `kv_cache_spec()` directly.
+attention with different head dims) should override `kv_cache_spec()` directly. `num_kv_slots` can
+be *fewer* than `len(layer_specs())`: a layer whose `AttentionLayerSpec.kv_slot` points at an
+earlier layer's slot doesn't get its own `KVCache` allocation (see "Cross-layer KV sharing" below).
 
 ### Implicit requirements not spelled out above
 
@@ -266,7 +280,11 @@ registry existed) defaults to `"gpt"`.
    If you want it to work with `scripts/base_train.py`'s `--depth` dial, add a
    `from_depth(depth, aspect_ratio, head_dim, max_seq_len, vocab_size, window_pattern)`
    classmethod (see `GPTConfig.from_depth` for the muP-style derivation GPT uses) — otherwise
-   `base_train.py` raises a clear assertion telling you it's missing.
+   `base_train.py` raises a clear assertion telling you it's missing. Any field `from_depth`
+   doesn't take a fixed kwarg for (e.g. `LlamaKVShareConfig.kv_share_frac`) is still reachable
+   from the CLI via `--arch-opt field_name=value` (`scripts/base_train.py` and
+   `scripts/model_info.py` both accept it; `nanochat.model.registry.apply_arch_opts` validates the
+   field exists and parses the value with `ast.literal_eval`, so it never silently no-ops a typo).
 3. `model.py`: implement `BaseModel`, reusing whatever fits from `nanochat/model/components/`.
    `CausalSelfAttention`/`MLP` take explicit dims (not a config object), so they're reusable by a
    config with different field names. Reach for `Block` directly (or `TokenEmbedding`/`LMHead`) if
@@ -294,8 +312,10 @@ smear / backout / per-layer resid-x0 lambdas) exists specifically to test whethe
 above are real interfaces or just GPT with extra indirection. What it reused verbatim from
 `nanochat/model/components/`: `CausalSelfAttention` (GQA/RoPE/QK-norm are not GPT-specific —
 constructed with `has_value_embed=False`), `RotaryEmbedding`, `TokenEmbedding` (constructed with
-`smear=False`), `LMHead`. What it wrote fresh: `SwiGLUMLP` (`nanochat/model/llama/mlp.py`) and
-`PlainBlock` (`nanochat/model/llama/block.py`, `BaseBlock`'s `x0` argument accepted but unused —
+`smear=False`), `LMHead`, and (since Stage 4) `SwiGLUMLP`/`PlainBlock` themselves — both now live
+in `nanochat/model/components/mlp.py` and `block.py` alongside GPT's `MLP`/`Block`, since
+`llama_kvshare` (below) needed `PlainBlock` too and a second consumer is what earns a component its
+place there (`PlainBlock`'s `x0` argument is accepted per the `BaseBlock` contract but unused —
 this topology has no `x0` residual). `Llama` itself (`nanochat/model/llama/model.py`) needed **no
 `PARAM_ROLES` declarations anywhere** in its whole tree: every parameter it owns is either a
 `Linear` weight (defaults to role `"matrix"`) or reused directly from a GPT component that already
@@ -303,6 +323,64 @@ declares its own roles. It also needed no `patch_config_dict`/`patch_state_dict`
 `patch_optimizer_state_dict` overrides — a brand-new architecture has no legacy checkpoints, so
 `BaseModel`'s no-op defaults are exactly correct. This is what the contracts are supposed to make
 possible: a second architecture is mostly reuse, with new code only where it's genuinely different.
+
+## Cross-layer KV sharing
+
+`nanochat/model/llama_kvshare/` (Gemma-3n-style) makes the last `kv_share_frac` fraction of layers
+reuse an earlier layer's K/V instead of computing their own — fewer parameters (no `c_k`/`c_v` on
+those layers), less prefill compute, and a smaller KV cache, all at the same depth. It's also the
+first architecture to break an assumption that used to be baked into three places: "one KV-cache
+slot per layer." Fixing that generically (so GPT and Llama, which still are one-slot-per-layer,
+stay byte-identical) is what this section documents.
+
+**The slot/layer decoupling.** `AttentionLayerSpec.kv_slot` (see above) identifies which `KVCache`
+slot a layer's K/V lives in, separate from its position in `layer_specs()`. `BaseModel.kv_cache_spec()`
+counts *distinct* slots (`num_kv_slots`), which `nanochat.engine.KVCache` allocates (`KVCache.n_slots`,
+`KVCache.get_slot_cache(slot)` — both renamed from `n_layers`/`get_layer_cache` in this stage, the
+forcing function that found every reader). `nanochat.model.components.kv_sharing.compute_kv_slots(n_layer,
+kv_share_frac)` is the assignment: the first `n_layer - round(n_layer * kv_share_frac)` layers each
+own a slot at their own index; every later layer's slot is the last owning layer's.
+
+**`CausalSelfAttention` gained `kv_slot`/`produces_kv` constructor kwargs** (both default to
+today's one-slot-per-layer behavior) and a `kv_bus=None` forward kwarg. A producer layer
+(`produces_kv=True`, the default) computes `k`/`v` as before, then — if given a `kv_bus` dict —
+writes `kv_bus[self.kv_slot] = (k, v)` after RoPE/QK-norm/the ×1.2 scale, i.e. exactly the tensors
+it's about to attend with. A consumer layer (`produces_kv=False`, so no `c_k`/`c_v` at all) reads
+`k, v = kv_bus[self.kv_slot]` and only projects/rotates its own queries
+(`RotaryEmbedding.apply_to_q`). Both then call the *same* `flash_attn_with_kvcache(q, k_cache,
+v_cache, k=k, v=v, ...)` — a model wires this by threading one `kv_bus = {}` dict through its block
+loop each forward pass (see `LlamaKVShare.forward`); GPT and Llama simply never pass one, so nothing
+about them changes.
+
+**Why the consumer passes the producer's own `k`/`v` back in, instead of `k=None`** (a real trap,
+worth knowing if you touch this code): `flash_attn_with_kvcache(k=None)` means different things on
+the two backends. `nanochat/flash_attention.py`'s SDPA fallback reads `k_cache[:, :pos+T_new]`
+regardless of whether `k`/`v` were passed — it doesn't care. FA3's real kernel, given `k=None`,
+uses `seqlen_k = cache_seqlens`, which *excludes* the tokens the producer just wrote earlier in the
+same forward pass, silently misaligning attention by `T_new` positions. Re-passing the producer's
+own tensors sidesteps this: the cache write becomes a value-idempotent no-op (those exact tensors
+are already there), and both backends then behave identically to the producer's own call. This is
+also why `kv_cache.advance()` moved out of `CausalSelfAttention.forward` entirely (it used to fire
+on `layer_idx == kv_cache.n_layers - 1`, which breaks the moment `n_layers` != slot count) and into
+each model's own `forward`, called once after the whole block loop.
+
+**`nanochat/model/flops.py`'s `kv_bytes_per_token`** now sums one contribution per *distinct* slot
+(`distinct_kv_specs`), not per layer — otherwise it would over-report stored KV bytes by exactly
+the sharing factor, the one number this architecture exists to shrink. `kv_read_bytes` stays
+per-layer: a consumer layer still issues its own read of the shared cache during its own attention
+call, so its DRAM traffic isn't smaller just because it doesn't own the slot.
+
+### Worked example: `llama_kvshare`
+
+`nanochat/model/llama_kvshare/` is ~90 lines total across `config.py`/`model.py`. `LlamaKVShareConfig`
+adds one field (`kv_share_frac: float = 0.5`) to `LlamaConfig`; `from_depth` is inherited
+unchanged (it builds via `cls(...)`, so it just carries the extra field's default through — reach
+it with `--arch-opt kv_share_frac=0.667`). `LlamaKVShare.__init__` calls `compute_kv_slots(n_layer,
+kv_share_frac)` once, then builds each `PlainBlock` with that layer's `kv_slot` and
+`produces_kv=(slot == layer_index)` — otherwise identical to `Llama.__init__`. `forward` threads a
+fresh `kv_bus = {}` through the block loop and calls `kv_cache.advance(...)` once at the end. Like
+`llama`, it needs **no `PARAM_ROLES` declarations** (a consumer block simply has fewer `Linear`
+submodules than a producer one — nothing new to declare either way) and no migration hooks.
 
 ## Checkpoint tags and architecture-aware discovery
 
@@ -435,6 +513,10 @@ tokens = list(generate_naive(model, prompt, max_tokens=64, temperature=0.0))
 # .kv_bytes_per_token(), .estimate_decode_flops(256), .estimate_prefill_flops(256)
 ```
 
+`scripts/model_info.py --arch gpt --depth 6` reports the same `num_scaling_params()`/`estimate_flops()`/
+`kv_bytes_per_token()` numbers without touching a checkpoint at all (meta-device only) — a faster
+first check when the change is purely about accounting, not weights.
+
 Every value should match exactly. This is how Stage 1's `nanochat/gpt.py` -> `nanochat/model/`
 extraction, and Stage 2's parameter-role/module-ownership restructure, were both checked end to
 end. If the change also touches optimizer grouping (e.g. a `setup_optimizer` policy change), also
@@ -443,8 +525,9 @@ a freshly built optimizer without error (a same-size group reorder passes size v
 corrupts silently — see "Optimizer state is checkpointed positionally" above, and
 `nanochat/model/gpt/migrations.py:patch_optimizer_state_dict` for the pattern if it doesn't).
 
-For an end-to-end smoke test of the training path on CPU/MPS (add `--arch=llama` or any other
-registered architecture to exercise it instead — the same command works unmodified):
+For an end-to-end smoke test of the training path on CPU/MPS (add `--arch=llama`,
+`--arch=llama_kvshare`, or any other registered architecture to exercise it instead — the same
+command works unmodified; add `--arch-opt kv_share_frac=...` to vary the KV-sharing fraction):
 
 ```bash
 python -m scripts.base_train --depth=2 --head-dim=32 --window-pattern=L --max-seq-len=128 \

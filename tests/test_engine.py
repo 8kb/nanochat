@@ -40,7 +40,7 @@ class MockModel:
         """Matches nanochat.model.base.BaseModel.kv_cache_spec, which Engine.generate calls to
         size the KV cache."""
         m = self.config
-        return {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        return {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_kv_slots": m.n_layer}
 
     def forward(self, ids, kv_cache=None):
         """Return uniform logits so sampling is spread across vocab."""
@@ -93,22 +93,22 @@ def test_kv_cache_basic():
     num_heads = 3
     seq_len = 64
     head_dim = 5
-    num_layers = 6
+    num_kv_slots = 6
 
     kv_cache = KVCache(
         batch_size=batch_size,
         num_heads=num_heads,
         seq_len=seq_len,
         head_dim=head_dim,
-        num_layers=num_layers,
+        num_kv_slots=num_kv_slots,
         device="cpu",
         dtype=torch.float32,
     )
 
     # Check initial state
     assert kv_cache.get_pos() == 0
-    assert kv_cache.k_cache.shape == (num_layers, batch_size, seq_len, num_heads, head_dim)
-    assert kv_cache.v_cache.shape == (num_layers, batch_size, seq_len, num_heads, head_dim)
+    assert kv_cache.k_cache.shape == (num_kv_slots, batch_size, seq_len, num_heads, head_dim)
+    assert kv_cache.v_cache.shape == (num_kv_slots, batch_size, seq_len, num_heads, head_dim)
 
     # Test advance
     kv_cache.advance(10)
@@ -121,10 +121,10 @@ def test_kv_cache_basic():
     kv_cache.reset()
     assert kv_cache.get_pos() == 0
 
-    # Test get_layer_cache returns correct views
-    k_layer0, v_layer0 = kv_cache.get_layer_cache(0)
-    assert k_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
-    assert v_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
+    # Test get_slot_cache returns correct views
+    k_slot0, v_slot0 = kv_cache.get_slot_cache(0)
+    assert k_slot0.shape == (batch_size, seq_len, num_heads, head_dim)
+    assert v_slot0.shape == (batch_size, seq_len, num_heads, head_dim)
 
 
 def test_kv_cache_prefill():
@@ -132,12 +132,12 @@ def test_kv_cache_prefill():
     batch_size = 1
     num_heads = 4
     head_dim = 8
-    num_layers = 2
+    num_kv_slots = 2
 
     # Create source cache and advance it
     src_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=32,
-        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+        head_dim=head_dim, num_kv_slots=num_kv_slots, device="cpu", dtype=torch.float32,
     )
     # Write some data to source cache
     src_cache.k_cache[0, 0, :16, :, :] = 1.0
@@ -147,7 +147,7 @@ def test_kv_cache_prefill():
     # Create destination cache with larger seq_len
     dst_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=64,
-        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+        head_dim=head_dim, num_kv_slots=num_kv_slots, device="cpu", dtype=torch.float32,
     )
 
     # Prefill

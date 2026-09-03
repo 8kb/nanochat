@@ -8,7 +8,10 @@ python -m pytest tests/test_model_registry.py -v
 
 import pytest
 
-from nanochat.model import GPT, GPTConfig, Llama, LlamaConfig, get_model_class, get_config_class, config_from_dict
+from nanochat.model import (
+    GPT, GPTConfig, Llama, LlamaConfig, LlamaKVShare, LlamaKVShareConfig,
+    get_model_class, get_config_class, config_from_dict,
+)
 from tests.conftest import TINY_GPT_KWARGS, TINY_KWARGS_BY_ARCH
 
 
@@ -24,6 +27,12 @@ def test_llama_is_registered_under_arch_name():
     assert get_config_class("llama") is LlamaConfig
 
 
+def test_llama_kvshare_is_registered_under_arch_name():
+    assert LlamaKVShareConfig.arch == "llama_kvshare"
+    assert get_model_class("llama_kvshare") is LlamaKVShare
+    assert get_config_class("llama_kvshare") is LlamaKVShareConfig
+
+
 def test_unknown_arch_raises():
     with pytest.raises(ValueError):
         get_model_class("does-not-exist")
@@ -31,7 +40,7 @@ def test_unknown_arch_raises():
         get_config_class("does-not-exist")
 
 
-@pytest.mark.parametrize("arch", ["gpt", "llama"])
+@pytest.mark.parametrize("arch", list(TINY_KWARGS_BY_ARCH.keys()))
 def test_to_dict_config_from_dict_roundtrip(arch):
     config_cls = get_config_class(arch)
     config = config_cls(**TINY_KWARGS_BY_ARCH[arch])

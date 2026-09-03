@@ -293,13 +293,13 @@ class TestSDPAOnly:
         """Test SDPA with KV cache."""
         set_impl('sdpa')
         B, T_max, H, D = 2, 64, 4, 32
-        n_layers = 1
+        n_kv_slots = 1
 
         cache = KVCache(
             batch_size=B, num_heads=H, seq_len=T_max, head_dim=D,
-            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE
+            num_kv_slots=n_kv_slots, device=self.DEVICE, dtype=self.DTYPE
         )
-        k_cache, v_cache = cache.get_layer_cache(0)
+        k_cache, v_cache = cache.get_slot_cache(0)
 
         # Prefill
         T_prefill = 16

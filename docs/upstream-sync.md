@@ -120,6 +120,30 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
   "Parameter roles" in [architecture.md](architecture.md). `nanochat/model/base.py`'s
   `num_scaling_params()` went from abstract to a generic role-summing default, which GPT overrides
   to keep its legacy six-key dict (no GPT behavior change).
+- **Stage 4** (cross-layer KV sharing, `nanochat/model/llama_kvshare/`): three renames/relocations
+  worth knowing if a future upstream diff touches `nanochat/engine.py` or
+  `nanochat/model/components/attention.py`'s KV-cache path:
+  - `nanochat/engine.py`'s `KVCache.__init__` kwarg `num_layers` -> `num_kv_slots`, attribute
+    `n_layers` -> `n_slots`, method `get_layer_cache(layer_idx)` -> `get_slot_cache(slot)`.
+    `BaseModel.kv_cache_spec()`'s dict key `num_layers` -> `num_kv_slots` to match (splatted
+    straight into `KVCache.__init__`, so the two names are one contract).
+  - `CausalSelfAttention.forward`'s `if self.layer_idx == kv_cache.n_layers - 1:
+    kv_cache.advance(T)` was deleted; `kv_cache.advance(idx.size(1))` is now called once by each
+    model's own `forward`, after its whole block loop (`GPT.forward`/`Llama.forward`/
+    `LlamaKVShare.forward`) — see "Cross-layer KV sharing" in
+    [architecture.md](architecture.md#cross-layer-kv-sharing) for why (a same-layer-count
+    assumption broke once a layer's KV slot can differ from its position).
+  - `nanochat/model/llama/mlp.py` (`SwiGLUMLP`) and `nanochat/model/llama/block.py` (`PlainBlock`)
+    moved into `nanochat/model/components/mlp.py`/`block.py` (alongside GPT's `MLP`/`Block`), since
+    `llama_kvshare` needed `PlainBlock` too — a second consumer is this repo's bar for promoting
+    something into `components/`.
+  - New `nanochat/scaling.py:derive_training_plan`, extracted from `scripts/base_train.py`'s
+    module body (the batch-size/LR-scale/weight-decay/num_iterations derivation, previously
+    ~120 lines inline) so `scripts/model_info.py` can compute the same numbers without training
+    anything; `base_train.py` still owns every print statement. `scripts/base_train.py` also
+    gained `--arch-opt KEY=VALUE` (`nanochat.model.registry.apply_arch_opts`) and changed
+    `--window-pattern`'s default from `"SSSL"` to `None` (only passed to `from_depth` when given,
+    so each architecture's own default applies instead of GPT's silently overriding it).
 
 ## Merge procedure for a new upstream commit
 

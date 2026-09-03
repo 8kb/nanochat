@@ -176,6 +176,8 @@ class GPT(BaseModel):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         x = self.embedding(idx, kv_cache)
         x = self._forward_trunk(x, idx, kv_cache)
+        if kv_cache is not None:
+            kv_cache.advance(idx.size(1))
         return self.unembedding(x, targets, loss_reduction)
 
     @classmethod
