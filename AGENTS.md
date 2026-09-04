@@ -127,6 +127,15 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   present via `model_config`). `chat_sft.py`'s auto-generated output tag is also arch-qualified
   (`f"{arch}_d{depth}"` for non-gpt, matching `base_train.py`'s existing pattern) to avoid two
   architectures' SFT runs at the same depth silently overwriting one directory.
+- **An architecture that only changes config defaults should subclass the model it's based on, not
+  re-register it under a new name.** `nanochat.model.llama_kvshare_win.LlamaKVShareWin(LlamaKVShare):
+  pass` is the pattern — the config subclass carries the real change (`LlamaKVShareWinConfig`
+  overrides `window_pattern`'s default), the model class exists only so `get_model_class(...)`,
+  tracebacks, and checkpoint `repr`s name the right architecture. If the changed default is also a
+  `from_depth(...)` kwarg (e.g. `window_pattern`), `from_depth` itself must be overridden too, not
+  just the dataclass field — the parent classmethod's own signature default (`LlamaConfig.from_depth`
+  hardcodes `window_pattern="L"`) otherwise silently wins over the subclass's field default on any
+  `--depth`-driven run.
 
 ## What runs on this Mac
 

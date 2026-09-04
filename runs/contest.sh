@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# Train all three registered architectures (gpt, llama, llama_kvshare) on the same tokenizer and
-# the same compute budget, so their results are actually comparable; then SFT (chat) fine-tune and
-# chat_eval each resulting base checkpoint, so the contest compares both base and chat models, not
-# base alone. Records everything needed to compare them locally afterwards (see docs/contest.md).
+# Train all four registered architectures (gpt, llama, llama_kvshare, llama_kvshare_win) on the
+# same tokenizer and the same compute budget, so their results are actually comparable; then SFT
+# (chat) fine-tune and chat_eval each resulting base checkpoint, so the contest compares both base
+# and chat models, not base alone. Records everything needed to compare them locally afterwards
+# (see docs/contest.md). chat_eval runs under launch_module (torchrun on NPROC_PER_NODE>1) rather
+# than a single-rank `python` -- it already shards problems across ranks and all_reduces the
+# result (see scripts/chat_eval.py), so running it single-rank was leaving 3 of 4 billed GPUs idle
+# during eval, the same mistake that made eval cost more than training once already.
 #
 # Usage: bash runs/contest.sh [label]
 # Example: bash runs/contest.sh jan26
@@ -53,6 +57,7 @@ CONTEST_ROWS=(
     "gpt|16|"
     "llama|16|"
     "llama_kvshare|16|--arch-opt kv_share_frac=0.5"
+    "llama_kvshare_win|16|--arch-opt kv_share_frac=0.5"
 )
 
 LABEL="${1:-${LABEL:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
@@ -271,7 +276,7 @@ PYEOF
     eval_start_time=$(date +%s)
     MAX_PROBLEMS_ARG=()
     [ -n "$CHATEVAL_MAX_PROBLEMS" ] && MAX_PROBLEMS_ARG=(--max-problems="$CHATEVAL_MAX_PROBLEMS")
-    python -m scripts.chat_eval -i sft -g "$tag" \
+    launch_module scripts.chat_eval -i sft -g "$tag" \
         "${MAX_PROBLEMS_ARG[@]}" \
         $EXTRA_CHATEVAL_ARGS \
         2>&1 | tee "$eval_log_file"

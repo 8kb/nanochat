@@ -94,11 +94,17 @@ real training script compute identical numbers — the inspector's output was ch
 the prerequisite for Stage 5's architecture contest: choosing matched configs was guesswork before
 this existed.
 
-## Stage 5 — architecture contest (harness verified on real cloud GPUs; d16 + persistent-volume pipeline still ahead)
+## Stage 5 — architecture contest (persistent-volume pipeline verified on real cloud GPUs; H100 d12 contest and the real d16 contest still ahead)
 
-Train all three architectures (`gpt`, `llama`, `llama_kvshare`) on the same tokenizer and the same
-iso-FLOPs compute budget, so the comparison is real — and now also SFT (chat) fine-tune and
-`chat_eval` each resulting base checkpoint, so the contest compares base *and* chat models.
+Train all four architectures (`gpt`, `llama`, `llama_kvshare`, `llama_kvshare_win`) on the same
+tokenizer and the same iso-FLOPs compute budget, so the comparison is real — and now also SFT
+(chat) fine-tune and `chat_eval` each resulting base checkpoint, so the contest compares base *and*
+chat models. `llama_kvshare_win` (added after the persistent-volume pipeline's first real run
+below) is `llama_kvshare` plus sliding-window attention — a config-only subclass (one field default
+changed, `model.py` is `class LlamaKVShareWin(LlamaKVShare): pass`) that composes the KV-sharing
+and windowing axes without any new model logic, since the window is a mask applied at attention
+time and KV sharing is a slot assignment, and neither interferes with the other. See
+[docs/architecture.md](architecture.md)'s "Worked example: `llama_kvshare_win`".
 `runs/contest.sh` (architecture-aware, unlike `runs/scaling_laws.sh`/`runs/miniseries.sh`, which
 grep GPT-only stdout keys) declares one row per architecture, previews every row's
 params/FLOPs/KV-cache/GPU-hours via `scripts/model_info.py` (Stage 4) before training anything
@@ -126,14 +132,24 @@ docs/contest.md's "Lessons from the first real cloud run" for the full list):
   gap. Now sourced automatically by the scripts themselves.
 - **FA3 silently discarded its own failure reason**, making a fixable environment issue
   indistinguishable from genuinely unsupported hardware. Now captured into
-  `nanochat.flash_attention.FA3_LOAD_ERROR` and printed in the fallback warning.
+  `nanochat.flash_attention.FA3_LOAD_ERROR` and printed in the fallback warning. On the first real
+  pod where this diagnostic actually ran, it found the real cause in one shot: RunPod's pytorch
+  image sets `HF_HUB_ENABLE_HF_TRANSFER=1` but doesn't install the `hf_transfer` package, so the
+  `kernels` hub download raised before reaching the network. Fixed by adding `hf_transfer` to
+  `pyproject.toml`; confirmed FA3 active on a real A100 run afterward.
+- **`chat_eval` cost more than training.** Its `--max-problems` has no default cap, and two of its
+  five tasks (GSM8K, HumanEval) are generative and unbatched — a single architecture's eval ran
+  past 25 minutes, more than base+SFT training combined. Fixed with a default cap
+  (`CHATEVAL_MAX_PROBLEMS=100`) in the contest scripts. Separately, `chat_eval` already shards
+  across DDP ranks but was launched with plain `python`, wasting 3 of 4 billed GPUs on that step —
+  now runs through the same `launch_module` (`torchrun`) helper as `base_train`/`chat_sft`.
 
-Verified in three stages, each on real infrastructure where it matters:
+Verified in stages, each on real infrastructure where it matters:
 1. **Locally, no GPU rented**: a `DRY_RUN=1` dry run reproduced a hand-computed reference cost
    table to the GPU-hour, and a full end-to-end CPU/MPS rehearsal (`NPROC_PER_NODE=1`,
-   `EXTRA_TRAIN_ARGS` forcing a 3-step toy run) trained all three architectures, produced distinct
-   checkpoints and a real results CSV, and `scripts/model_info.py --checkpoints` correctly read
-   back each checkpoint's true trained shape and a `match` tokenizer fingerprint.
+   `EXTRA_TRAIN_ARGS` forcing a 3-step toy run) trained all three architectures then existing,
+   produced distinct checkpoints and a real results CSV, and `scripts/model_info.py --checkpoints`
+   correctly read back each checkpoint's true trained shape and a `match` tokenizer fingerprint.
 2. **On a real 4x A100-SXM4-80GB pod** (`runs/contest_d12.sh`, d12/`TARGET_FLOPS=1e18`, ~$10.60):
    all three architectures trained end to end with real val bpb/CORE scores (gpt won on quality,
    0.1509 CORE, but was slowest at 33% MFU vs. llama/llama_kvshare's 57-58% — SDPA fallback
@@ -143,6 +159,15 @@ Verified in three stages, each on real infrastructure where it matters:
    base→SFT→chat_eval chain, a second full CPU/MPS rehearsal proved arch-qualified chat checkpoint
    tags don't collide and base→chat provenance (`base_model_tag`/`base_model_step`) is stamped
    correctly, before spending any more real money on it.
+4. **On a real 4x A100-SXM4-80GB pod again, against the new persistent-volume pipeline**
+   (`llama_kvshare` only, deliberately narrowed to cheapen a pipeline-validation run): a 50GB
+   RunPod Network Volume (`nanochat-contest-archive`, US-KS-2), pre-staged once from a cheap CPU
+   pod (data shards, tokenizer, `.venv`), mounted read/write by the GPU pod so "sync" is just
+   "already there." Base training: val bpb 0.8716, CORE 0.1307, 23.03 min, **FA3 active** —
+   validating the `hf_transfer` fix above on real infrastructure. SFT: val bpb 0.3831, 9.35 min.
+   `chat_eval` (capped at 100 problems/task after the cost bug above was hit and fixed mid-run):
+   ChatCORE 0.0900. Full numbers and the incidents hit running it for real:
+   [docs/contest.md](contest.md)'s "Stage 1 results" and "Lessons from the first real cloud run".
 
 Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100, `--mfu 0.4` — corrected after
 the GPU-hours fix above; docs/contest.md also gives a more conservative `--mfu 0.33` estimate
@@ -153,17 +178,17 @@ matching what was actually measured):
 | gpt | 234.9M | 1.585e9 | 16 | ~11.13 |
 | llama | 239.1M | 1.837e9 | 16 | ~11.13 |
 | llama_kvshare | 222.3M | 1.736e9 | 8 | ~11.13 |
+| llama_kvshare_win | 222.3M | 1.510e9 | 8 | ~11.13 |
 
-Total ≈33.4 GPU-hours ≈8.4h wall clock ≈$46-53 — a real, half-day run, not the ~$12-15 the
+Total ≈44.5 GPU-hours ≈11.1h wall clock ≈$62-71 — a real, half-to-full-day run, not the ~$12-15 the
 pre-fix estimate said.
 
-**What's left**: the SFT/chat extension hasn't been verified on real cloud GPUs yet (only locally
-— see docs/contest.md's "Cloud shakedown" section); a persistent RunPod Network Volume pipeline
-(pre-staged data, checkpoints written straight to durable storage, no live rsync-while-billing) is
-planned but not built; and the real d16 contest itself is still ahead, gated on the smaller stages
-above per the user's own staged rollout — see docs/contest.md and this plan's approved staging for
-the exact sequence (single-architecture validation → FA3 resolution, possibly on H100/H200 → full
-d12 contest on the newer GPU class → re-cost and run d16).
+**What's left**: a d12 contest of `gpt`/`llama`/`llama_kvshare_win` on a fresh 4x H100 pod (a
+second Network Volume, since US-KS-2 carries no H100/H200 stock at all — checked live) is the
+immediate next step, both to get FA3 working end-to-end on the GPU class its non-Ampere code path
+was written for (Stage 1's A100 run never exercised that path) and to measure `llama_kvshare_win`
+for the first time; the real d16 contest stays the eventual target beyond that, re-costed once the
+H100 numbers land — see docs/contest.md for the exact sequence and cost estimates.
 
 ## Stage 6 — attention variants
 

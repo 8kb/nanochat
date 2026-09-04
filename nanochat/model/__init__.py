@@ -14,9 +14,11 @@ from nanochat.model.registry import register_model, get_model_class, get_config_
 from nanochat.model.gpt import GPT, GPTConfig
 from nanochat.model.llama import Llama, LlamaConfig
 from nanochat.model.llama_kvshare import LlamaKVShare, LlamaKVShareConfig
+from nanochat.model.llama_kvshare_win import LlamaKVShareWin, LlamaKVShareWinConfig
 
 __all__ = [
     "BaseModel", "BaseModelConfig", "AttentionLayerSpec", "BaseEmbedding", "BaseBlock", "BaseUnembedding",
     "register_model", "get_model_class", "get_config_class", "config_from_dict", "apply_arch_opts",
     "GPT", "GPTConfig", "Llama", "LlamaConfig", "LlamaKVShare", "LlamaKVShareConfig",
+    "LlamaKVShareWin", "LlamaKVShareWinConfig",
 ]

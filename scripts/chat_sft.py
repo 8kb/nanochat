@@ -38,7 +38,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
-parser.add_argument("--arch", type=str, default=None, help="restrict base-checkpoint auto-discovery/output tag to this architecture (gpt|llama|llama_kvshare); default None picks any")
+parser.add_argument("--arch", type=str, default=None, help="restrict base-checkpoint auto-discovery/output tag to this architecture (gpt|llama|llama_kvshare|llama_kvshare_win); default None picks any")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")

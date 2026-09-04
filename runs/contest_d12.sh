@@ -1,12 +1,18 @@
 #!/bin/bash
 
-# Cheap shakedown of the architecture contest: same three rows as runs/contest.sh (base training,
-# then SFT + chat_eval per row), but at depth 12 and a 1e18 FLOPs budget instead of d16/5e18 --
-# about 1/5th the base GPU-hours, for proving the harness end-to-end on real cloud GPUs before
+# Cheap shakedown of the architecture contest: same rows as runs/contest.sh (base training, then
+# SFT + chat_eval per row), but at depth 12 and a 1e18 FLOPs budget instead of d16/5e18 -- about
+# 1/5th the base GPU-hours, for proving the harness end-to-end on real cloud GPUs before
 # committing to the full d16 run. Kept as its own file rather than a CONTEST_ROWS edit in
 # runs/contest.sh so that script's committed defaults stay the real d16 contest (see
 # docs/contest.md "Sizing"). Edit CONTEST_ROWS below to narrow this to one architecture for an
-# even cheaper pipeline-validation run (e.g. just "llama_kvshare|12|--arch-opt kv_share_frac=0.5").
+# even cheaper pipeline-validation run (e.g. just "llama_kvshare_win|12|--arch-opt kv_share_frac=0.5").
+# Default rows omit llama_kvshare (already measured once against this exact pipeline -- see
+# docs/contest.md's Stage 1 results) in favor of llama_kvshare_win, its sliding-window sibling.
+# chat_eval runs under launch_module (torchrun on NPROC_PER_NODE>1) rather than a single-rank
+# `python` -- it already shards problems across ranks and all_reduces the result (see
+# scripts/chat_eval.py), so running it single-rank was leaving 3 of 4 billed GPUs idle during
+# eval, the same mistake that made eval cost more than training once already.
 #
 # Usage: bash runs/contest_d12.sh [label]
 # Example: bash runs/contest_d12.sh d12test
@@ -51,7 +57,7 @@ mkdir -p "$NANOCHAT_BASE_DIR"
 CONTEST_ROWS=(
     "gpt|12|"
     "llama|12|"
-    "llama_kvshare|12|--arch-opt kv_share_frac=0.5"
+    "llama_kvshare_win|12|--arch-opt kv_share_frac=0.5"
 )
 
 LABEL="${1:-${LABEL:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
@@ -268,7 +274,7 @@ PYEOF
     eval_start_time=$(date +%s)
     MAX_PROBLEMS_ARG=()
     [ -n "$CHATEVAL_MAX_PROBLEMS" ] && MAX_PROBLEMS_ARG=(--max-problems="$CHATEVAL_MAX_PROBLEMS")
-    python -m scripts.chat_eval -i sft -g "$tag" \
+    launch_module scripts.chat_eval -i sft -g "$tag" \
         "${MAX_PROBLEMS_ARG[@]}" \
         $EXTRA_CHATEVAL_ARGS \
         2>&1 | tee "$eval_log_file"

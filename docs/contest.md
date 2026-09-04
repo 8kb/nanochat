@@ -1,7 +1,8 @@
 # Running the architecture contest on RunPod
 
-`runs/contest.sh` trains all three registered architectures (`gpt`, `llama`, `llama_kvshare`) on
-the same tokenizer and the same compute budget, so the comparison is actually apples-to-apples;
+`runs/contest.sh` trains all four registered architectures (`gpt`, `llama`, `llama_kvshare`,
+`llama_kvshare_win`) on the same tokenizer and the same compute budget, so the comparison is
+actually apples-to-apples;
 then it SFT (chat) fine-tunes and `chat_eval`s each resulting base checkpoint, so the contest
 compares both base *and* chat models, not base alone. It leaves everything needed to compare them
 locally in the checkpoint directory. This page is the runbook for the piece that costs real money:
@@ -143,16 +144,19 @@ At the defaults (`TARGET_FLOPS=5e18`, d16, 4x A100, `--mfu 0.4`), expect:
 | gpt | 234.9M | 1.585e9 | 16 | ~11.13 |
 | llama | 239.1M | 1.837e9 | 16 | ~11.13 |
 | llama_kvshare | 222.3M | 1.736e9 | 8 | ~11.13 |
+| llama_kvshare_win | 222.3M | 1.510e9 | 8 | ~11.13 |
 
-Total ≈ **33.4 GPU-hours** ≈ **8.4h wall clock** on 4 GPUs ≈ **$46–53** at 80GB-A100 rates
-($1.39/hr community to $1.59/hr secure, per GPU — see "Pod spec" above). (All three land at the
+Total ≈ **44.5 GPU-hours** ≈ **11.1h wall clock** on 4 GPUs ≈ **$62–71** at 80GB-A100 rates
+($1.39/hr community to $1.59/hr secure, per GPU — see "Pod spec" above). (All four land at the
 same GPU-hours by construction — `TARGET_FLOPS` is the same for every row, that's what "iso-FLOPs"
-means; a cheaper architecture spends the saved compute on more tokens instead of finishing early.)
-`--mfu 0.4` is optimistic for the SDPA fallback (see "What to watch for" below) — the verified d12
-shakedown below measured 33–58% depending on architecture; at a more conservative `--mfu 0.33` the
-same contest is ≈40.5 GPU-hours ≈ 10.1h wall clock ≈ $56–64. **This is a real, half-day, ~$50 run —
-size accordingly, and consider the d12 shakedown (below) first if you haven't run this harness on
-real cloud GPUs yet.**
+means; a cheaper architecture spends the saved compute on more tokens instead of finishing early —
+`llama_kvshare_win`'s lower FLOPs/token than `llama_kvshare` at an identical param count means it
+trains on proportionally more tokens for the same GPU-hours, not fewer.) `--mfu 0.4` is optimistic
+for the SDPA fallback (see "What to watch for" below) — the verified d12 shakedown below measured
+33–58% depending on architecture; at a more conservative `--mfu 0.33` the same contest is ≈53.9
+GPU-hours ≈ 13.5h wall clock ≈ $75–86. **This is a real, half-to-full-day, ~$65-85 run — size
+accordingly, and consider the d12 shakedown (below) first if you haven't run this harness on real
+cloud GPUs yet.**
 
 If the numbers look wrong (wrong depth, wrong GPU count, unexpected `--arch-opt`), fix the
 `CONTEST_ROWS` array at the top of `runs/contest.sh` or the env vars and dry-run again. Only once
@@ -188,11 +192,12 @@ entirely (no plots, just the CSVs and the terminal logs).
   hub unreachable, a broken `kernels` import, ...) was indistinguishable from "this GPU just
   doesn't have a kernel." If you want to dig further on a live pod:
   `python -c "from kernels import get_kernel, has_kernel; import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability()); print(has_kernel('kernels-community/flash-attn3'))"`.
-- **GPT's row runs with `window_pattern=SSSL`** (its own architecture default; Llama and
-  LlamaKVShare default to `L`, full attention) — this is intentional (each architecture competes as
-  its author defined it, not with a pattern forced to match). If FA3 didn't load, the SDPA fallback
-  has no sliding-window kernel and will print its own warning; GPT's row will simply be slower per
-  step than the other two, not wrong.
+- **GPT's and `llama_kvshare_win`'s rows run with `window_pattern=SSSL`** (each architecture's own
+  default; Llama and LlamaKVShare default to `L`, full attention) — this is intentional (each
+  architecture competes as its author defined it, not with a pattern forced to match). If FA3
+  didn't load, the SDPA fallback attention runs sliding windows via an explicit mask rather than a
+  fused kernel and will print its own warning; GPT's and `llama_kvshare_win`'s rows will simply be
+  slower per step than the other two, not wrong.
 - **`Total training FLOPs estimate`** for each row should be within rounding of `TARGET_FLOPS`
   regardless of architecture — that's the iso-FLOPs contract holding.
 
@@ -257,8 +262,8 @@ checkpoint trained some other way (e.g. `runs/runcpu.sh`, which still trains its
 No GPU needed for any of this.
 
 ```bash
-# Static + trained-model comparison for all three, side by side, straight from meta.json:
-python -m scripts.model_info --checkpoints "contest_mycontest_gpt_d16,contest_mycontest_llama_d16,contest_mycontest_llama_kvshare_d16"
+# Static + trained-model comparison for all four, side by side, straight from meta.json:
+python -m scripts.model_info --checkpoints "contest_mycontest_gpt_d16,contest_mycontest_llama_d16,contest_mycontest_llama_kvshare_d16,contest_mycontest_llama_kvshare_win_d16"
 # or, to sweep every contest checkpoint in one go:
 python -m scripts.model_info --checkpoints "$(ls ~/.cache/nanochat/base_checkpoints | grep contest_mycontest | paste -sd, -)"
 ```
@@ -297,7 +302,7 @@ without needing the run's CSV.
 
 Everything above assumes the defaults. To change what's being compared:
 
-- **Depth**: edit the `16` in each `CONTEST_ROWS` entry (all three must move together to stay
+- **Depth**: edit the `16` in each `CONTEST_ROWS` entry (all rows must move together to stay
   comparable), or pass `--depth=<N>` if you fork the script per-arch. Re-run the dry run — the
   budget table updates automatically.
 - **Compute budget**: `TARGET_FLOPS` env var. `scripts/model_info.py --arch ... --depth ...
@@ -310,16 +315,16 @@ Everything above assumes the defaults. To change what's being compared:
   `--target-param-data-ratio` in both the preflight and the row's args if you want each model
   individually compute-optimal instead of budget-matched.
 - **Data**: `NUM_SHARDS` (default 100). At `TARGET_FLOPS=5e18`, gpt's row (the most token-hungry
-  of the three) needs ≈3.16B tokens; this tokenizer's vocab averages ≈4.7 characters/token on this
+  of the rows) needs ≈3.16B tokens; this tokenizer's vocab averages ≈4.7 characters/token on this
   dataset, and the BOS-aligned dataloader keeps ≈65% of tokens after cropping (see
   `nanochat/dataloader.py`), so each ~253M-character shard yields ≈35M usable training tokens —
   ≈91 shards needed, 100 leaves a ~10% margin. Raise `NUM_SHARDS` if you raise `TARGET_FLOPS` or
   `--depth` significantly. The validation shard (always the last one, `shard_06542.parquet`) is
-  identical across every row regardless of `NUM_SHARDS`, which is what makes the three val-bpb
-  numbers comparable to each other.
+  identical across every row regardless of `NUM_SHARDS`, which is what makes the val-bpb numbers
+  comparable to each other.
 - **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`nanochat/fp8.py`) — irrelevant
   on A100s; if you move the contest to H100s, add `--fp8` to each row's args and expect a real
-  speedup, but note it changes precision, so keep it on or off for all three rows equally.
+  speedup, but note it changes precision, so keep it on or off for every row equally.
 - **The SFT step has no iso-FLOPs budget of its own.** It's `--num-iterations=-1` (a full epoch of
   the SmolTalk+GSM8K+MMLU mixture) by default for every row, matching upstream nanochat's own SFT
   convention (`runs/speedrun.sh`) — not compute-matched the way base training is. Size this into
@@ -361,12 +366,16 @@ CPU/MPS machine with no CUDA at all.
 
 ## Cloud shakedown: `runs/contest_d12.sh`
 
-Before spending ~$50 on the real d16 contest, prove the harness on real cloud GPUs cheaply: same
-three rows, `--depth=12` and `TARGET_FLOPS=1e18` instead of `--depth=16`/`5e18` — about **1/33rd**
-the GPU-hours (a d12 row is both shallower *and*, at a fixed FLOPs budget, needs proportionally
-fewer tokens than d16 despite the "cheaper architectures get more tokens" effect within a single
-depth). Kept as its own file (`runs/contest_d12.sh`) rather than a `CONTEST_ROWS` edit to
-`runs/contest.sh`, so that script's committed defaults stay the real d16 contest:
+Before spending ~$65-85 on the real d16 contest, prove the harness on real cloud GPUs cheaply:
+`--depth=12` and `TARGET_FLOPS=1e18` instead of `--depth=16`/`5e18` — about **1/33rd** the
+GPU-hours per row (a d12 row is both shallower *and*, at a fixed FLOPs budget, needs
+proportionally fewer tokens than d16 despite the "cheaper architectures get more tokens" effect
+within a single depth). Kept as its own file (`runs/contest_d12.sh`) rather than a `CONTEST_ROWS`
+edit to `runs/contest.sh`, so that script's committed defaults stay the real d16 contest.
+`runs/contest_d12.sh`'s default rows are `gpt`, `llama`, `llama_kvshare_win` — `llama_kvshare`
+(without windowing) is intentionally left out here since it was already measured against this
+exact pipeline once (see "Stage 1 results" below) and re-training it would just be spending money
+to get the same number back; `runs/contest.sh` (the real d16 contest) still trains all four:
 
 ```bash
 DRY_RUN=1 bash runs/contest_d12.sh d12test   # always dry-run first, same as the real contest
@@ -405,6 +414,39 @@ a real pod. Re-running `contest_d12.sh` on a real pod (optionally narrowed to on
 `CONTEST_ROWS`, e.g. just `llama_kvshare`, for the cheapest possible real-cloud validation) is the
 natural next real-money step before trusting the SFT extension for the full d16 contest.
 
+## Stage 1 results: `llama_kvshare` d12 on the persistent-volume pipeline
+
+The first real run against the persistent-volume pipeline (this doc's "Attaching the persistent
+volume" section), narrowed to one architecture (`CONTEST_ROWS` trimmed to just `llama_kvshare`) to
+exercise base→SFT→chat_eval end to end at the smallest real cost before trusting it for a full
+contest. 4x A100-SXM4-80GB, US-KS-2, volume `3w7toelc6z`:
+
+| step | metric | value |
+|---|---|---|
+| base training | val bpb | 0.8716 |
+| base training | CORE | 0.1307 |
+| base training | wall-clock | 23.03 min |
+| base training | FA3 | **active** (`✓ Using Flash Attention 3`) |
+| SFT | val bpb | 0.3831 |
+| SFT | wall-clock | 9.35 min |
+| chat_eval (`--max-problems=100`) | ARC-Easy | 47.00% |
+| chat_eval | ARC-Challenge | 28.00% |
+| chat_eval | MMLU | 30.00% |
+| chat_eval | GSM8K | 0.00% |
+| chat_eval | HumanEval | 5.00% |
+| chat_eval | **ChatCORE** | **0.0900** |
+
+Real cost: ~$6-6.5 GPU time across two pods (the first was killed mid-run to apply the `hf_transfer`
+fix below, cleanly; the retry that produced the numbers above includes recovery from the runaway
+`chat_eval` incident, also below).
+
+**This is the reference row for the H100 contest** (see "Cloud shakedown" above — `llama_kvshare`
+itself is intentionally not re-trained there). `val_bpb`/`CORE`/`ChatCORE` are hardware-independent
+at identical iterations/data/seed, so they're directly comparable across the A100→H100 move;
+`train_time_sec` and MFU are not (different hardware, and the H100 run additionally has FA3
+actually active — this A100 run's FA3 success came from a fix applied *after* the original silent
+SDPA fallback, see "Lessons" below).
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now
@@ -441,3 +483,55 @@ rather than scattered across commit messages.
   of just checking whether it was set. The user was asked to rotate the key immediately. The fix
   going forward: check a secret's *presence/length* (`echo ${#VAR}`), never grep or print its
   *value* — even when the whole point is confirming it resolved.
+- **FA3's real root cause was a missing `hf_transfer` package.** `HF_HUB_ENABLE_HF_TRANSFER=1` ships
+  set in RunPod's own pytorch image, but the `hf_transfer` package itself wasn't installed, so
+  `kernels`' hub download raised `ValueError` before it ever reached the network — invisible before
+  `FA3_LOAD_ERROR` existed, and found by that diagnostic on its **first real use**. Fixed by adding
+  `hf_transfer>=0.1.9` to `pyproject.toml`; verified on real infra both directly
+  (`HAS_FA3: True, FA3_LOAD_ERROR: None`) and in the Stage 1 training log
+  (`✓ Using Flash Attention 3`).
+- **FA3's speedup is attention-pattern-dependent, and an early claim about it over-generalized.**
+  After the fix, `llama_kvshare` (full causal attention, no windowing) measured ~57.7% MFU with FA3
+  vs. ~56.6% with SDPA — ~2%, not the dramatic win predicted from the earlier gpt-on-A100 result.
+  That earlier gap (33% SDPA vs. 57-58% FA3, see the d12 shakedown table above) is specific to
+  **windowed** patterns like gpt's `SSSL`: SDPA falls off its fused kernel onto an explicit mask for
+  those (see "SDPA has no support for sliding window attention" fixed to "SDPA's sliding window
+  support falls back to an explicit mask" in `scripts/base_train.py`), while full causal attention
+  already has an efficient fused SDPA path. This is exactly why `llama_kvshare_win` (Stage 3, adds
+  windowing to `llama_kvshare`) is worth measuring on a GPU where FA3 actually loads — it's the
+  first architecture in this contest where FA3-vs-SDPA and KV-sharing-vs-not are both live at once.
+- **`chat_eval` cost more than training.** `--max-problems` defaults to `None` = the full test set;
+  GSM8K (~1319 problems) and HumanEval (~164) are generative and unbatched per rank, and a single
+  architecture's eval ran past 25 minutes still only partway through GSM8K — more than base training
+  (23 min) plus SFT (9.35 min) combined. Now capped via `CHATEVAL_MAX_PROBLEMS` (default 100). The
+  trap: **`-1` is not an "uncapped" sentinel** — `chat_eval.py` has no such value, and `-1` evaluates
+  *zero* problems (`min(len(task), -1)`); the true uncapped form is `CHATEVAL_MAX_PROBLEMS=""`
+  (empty string), which omits the flag entirely.
+- **`chat_eval` was also wasting 3 of 4 billed GPUs.** It already shards problems across ranks and
+  `all_reduce`s the aggregate (`scripts/chat_eval.py`), but `runs/contest.sh`/`contest_d12.sh` were
+  launching it with plain `python` instead of `torchrun` — using 1 of however many GPUs the pod was
+  billed for. Now runs through the same `launch_module` helper as `base_train`/`chat_sft`. General
+  lesson: on a multi-GPU pod, *every* pipeline step is billed at the full pod rate, so a
+  single-rank step isn't a neutral choice — it's a markup equal to GPU count on that step alone.
+- **Resume granularity is coarser than it looks.** The per-row skip in `runs/contest*.sh` is keyed
+  on a row already existing in `chat_results.csv`, so a failure *after* SFT finishes but *during*
+  `chat_eval` re-runs the whole SFT step on the next attempt. Worked around once by invoking
+  `chat_eval` directly against the already-finished checkpoint and hand-appending the CSV row
+  (`python -m scripts.chat_eval -i sft -g <tag> --max-problems=100`, then constructing the row with
+  the same regex the script uses) rather than re-running the row through the harness. Finer-grained
+  checkpointing of the SFT step would close this gap but hasn't been made.
+- **Minimal pod images lack tools you assume exist.** `column` is absent on RunPod's own pod image
+  (`print_csv()`'s `cat` fallback exists because of this), and separately, `timeout`/`gtimeout`
+  (GNU coreutils) is absent on **macOS** by default — a local rehearsal command wrapped in
+  `timeout 1100 bash ...` died instantly with a single easy-to-miss `command not found: timeout`
+  line, under a background task that still reported exit code 0. Neither failure is loud; check the
+  actual exit code and that the intended long job is actually running, don't infer it from "no
+  visible error."
+- **Network-volume DC choice is stickier than it looks.** US-KS-2 (this doc's existing volume) was
+  picked for A100 + storage overlap and, checked live, carries **no H100 and no H200 stock at all**
+  — a Hopper contest needs an entirely separate volume and cold-start kit in a different DC, exactly
+  as anticipated when the first volume was created. Cross-reference `get-gpu-type` (per GPU tier,
+  gives per-DC availability) against `list-data-centers` (gives each DC's `networkVolumeTypes`) to
+  find a DC with both live stock for the GPU tier you need *and* the storage tier you want — pick
+  the volume's DC for the GPU tier you'll need **last**, not first, since the volume choice is what's
+  sticky, not the pod's.

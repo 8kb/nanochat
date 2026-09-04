@@ -178,6 +178,24 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
     in during setup instead of training one from scratch; `WANDB_API_KEY` is sourced from
     `/etc/rp_environment` automatically; the final summary falls back to `cat` when `column` isn't
     installed.
+- **Stage 5 follow-up, H100 contest prep** (`llama_kvshare_win` + more harness fixes found running
+  Stage 5 follow-up's pipeline for real):
+  - `nanochat/model/llama_kvshare_win/` is fork-only, no upstream counterpart: a config-only
+    subclass of `llama_kvshare` (`window_pattern` defaults to `"SSSL"` instead of `"L"`, with a
+    `from_depth` override since the parent classmethod's own signature default would otherwise win)
+    plus `class LlamaKVShareWin(LlamaKVShare): pass`. No changes to any component shared with
+    upstream.
+  - `scripts/base_train.py`'s SDPA-sliding-window warning text changed from "SDPA has no support
+    for sliding window attention" to "SDPA's sliding window support ... falls back to an explicit
+    attention mask" — a wording fix (SDPA does support it, just unfused and slow), upstream-adjacent
+    since it touches shared code but not a behavior change.
+  - Contest-harness-only: `runs/contest.sh`/`runs/contest_d12.sh` now launch `scripts.chat_eval`
+    through the same `launch_module` (`torchrun`) helper as `base_train`/`chat_sft` instead of plain
+    `python` — it already shards across DDP ranks and `all_reduce`s the result, so this was leaving
+    most billed GPUs idle during eval; `contest_d12.sh`'s default rows dropped `llama_kvshare` in
+    favor of `llama_kvshare_win` (the former was already measured once against this exact pipeline);
+    `contest.sh`'s (d16) rows gained `llama_kvshare_win` as a fourth entrant alongside the existing
+    three.
 
 ## Merge procedure for a new upstream commit
 

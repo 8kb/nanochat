@@ -40,7 +40,21 @@ TINY_KVSHARE_KWARGS = dict(
     kv_share_frac=0.5,  # 4 layers -> 2 KV slots
 )
 
-TINY_KWARGS_BY_ARCH = {"gpt": TINY_GPT_KWARGS, "llama": TINY_LLAMA_KWARGS, "llama_kvshare": TINY_KVSHARE_KWARGS}
+TINY_KVSHARE_WIN_KWARGS = dict(
+    sequence_len=32,
+    vocab_size=128,
+    n_layer=4,
+    n_head=2,
+    n_kv_head=2,
+    n_embd=64,
+    window_pattern="SL",  # a real window (not "L") so the generic suite exercises the windowed path
+    kv_share_frac=0.5,  # 4 layers -> 2 KV slots
+)
+
+TINY_KWARGS_BY_ARCH = {
+    "gpt": TINY_GPT_KWARGS, "llama": TINY_LLAMA_KWARGS, "llama_kvshare": TINY_KVSHARE_KWARGS,
+    "llama_kvshare_win": TINY_KVSHARE_WIN_KWARGS,
+}
 
 
 def build_tiny_model(arch="gpt", **overrides):
@@ -80,10 +94,16 @@ def tiny_llama_kvshare():
     return build_tiny_model("llama_kvshare")
 
 
+@pytest.fixture
+def tiny_llama_kvshare_win():
+    return build_tiny_model("llama_kvshare_win")
+
+
 @pytest.fixture(params=list(TINY_KWARGS_BY_ARCH.keys()))
 def tiny_model(request):
     """Parametrized over every registered architecture in TINY_KWARGS_BY_ARCH -- a test taking
-    this fixture runs once per architecture (test ids get a [gpt]/[llama]/[llama_kvshare] suffix).
-    Use this for anything that should hold for any architecture; use tiny_gpt/tiny_llama/
-    tiny_llama_kvshare for architecture-specific behavior."""
+    this fixture runs once per architecture (test ids get a [gpt]/[llama]/[llama_kvshare]/
+    [llama_kvshare_win] suffix). Use this for anything that should hold for any architecture; use
+    tiny_gpt/tiny_llama/tiny_llama_kvshare/tiny_llama_kvshare_win for architecture-specific
+    behavior."""
     return build_tiny_model(request.param)

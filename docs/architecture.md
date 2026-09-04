@@ -36,9 +36,12 @@ nanochat/model/
 ├── llama/                  the second architecture -- see "Worked example: llama" below
 │   ├── config.py             LlamaConfig(BaseModelConfig)
 │   └── model.py                Llama(BaseModel) -- reuses components/ verbatim, incl. PlainBlock
-└── llama_kvshare/          the third architecture -- see "Worked example: llama_kvshare" below
-    ├── config.py             LlamaKVShareConfig(LlamaConfig) -- adds kv_share_frac
-    └── model.py                LlamaKVShare(BaseModel) -- Llama + cross-layer KV sharing
+├── llama_kvshare/          the third architecture -- see "Worked example: llama_kvshare" below
+│   ├── config.py             LlamaKVShareConfig(LlamaConfig) -- adds kv_share_frac
+│   └── model.py                LlamaKVShare(BaseModel) -- Llama + cross-layer KV sharing
+└── llama_kvshare_win/      the fourth architecture -- see "Worked example: llama_kvshare_win" below
+    ├── config.py             LlamaKVShareWinConfig(LlamaKVShareConfig) -- window_pattern default only
+    └── model.py                LlamaKVShareWin(LlamaKVShare) -- no new logic at all
 ```
 
 `nanochat/scaling.py` (`derive_training_plan`) and `scripts/model_info.py` are outside `nanochat/model/`
@@ -382,6 +385,31 @@ fresh `kv_bus = {}` through the block loop and calls `kv_cache.advance(...)` onc
 `llama`, it needs **no `PARAM_ROLES` declarations** (a consumer block simply has fewer `Linear`
 submodules than a producer one — nothing new to declare either way) and no migration hooks.
 
+### Worked example: `llama_kvshare_win`
+
+`nanochat/model/llama_kvshare_win/` is the payoff case for the component contracts: a whole fourth
+contest entrant costs one config subclass and a one-line `model.py`. `LlamaKVShareWinConfig`
+(`nanochat/model/llama_kvshare_win/config.py`) changes exactly one thing from
+`LlamaKVShareConfig` — `window_pattern` defaults to `"SSSL"` instead of `"L"` — plus a `from_depth`
+override that exists *only* to change that same default in the inherited classmethod's own
+signature (`LlamaConfig.from_depth` hardcodes `window_pattern="L"`, so the dataclass field default
+alone wouldn't reach a `--depth`-driven run). `nanochat/model/llama_kvshare_win/model.py` is a
+`class LlamaKVShareWin(LlamaKVShare): pass` under `@register_model("llama_kvshare_win", ...)` — no
+new model logic at all, because `LlamaKVShare.__init__` already reads `config.window_pattern` and
+passes it to `compute_window_sizes` (see "Worked example: `llama_kvshare`" above); the sliding-window
+attention itself is `CausalSelfAttention`'s existing `window_size` handling, shared by every
+architecture. It subclasses `LlamaKVShare` (rather than re-registering it under a second name) so
+`get_model_class("llama_kvshare_win")`, tracebacks, and `repr`s all name the real class.
+
+Windowing and cross-layer KV sharing compose without any extra wiring because they act at different
+points: KV sharing decides *which layer's* K/V a given layer attends to (`kv_slot`, wired once in
+`LlamaKVShare.__init__`), while the window is a *mask applied at attention time* by the consuming
+layer itself (`CausalSelfAttention.forward`'s `window_size=(self.window, 0)`), not a truncation of
+what the producer stores. A short-window consumer layer sharing a long-window producer's K/V is
+therefore fine in both the training path (`kv_bus`, a full uncropped K/V handed to every consumer,
+each applying its own window at attention time) and the cached-inference path
+(`kv_cache.get_slot_cache`, same reasoning).
+
 ## Checkpoint tags and architecture-aware discovery
 
 A checkpoint's directory name (its "tag") defaults to `d<depth>` for `gpt`, and
@@ -401,11 +429,17 @@ it) to filter candidates to that architecture first: it peeks at each candidate 
 `checkpoint_manager._checkpoint_arch`, no directory-naming assumption required. `scripts/
 base_train.py` and `scripts/base_eval.py` both have a `--arch` flag wired to this.
 
-Not yet done: the SFT/RL/serving pipeline (`scripts/chat_sft.py`, `chat_rl.py`, `chat_cli.py`,
-`infer_bench.py`, `chat_eval.py`) doesn't pass `arch=` anywhere, so its auto-discovery is still
-architecture-blind — fine as long as only one architecture's checkpoints exist under a given
-`*_checkpoints/` directory at a time, but worth revisiting once a second architecture actually goes
-through SFT.
+`scripts/chat_sft.py` now has the same `--arch` flag, threaded into its `load_model`/
+`load_optimizer_state` calls, and arch-qualifies its own output tag the same way `base_train.py`
+does (`chatsft_checkpoints/<arch>_d<depth>/`, avoiding the cross-architecture collision that would
+otherwise land two different architectures' SFT checkpoints in the same directory). It also stamps
+the resolved base checkpoint's tag/step into the SFT checkpoint's own meta, so a chat checkpoint is
+traceable back to the base run it came from without needing the contest's CSV. Not yet done: the
+rest of the pipeline (`chat_rl.py`, `chat_cli.py`, `infer_bench.py`, `chat_eval.py`) still doesn't
+pass `arch=` anywhere, so their auto-discovery stays architecture-blind — fine as long as only one
+architecture's checkpoints exist under a given `*_checkpoints/` directory at a time (or the caller
+passes an explicit `--model-tag`/`-g`, which every contest script does), but worth revisiting if
+that stops holding.
 
 ## Old-checkpoint migrations
 

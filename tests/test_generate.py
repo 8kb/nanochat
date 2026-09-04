@@ -40,7 +40,7 @@ class _FakeTokenizer:
         return "".join(str(i) for i in ids)
 
 
-@pytest.mark.parametrize("arch", ["gpt", "llama", "llama_kvshare"])
+@pytest.mark.parametrize("arch", ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"])
 @pytest.mark.parametrize("window_pattern", ["L", "SSSL"])
 def test_generate_naive_matches_engine_generate_at_temperature_zero(window_pattern, arch):
     model = build_tiny_model(arch, window_pattern=window_pattern)

@@ -18,11 +18,13 @@ Original upstream documentation (README, dev log, leaderboard) is preserved at
 architecture registry, and reusable pieces (attention, MLP, RoPE, norm, sliding-window patterns,
 FLOPs accounting) that a second architecture reuses instead of forking the whole file — proven by
 `nanochat/model/llama/` (SwiGLU MLP, plain pre-norm blocks, reuses GPT's attention/RoPE/embedding/
-unembedding components verbatim) and `nanochat/model/llama_kvshare/` (Llama, but the last fraction
+unembedding components verbatim), `nanochat/model/llama_kvshare/` (Llama, but the last fraction
 of layers reuse an earlier layer's K/V instead of computing their own — Gemma-3n-style cross-layer
-KV sharing — for fewer params, less prefill compute, and a smaller KV cache at the same depth).
-`--arch=gpt` (default), `--arch=llama`, or `--arch=llama_kvshare` selects which one
-`scripts/base_train.py` trains; `scripts/model_info.py` reports any architecture's parameters,
+KV sharing — for fewer params, less prefill compute, and a smaller KV cache at the same depth), and
+`nanochat/model/llama_kvshare_win/` (llama_kvshare plus sliding-window attention — one config
+subclass, no new model code). `--arch=gpt` (default), `--arch=llama`, `--arch=llama_kvshare`, or
+`--arch=llama_kvshare_win` selects which one `scripts/base_train.py` trains; `scripts/model_info.py`
+reports any architecture's parameters,
 FLOPs, KV-cache bytes, and training horizon without training anything, for picking matched configs
 before spending GPU-hours. See [`docs/architecture.md`](docs/architecture.md) for the contract and
 how to add an architecture, and [`docs/roadmap.md`](docs/roadmap.md) for what's built so far versus
@@ -71,7 +73,8 @@ nanochat/model/
 │                           windows, kv_sharing
 ├── gpt/                      the original architecture
 ├── llama/                      SwiGLU MLP, plain pre-norm blocks
-└── llama_kvshare/               Llama + cross-layer KV sharing (Gemma-3n style)
+├── llama_kvshare/               Llama + cross-layer KV sharing (Gemma-3n style)
+└── llama_kvshare_win/            llama_kvshare + sliding-window attention (config-only subclass)
 ```
 
 `nanochat/scaling.py` holds the training-horizon math shared by `scripts/base_train.py` and
@@ -95,7 +98,7 @@ Full contract, the meta-device gotcha, precision policy, and a verification reci
 To compare architectures/depths before spending any compute:
 
 ```bash
-python -m scripts.model_info --arch gpt,llama,llama_kvshare --depth 12
+python -m scripts.model_info --arch gpt,llama,llama_kvshare,llama_kvshare_win --depth 12
 ```
 
 Prints parameter counts (by role), FLOPs/token, KV-cache bytes, and the derived training horizon
@@ -106,7 +109,7 @@ tokenizer-fingerprint match check, read from each checkpoint's own meta.json —
 loaded): `python -m scripts.model_info --checkpoints` inspects every checkpoint under
 `base_checkpoints/`, or pass a comma-separated list of tags.
 
-`runs/contest.sh` runs all three architectures on the same tokenizer and the same iso-FLOPs
+`runs/contest.sh` runs all four architectures on the same tokenizer and the same iso-FLOPs
 compute budget on rented cloud GPUs, then SFT (chat) fine-tunes and evaluates each resulting base
 checkpoint too — see [`docs/contest.md`](docs/contest.md) for the full RunPod runbook (always
 `DRY_RUN=1` first; nothing rents anything on its own).

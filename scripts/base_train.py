@@ -158,7 +158,7 @@ model_config = model.config
 model_config_kwargs = model_config.to_dict()
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 if not using_fa3 and model_config_kwargs.get("window_pattern", "L") != "L":
-    print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{model_config_kwargs['window_pattern']}'). Your GPU utilization will be terrible.")
+    print0(f"WARNING: SDPA's sliding window support (window_pattern='{model_config_kwargs['window_pattern']}') falls back to an explicit attention mask instead of a fused kernel. Your GPU utilization will be terrible.")
     print0("WARNING: Recommend --window-pattern L for full context attention without alternating sliding window patterns.")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
