@@ -67,7 +67,15 @@ EVAL_TOKENS=$((20 * 524288))
 WANDB_RUN="${WANDB_RUN:-contest_${LABEL}}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 EXTRA_SFT_ARGS="${EXTRA_SFT_ARGS:-}"           # appended to every scripts.chat_sft invocation
-EXTRA_CHATEVAL_ARGS="${EXTRA_CHATEVAL_ARGS:-}" # appended to every scripts.chat_eval invocation
+# chat_eval.py's --max-problems has no default cap (None = full test set) -- two of its five
+# tasks (GSM8K ~1319 problems, HumanEval ~164) are generative (one autoregressive sample per
+# problem, unbatched within a rank), so at full scale eval alone can badly dominate training cost
+# for a small contest model: found the hard way when a single architecture's eval ran past 25
+# minutes still partway through GSM8K, well past base+SFT training combined. Capped by default;
+# set CHATEVAL_MAX_PROBLEMS="" (empty, not -1 -- chat_eval.py has no "uncapped" sentinel value,
+# and -1 would evaluate zero problems instead) for the true uncapped full-scale eval.
+CHATEVAL_MAX_PROBLEMS="${CHATEVAL_MAX_PROBLEMS-100}"
+EXTRA_CHATEVAL_ARGS="${EXTRA_CHATEVAL_ARGS:-}" # appended (last) to every scripts.chat_eval invocation
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -261,7 +269,10 @@ PYEOF
     log "=============================================="
     eval_log_file="$RESULTS_DIR/${tag}_chateval.log"
     eval_start_time=$(date +%s)
+    MAX_PROBLEMS_ARG=()
+    [ -n "$CHATEVAL_MAX_PROBLEMS" ] && MAX_PROBLEMS_ARG=(--max-problems="$CHATEVAL_MAX_PROBLEMS")
     python -m scripts.chat_eval -i sft -g "$tag" \
+        "${MAX_PROBLEMS_ARG[@]}" \
         $EXTRA_CHATEVAL_ARGS \
         2>&1 | tee "$eval_log_file"
     eval_time=$(( $(date +%s) - eval_start_time ))
