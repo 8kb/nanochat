@@ -8,13 +8,69 @@ locally in the checkpoint directory. This page is the runbook for the piece that
 renting the GPUs. **Nothing in this repo does that automatically** — provisioning a pod is a
 manual step you take deliberately.
 
-A persistent-volume pipeline (pre-staged data/tokenizer, checkpoints written straight to durable
-storage, no live rsync-while-billing) is planned but not yet built — this doc still describes the
-single-ephemeral-pod workflow. Until then, the tokenizer step below is already free (committed to
-the repo, see "One-time setup"), which removes most of what a volume would have saved anyway.
+A persistent Network Volume now exists and is pre-staged (see "Attaching the persistent volume"
+below): `3w7toelc6z` ("nanochat-contest-archive"), 50GB Standard tier, **US-KS-2**, holding all
+101 data shards, the tokenizer, the CORE eval bundle, and a full `.venv` (`uv sync --extra gpu`
+already run). A pod that mounts it at `/workspace` skips setup almost entirely. The rest of this
+doc still also describes the plain single-ephemeral-pod workflow (no volume) for a one-off run
+that doesn't want persistent infra, or for GPU types in a different data center than the volume
+(see the DC-mismatch note below).
 
 Do not skip the dry run in step 3. It costs nothing and tells you exactly what you're about to
 spend before a single GPU-second runs.
+
+## 0. Authenticate `runpodctl` (only needed for attaching an existing network volume)
+
+The RunPod MCP tools (used for everything else in this doc — creating pods, checking GPU stock,
+creating/deleting network volumes) work via OAuth with no key on disk. But attaching an
+*existing* network volume to a new pod isn't exposed by the MCP `create-pod` tool (as of this doc
+— it only supports creating a fresh pod-local volume disk, not referencing a volume ID; the
+underlying RunPod v2 API does support this via `mounts.network[0]`, so it's a gap in the MCP tool
+specifically). That one operation needs `runpodctl` instead, which needs a real
+`RUNPOD_API_KEY` — get one at console.runpod.io/user/settings → API Keys, scoped to Pod
+create/get/terminate only (no serverless/templates/registries/billing/secrets/network-volume
+endpoints needed).
+
+**`runpodctl doctor`** is the easy way to set this up interactively (prompts for the key, writes
+`~/.runpod/config.toml`, and can also register an SSH key) — simpler than hand-editing the TOML
+file. Run it yourself in your own terminal (not scripted, since it prompts). Verify with
+`runpodctl user` (prints account info, not the key). `runpodctl doctor` also auto-registers an
+SSH key at `~/.runpod/ssh/runpodctl-ssh-key` — use this key (not any other) for every pod created
+via `runpodctl`, since RunPod injects account-registered keys at boot.
+
+## 0.5. Attaching the persistent volume
+
+A pod must be created **in the volume's data center** (US-KS-2 for `3w7toelc6z`) to mount it —
+this is a real constraint, not a preference: a network volume is DC-pinned, and a pod created
+elsewhere simply can't reference it. Check GPU stock in that specific DC before creating the pod
+(`get-gpu-type` with the DC in its `dataCenters` list, or `runpodctl gpu list`).
+
+```bash
+runpodctl pod create \
+  --compute-type gpu \
+  --gpu-id "NVIDIA A100-SXM4-80GB" --gpu-count 4 \
+  --data-center-ids US-KS-2 \
+  --network-volume-id 3w7toelc6z --volume-mount-path /workspace \
+  --template-id runpod-torch-v280 \
+  --env '{"WANDB_API_KEY":"{{ RUNPOD_SECRET_WANDB_API_KEY }}"}' \
+  --wait
+```
+
+**The `WANDB_API_KEY` secret must be requested explicitly in `--env` at pod creation** — it is
+*not* injected account-wide automatically. Forgetting this (easy to do on a CPU pod that doesn't
+need it, then reusing the same habit on a GPU pod that does) silently means no wandb logging.
+
+Once attached, `NANOCHAT_BASE_DIR=/workspace/.cache/nanochat` is already populated (data,
+tokenizer, eval bundle) and `/workspace/nanochat/.venv` already has `uv sync --extra gpu` done —
+`SKIP_SETUP=1` is safe, or leave setup unset and every step just skips because the files already
+exist.
+
+**If a stage's GPU type isn't available in the volume's DC** (expected for H100/H200 — no single
+RunPod DC currently offers standard-storage volumes plus A100 *and* H100 *and* H200 stock
+together), that pod trains in whichever DC actually has the GPU, writes checkpoints to its own
+local disk as normal, and results come home via the ordinary "Bring the results home" rsync step
+below rather than a direct volume mount — the volume isn't useless there, it just isn't reachable
+from that pod's filesystem directly.
 
 ## 1. Pod spec
 
@@ -149,6 +205,30 @@ saves, i.e. none, unless you changed that), so just re-launch the same command �
 skip, the interrupted one restarts from scratch (base_train.py's own `--resume-from-step` is not
 wired into `runs/contest.sh`; a full row is short enough at these depths that resuming mid-row
 isn't worth the complexity).
+
+### Watching a long run without getting stale information
+
+A run spans multiple architectures and (with the SFT extension) two training phases each, easily
+tens of minutes to hours. Whether you're tailing the log by hand or scripting a poll loop, two real
+failure modes showed up watching this project's own runs:
+
+- **A fixed-size `tail -N` window silently stops reporting progress once the log outgrows it.**
+  Diffing "new content" by comparing line/byte counts against a capped `tail -n 1000` (or similar)
+  plateaus once the file exceeds that window — the count stops growing even though the file still
+  is, so a naive polling loop goes quiet forever after that point while the job keeps running.
+  Watch the **full file's** size (`wc -c`) or track a byte offset (`tail -c +$OFFSET`) instead of a
+  windowed snapshot. This caused a real stuck-looking report mid-run: reported "still at step 900"
+  for several updates while the row had actually already finished and training had moved three
+  architectures ahead.
+- **A single point-in-time check can go stale between when you run it and when you report it.**
+  If you ask "is it done yet" and get "still running," that's true only at that instant — always
+  re-verify (list the actual process, tail the real log) right before reporting status rather than
+  trusting a check from a few minutes/messages earlier, especially right after a step that's known
+  to take a while (like a large `uv sync`).
+- **`timeout`/`gtimeout` isn't installed on macOS by default** (it's GNU coreutils, not BSD) — a
+  script or command assuming it exists fails immediately at that one step rather than running the
+  intended long job. Check the actual exit code / that the job you meant to start is actually
+  running, don't assume "no visible error" means "did what I intended."
 
 ## 5. Bring the results home
 
