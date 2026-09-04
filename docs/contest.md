@@ -237,6 +237,15 @@ failure modes showed up watching this project's own runs:
 
 ## 5. Bring the results home
 
+**Terminate the GPU pod first — the moment its actual GPU work (training/eval) finishes — before
+running anything below.** The checkpoints are already durable on the volume at that point; the
+commands here just move files off it, no GPU involved, so running them while the training pod is
+still up bills its full per-GPU rate for pure I/O. Once it's terminated, pull the copy either via
+the RunPod S3 API against the volume directly (no pod at all, see "Attaching the persistent
+volume" above) or, if a pod is genuinely needed, a fresh cheap CPU pod (~$0.06/hr) attached to the
+same volume — never the GPU pod that trained. See "Lessons" below for what skipping this cost in
+practice the one time it was done wrong.
+
 ```bash
 rsync -avz --include='model_*.pt' --include='meta_*.json' --exclude='optim_*' \
     pod:/workspace/.cache/nanochat/base_checkpoints/contest_mycontest_*/ \
@@ -598,3 +607,16 @@ rather than scattered across commit messages.
   actually trained, since `total_batch_size` stays fixed and grad-accum steps just shrink). Low
   `nvidia-smi` memory usage early in a run on new hardware is the concrete, checkable signal that
   the batch size needs raising — check it before, not after, a long run.
+- **Pulled the H100 contest's results home over the GPU pod's own SSH session instead of
+  terminating it first.** The checkpoints were already durable on the volume the instant training
+  finished — the rsync was pure file I/O, no GPU involved — but it ran while the 2x H100 pod
+  ($6.98/hr = **$0.116/min**) was still up, rather than terminating it immediately and either using
+  S3 (still deferred, see below) or a fresh CPU pod (~$0.06/hr, the same class already used for
+  volume prep in this exact session) for the pull. **One minute on that GPU pod cost more than 1.9
+  hours would have on the CPU pod** — a real, quantifiable waste, and an inconsistency with the
+  session's own established logic (Phase 0's whole point was doing non-GPU work on a cheap pod).
+  Two fixes, not one: (1) **stop deferring RunPod S3 keys** — set them up once and this entire
+  question disappears, no pod of any kind needed to pull from a volume ever again; (2) **whenever a
+  pod is genuinely needed for pure data movement, it must be the cheapest pod type attached to that
+  volume, never the GPU pod that was just training** — terminate the GPU pod the moment its actual
+  GPU work (training/eval) is done, full stop, before running anything that isn't GPU work.
