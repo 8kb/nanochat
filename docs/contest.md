@@ -440,12 +440,57 @@ Real cost: ~$6-6.5 GPU time across two pods (the first was killed mid-run to app
 fix below, cleanly; the retry that produced the numbers above includes recovery from the runaway
 `chat_eval` incident, also below).
 
-**This is the reference row for the H100 contest** (see "Cloud shakedown" above — `llama_kvshare`
-itself is intentionally not re-trained there). `val_bpb`/`CORE`/`ChatCORE` are hardware-independent
-at identical iterations/data/seed, so they're directly comparable across the A100→H100 move;
-`train_time_sec` and MFU are not (different hardware, and the H100 run additionally has FA3
-actually active — this A100 run's FA3 success came from a fix applied *after* the original silent
-SDPA fallback, see "Lessons" below).
+**This is the reference row for the H100 contest below** (`llama_kvshare` itself is intentionally
+not re-trained there). `val_bpb`/`CORE`/`ChatCORE` are hardware-independent at identical
+iterations/data/seed, so they're directly comparable across the A100→H100 move; `train_time_sec`
+and MFU are not (different hardware, and the H100 run additionally has FA3 actually active — this
+A100 run's FA3 success came from a fix applied *after* the original silent SDPA fallback, see
+"Lessons" below).
+
+## Stage 3 results: `gpt`/`llama`/`llama_kvshare_win` d12 on 4x→2x H100
+
+The full d12 contest against `llama_kvshare_win` (the fourth architecture — `llama_kvshare` plus
+sliding-window attention, see `docs/architecture.md`'s worked example), on a fresh persistent
+volume in a Hopper-capable DC. `llama_kvshare` itself was intentionally excluded from this run's
+rows (already measured above, on this exact pipeline) so the run only pays for new information.
+
+**Infra**: 50GB Standard volume `w6ndh50xcl`, **US-GA-2** — checked live that US-KS-2 (the Stage 1
+volume's DC) has zero H100/H200 stock at all, so this needed a second volume in a different DC
+(see "Lessons" below for how to pick one). **4x H100 wasn't orderable** despite showing live
+stock (`get-gpu-type` reported "LOW", not "NONE") — confirmed by directly probing GPU counts (4x
+failed three times; 3x and 2x both succeeded) — ran on **2x H100 SXM 80GB** instead. FA3 confirmed
+active directly (`HAS_FA3: True`) and in every row's log — the first real exercise of the Hopper
+(`major==9`) code path, which the Stage 1 A100 run never touched.
+
+| arch | val bpb | CORE | ChatCORE | ARC-Easy | ARC-Chal. | MMLU | GSM8K | HumanEval | scaling params | KV cache |
+|---|---|---|---|---|---|---|---|---|---|---|
+| gpt | 0.8434 | 0.1553 | 0.0833 | 43% | 29% | 29% | 2% | 5% | 110.1M | 75.5MB |
+| llama | 0.8791 | 0.1109 | 0.0507 | 37% | 31% | 23% | 0% | 4% | 110.1M | 75.5MB |
+| llama_kvshare_win | 0.8693 | 0.1359 | 0.0620 | 47% | 25% | 24% | 0% | 3% | 103.0M | 37.7MB |
+
+`llama_kvshare_win` placed 2nd on both CORE and ChatCORE (behind `gpt`, ahead of `llama`) with the
+**fewest scaling params and smallest KV cache** of the three — the KV-sharing + windowing
+combination is paying off on quality-per-byte, not just raw quality. Its CORE (0.1359) is also
+higher than Stage 1's plain `llama_kvshare` (0.1307) — suggestive that windowing helps at this
+depth, though the comparison spans different hardware and FA3 status, so it isn't a controlled
+ablation.
+
+**A mid-run tuning fix worth carrying forward**: `DEVICE_BATCH_SIZE=16` (inherited from the A100
+default) left only 16-20GB of the H100's 80GB in use — the training loop was overhead-bound
+(data loading, Python, DDP sync), not compute-bound, so FA3 and H100's 3.2x higher peak FLOPS
+weren't showing up in wall-clock. A clean same-architecture check via wandb's own
+`total_training_time` metric (`llama`, no windowing, so FA3-vs-SDPA is a smaller factor): **A100
+23.19 min (4 GPUs, no FA3) vs. H100 20.68 min (2 GPUs, FA3) — only ~11% faster**, confirming the
+overhead-bound diagnosis. Killing the in-progress `llama_kvshare_win` row (minimal sunk cost — no
+checkpoint had saved yet) and relaunching with `DEVICE_BATCH_SIZE=64` pushed memory to 57GB/80GB
+(71%, safe) and **MFU from ~30-35% to ~42-44%**, finishing the row in 33.1 min instead of the
+~40 min it was on pace for. **Use a batch size sized for the actual GPU's memory, not a value
+inherited from a previous GPU class** — checking `nvidia-smi` memory usage early in a run on new
+hardware is the concrete, checkable signal.
+
+Checkpoints (base + SFT, no optimizer state) were rsynced home before terminating the pod — RunPod
+S3 keys are still deferred, so this remains the only way to get local access without another
+billed pod.
 
 ## Lessons from the first real cloud run
 
@@ -535,3 +580,21 @@ rather than scattered across commit messages.
   find a DC with both live stock for the GPU tier you need *and* the storage tier you want — pick
   the volume's DC for the GPU tier you'll need **last**, not first, since the volume choice is what's
   sticky, not the pod's.
+- **`get-gpu-type`'s "LOW" availability is not a promise of stock at the count you ask for.**
+  US-GA-2 showed "LOW" (not "NONE") for H100 SXM, but 4x failed three times in a row before 3x and
+  then 2x both succeeded. **Probing GPU counts by calling `pod create` at each count creates a real
+  billed pod on success, not just a dry check** — two stray pods got created probing this and had
+  to be terminated within seconds of creation (negligible cost here, but a real trap). If you need
+  to find the actual available count, accept the first success rather than continuing to probe
+  downward, or terminate immediately between attempts.
+- **A batch size tuned for one GPU class silently underutilizes a different one.** `DEVICE_BATCH_SIZE=16`
+  (the A100-sized default) left only 16-20GB of an H100's 80GB in use (~20-25%) — the training loop
+  was overhead-bound (data loading, Python, DDP sync per step), not compute-bound, so FA3 and
+  H100's 3.2x higher peak FLOPS barely showed up in wall-clock: a same-architecture check via
+  wandb's `total_training_time` metric (`llama`, no windowing) measured only ~11% faster net
+  training time on 2x H100+FA3 than 4x A100 without FA3. Bumping to `DEVICE_BATCH_SIZE=64` (memory
+  headroom allowed it, confirmed via `nvidia-smi` before committing) pushed MFU from ~30-35% to
+  ~42-44% with no change to `val_bpb`/`CORE` (batch size only changes wall-clock/cost, not what's
+  actually trained, since `total_batch_size` stays fixed and grad-accum steps just shrink). Low
+  `nvidia-smi` memory usage early in a run on new hardware is the concrete, checkable signal that
+  the batch size needs raising — check it before, not after, a long run.

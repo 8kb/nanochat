@@ -168,6 +168,17 @@ Verified in stages, each on real infrastructure where it matters:
    `chat_eval` (capped at 100 problems/task after the cost bug above was hit and fixed mid-run):
    ChatCORE 0.0900. Full numbers and the incidents hit running it for real:
    [docs/contest.md](contest.md)'s "Stage 1 results" and "Lessons from the first real cloud run".
+5. **On a fresh 2x H100 SXM 80GB pod** (4x wasn't orderable despite showing live "LOW" stock; a
+   second Network Volume was needed since US-KS-2 carries no H100/H200 stock at all): the full d12
+   contest, `gpt`/`llama`/`llama_kvshare_win` (`llama_kvshare` itself skipped — already measured in
+   step 4). FA3 confirmed active directly and in every log — the first real exercise of the Hopper
+   (`major==9`) code path. Results: gpt val bpb 0.8434/CORE 0.1553/ChatCORE 0.0833; llama val bpb
+   0.8791/CORE 0.1109/ChatCORE 0.0507; **llama_kvshare_win val bpb 0.8693/CORE 0.1359/ChatCORE
+   0.0620**, 2nd on both metrics (behind gpt, ahead of llama) with the fewest scaling params (103M)
+   and smallest KV cache (37.7MB) of the three — the KV-sharing + windowing combination pays off on
+   quality-per-byte. A mid-run tuning fix (batch size sized for A100 was leaving 80% of the H100's
+   memory idle, capping MFU at ~30-35% despite FA3) doubled MFU to ~42-44% once caught and fixed —
+   see docs/contest.md's "Lessons" for the full diagnosis and numbers.
 
 Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100, `--mfu 0.4` — corrected after
 the GPU-hours fix above; docs/contest.md also gives a more conservative `--mfu 0.33` estimate
@@ -183,12 +194,9 @@ matching what was actually measured):
 Total ≈44.5 GPU-hours ≈11.1h wall clock ≈$62-71 — a real, half-to-full-day run, not the ~$12-15 the
 pre-fix estimate said.
 
-**What's left**: a d12 contest of `gpt`/`llama`/`llama_kvshare_win` on a fresh 4x H100 pod (a
-second Network Volume, since US-KS-2 carries no H100/H200 stock at all — checked live) is the
-immediate next step, both to get FA3 working end-to-end on the GPU class its non-Ampere code path
-was written for (Stage 1's A100 run never exercised that path) and to measure `llama_kvshare_win`
-for the first time; the real d16 contest stays the eventual target beyond that, re-costed once the
-H100 numbers land — see docs/contest.md for the exact sequence and cost estimates.
+**What's left**: the real d16 contest, re-costed for H100 (this stage's numbers, once
+`DEVICE_BATCH_SIZE` is sized correctly for the card, are the best available reference) — see
+docs/contest.md for the exact cost table and sequence.
 
 ## Stage 6 — attention variants
 

@@ -29,7 +29,11 @@
 # Env overrides (all optional, same as runs/contest.sh):
 #   TARGET_FLOPS        iso-FLOPs budget per row (default 1e18, ~0.56 GPU-hours/row on 4xA100)
 #   NPROC_PER_NODE       GPUs to use (default 4; set to 1 to rehearse on a single GPU/CPU/MPS box)
-#   DEVICE_BATCH_SIZE     per-device micro-batch (default 16, sized for 40GB A100s)
+#   DEVICE_BATCH_SIZE     per-device micro-batch (default 16, sized for 40GB A100s -- on an H100
+#                            or larger card this leaves most of its memory unused and the run
+#                            becomes overhead- rather than compute-bound; check `nvidia-smi` memory
+#                            usage early and raise this if it's well under the card's total, see
+#                            docs/contest.md "Lessons from the first real cloud run")
 #   NUM_SHARDS             pretraining data shards to download during setup (default 45, sized for
 #                            a d12 row at TARGET_FLOPS=1e18 with ~18% margin -- see docs/contest.md)
 #   GPU_NAME, MFU, PRICE_PER_GPU_HOUR   feed the GPU-hours/dollar estimate (defaults: "NVIDIA A100", 0.4, 1.50)
