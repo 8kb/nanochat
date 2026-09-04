@@ -46,6 +46,35 @@ def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
 
 
 # =============================================================================
+# FA3 load-failure diagnostics
+# =============================================================================
+def test_fa3_load_error_reported_when_no_cuda(monkeypatch):
+    """_load_flash_attention_3() must return a reason string, not swallow it, when there's no
+    CUDA device -- this is the real path exercised on every CPU/MPS dev machine, and used to be
+    indistinguishable from any other failure (a bare `except Exception: return None`)."""
+    monkeypatch.setattr(fa_module.torch.cuda, "is_available", lambda: False)
+    module, reason = fa_module._load_flash_attention_3()
+    assert module is None
+    assert reason == "no CUDA device available"
+
+
+def test_fa3_load_error_captures_exception_text(monkeypatch):
+    """A real exception during loading (HF hub unreachable, kernels import broken, etc.) must be
+    captured into the reason string, not discarded -- this is the actual bug found running the
+    Stage 5 architecture contest on a real 4x A100 pod: FA3 fell back to SDPA with zero indication
+    of why, even though the GPU should have been supported."""
+    monkeypatch.setattr(fa_module.torch.cuda, "is_available", lambda: True)
+
+    def _boom():
+        raise RuntimeError("simulated HF hub failure")
+    monkeypatch.setattr(fa_module.torch.cuda, "get_device_capability", _boom)
+
+    module, reason = fa_module._load_flash_attention_3()
+    assert module is None
+    assert reason == "RuntimeError: simulated HF hub failure"
+
+
+# =============================================================================
 # FA3 vs SDPA comparison tests
 # =============================================================================
 @pytest.mark.skipif(not HAS_FA3, reason="FA3 required to compare implementations")

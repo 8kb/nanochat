@@ -107,8 +107,9 @@ loaded): `python -m scripts.model_info --checkpoints` inspects every checkpoint 
 `base_checkpoints/`, or pass a comma-separated list of tags.
 
 `runs/contest.sh` runs all three architectures on the same tokenizer and the same iso-FLOPs
-compute budget on rented cloud GPUs — see [`docs/contest.md`](docs/contest.md) for the full
-RunPod runbook (always `DRY_RUN=1` first; nothing rents anything on its own).
+compute budget on rented cloud GPUs, then SFT (chat) fine-tunes and evaluates each resulting base
+checkpoint too — see [`docs/contest.md`](docs/contest.md) for the full RunPod runbook (always
+`DRY_RUN=1` first; nothing rents anything on its own).
 
 ## Docs index
 

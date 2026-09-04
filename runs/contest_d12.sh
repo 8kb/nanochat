@@ -1,10 +1,12 @@
 #!/bin/bash
 
-# Cheap shakedown of the architecture contest: same three rows as runs/contest.sh, but at depth 12
-# and a 1e18 FLOPs budget instead of d16/5e18 -- about 1/5th the GPU-hours (~1.7 total on 4xA100,
-# ~25 min wall clock), for proving the harness end-to-end on real cloud GPUs before committing to
-# the full d16 run. Kept as its own file rather than a CONTEST_ROWS edit in runs/contest.sh so that
-# script's committed defaults stay the real d16 contest (see docs/contest.md "Sizing").
+# Cheap shakedown of the architecture contest: same three rows as runs/contest.sh (base training,
+# then SFT + chat_eval per row), but at depth 12 and a 1e18 FLOPs budget instead of d16/5e18 --
+# about 1/5th the base GPU-hours, for proving the harness end-to-end on real cloud GPUs before
+# committing to the full d16 run. Kept as its own file rather than a CONTEST_ROWS edit in
+# runs/contest.sh so that script's committed defaults stay the real d16 contest (see
+# docs/contest.md "Sizing"). Edit CONTEST_ROWS below to narrow this to one architecture for an
+# even cheaper pipeline-validation run (e.g. just "llama_kvshare|12|--arch-opt kv_share_frac=0.5").
 #
 # Usage: bash runs/contest_d12.sh [label]
 # Example: bash runs/contest_d12.sh d12test
@@ -27,8 +29,18 @@
 #   GPU_NAME, MFU, PRICE_PER_GPU_HOUR   feed the GPU-hours/dollar estimate (defaults: "NVIDIA A100", 0.4, 1.50)
 #   SKIP_SETUP=1            skip venv/data/tokenizer setup (same convention as runs/miniseries.sh)
 #   EXTRA_TRAIN_ARGS         appended (last) to every base_train.py invocation
+#   EXTRA_SFT_ARGS           appended (last) to every scripts.chat_sft invocation
+#   EXTRA_CHATEVAL_ARGS      appended (last) to every scripts.chat_eval invocation
 
 set -euo pipefail
+
+# RunPod injects account Secrets (e.g. WANDB_API_KEY) into /etc/rp_environment, but only sources
+# it into *interactive* shells via .bashrc's interactive-shell guard -- a non-interactive launch
+# (which is how this script gets run when kicked off over a scripted SSH command, not a human
+# typing at a prompt) never sees it otherwise, and wandb then fails with "api_key not configured
+# (no-tty)" even though the secret really is there. Sourcing it here makes it available
+# automatically regardless of how this script was launched; harmless no-op off RunPod.
+[ -f /etc/rp_environment ] && source /etc/rp_environment
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
@@ -53,6 +65,8 @@ PRICE_PER_GPU_HOUR="${PRICE_PER_GPU_HOUR:-1.50}"
 EVAL_TOKENS=$((20 * 524288))
 WANDB_RUN="${WANDB_RUN:-contest_${LABEL}}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
+EXTRA_SFT_ARGS="${EXTRA_SFT_ARGS:-}"           # appended to every scripts.chat_sft invocation
+EXTRA_CHATEVAL_ARGS="${EXTRA_CHATEVAL_ARGS:-}" # appended to every scripts.chat_eval invocation
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -67,8 +81,19 @@ if [ -z "${SKIP_SETUP:-}" ]; then
     uv sync --extra gpu
     source .venv/bin/activate
     python -m nanochat.dataset -n "$NUM_SHARDS"
-    if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ]; then
-        python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
+    # tok_train's own guard used to check only tokenizer.pkl -- token_bytes.pt is also required
+    # (base_train.py/base_eval.py/chat_sft.py all load it) and a partial copy of just the pickle
+    # would pass this guard and then crash at training start. Check both.
+    if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ] || [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/token_bytes.pt" ]; then
+        if [ -f "nanochat/default_tokenizer/tokenizer.pkl" ] && [ -f "nanochat/default_tokenizer/token_bytes.pt" ]; then
+            # Repo-committed tokenizer (small, content-derived, fully portable -- see
+            # nanochat/default_tokenizer/) -- skips training one from scratch on every pod.
+            log "Using repo-committed tokenizer (nanochat/default_tokenizer/) -- skipping tok_train"
+            mkdir -p "$NANOCHAT_BASE_DIR/tokenizer"
+            cp nanochat/default_tokenizer/tokenizer.pkl nanochat/default_tokenizer/token_bytes.pt "$NANOCHAT_BASE_DIR/tokenizer/"
+        else
+            python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
+        fi
     fi
 else
     source .venv/bin/activate
@@ -79,6 +104,10 @@ mkdir -p "$RESULTS_DIR"
 RESULTS_FILE="$RESULTS_DIR/results.csv"
 if [ ! -f "$RESULTS_FILE" ]; then
     echo "label,arch,depth,extra_args,n_embd,num_kv_slots,params_total,params_scaling,flops_per_token,kv_mb,total_batch_size,num_iterations,tokens_trained,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+fi
+CHAT_RESULTS_FILE="$RESULTS_DIR/chat_results.csv"
+if [ ! -f "$CHAT_RESULTS_FILE" ]; then
+    echo "label,arch,depth,base_tag,arc_easy,arc_challenge,mmlu,gsm8k,humaneval,chatcore_metric,sft_time_sec,eval_time_sec" > "$CHAT_RESULTS_FILE"
 fi
 
 # -----------------------------------------------------------------------------
@@ -125,54 +154,59 @@ fi
 
 # -----------------------------------------------------------------------------
 # Train every row, skipping any already recorded in results.csv (resume after an interruption).
-if [ "$NPROC_PER_NODE" -eq 1 ]; then
-    LAUNCH=(python -m scripts.base_train)
-else
-    LAUNCH=(torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train --)
-fi
+# launch_module lets both scripts.base_train and scripts.chat_sft share one launcher-selection
+# rule (torchrun for multi-GPU, plain python for the NPROC_PER_NODE=1 CPU/MPS rehearsal path).
+launch_module() {
+    local module="$1"; shift
+    if [ "$NPROC_PER_NODE" -eq 1 ]; then
+        python -m "$module" "$@"
+    else
+        torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m "$module" -- "$@"
+    fi
+}
 
 for row in "${CONTEST_ROWS[@]}"; do
     IFS='|' read -r arch depth extra_args <<< "$row"
     tag="contest_${LABEL}_${arch}_d${depth}"
-
-    if grep -q "^${LABEL},${arch},${depth}," "$RESULTS_FILE" 2>/dev/null; then
-        log "Skipping ${tag} (already in results)"
-        continue
-    fi
-
-    log "=============================================="
-    log "Training ${tag}"
-    log "=============================================="
 
     # base_train.py checks args.run == "dummy" (exact string) to skip wandb entirely -- suffixing
     # it unconditionally would silently require a real wandb login even when the caller asked for
     # dummy.
     if [ "$WANDB_RUN" = "dummy" ]; then
         run_name="dummy"
+        sft_run_name="dummy"
     else
         run_name="${WANDB_RUN}_${arch}_d${depth}"
+        sft_run_name="${WANDB_RUN}_${arch}_d${depth}_sft"
     fi
 
-    log_file="$RESULTS_DIR/${tag}_train.log"
-    start_time=$(date +%s)
-    "${LAUNCH[@]}" \
-        --arch="$arch" --depth="$depth" $extra_args \
-        --target-flops="$TARGET_FLOPS" --target-param-data-ratio=-1 \
-        --device-batch-size="$DEVICE_BATCH_SIZE" \
-        --model-tag="$tag" --run="$run_name" \
-        --eval-tokens="$EVAL_TOKENS" \
-        --core-metric-every=999999 --core-metric-max-per-task=-1 \
-        --sample-every=-1 --save-every=-1 \
-        $EXTRA_TRAIN_ARGS \
-        2>&1 | tee "$log_file"
-    train_time=$(( $(date +%s) - start_time ))
+    if grep -q "^${LABEL},${arch},${depth}," "$RESULTS_FILE" 2>/dev/null; then
+        log "Skipping ${tag} base training (already in results)"
+    else
+        log "=============================================="
+        log "Training ${tag}"
+        log "=============================================="
 
-    # Static shape/params/FLOPs/KV columns come from the preflight JSON (shapes only, computed
-    # once above); dynamic training-outcome columns are parsed from this row's own log. Plain
-    # python re rather than `grep -oP`: -P is a GNU-grep extension, absent on macOS's BSD grep.
-    plan_file="$RESULTS_DIR/plan_${arch}_d${depth}.json"
-    read -r n_embd num_kv_slots params_total params_scaling flops_per_token kv_mb \
-        total_batch_size num_iterations val_bpb core_score <<< "$(python - "$plan_file" "$log_file" <<'PYEOF'
+        log_file="$RESULTS_DIR/${tag}_train.log"
+        start_time=$(date +%s)
+        launch_module scripts.base_train \
+            --arch="$arch" --depth="$depth" $extra_args \
+            --target-flops="$TARGET_FLOPS" --target-param-data-ratio=-1 \
+            --device-batch-size="$DEVICE_BATCH_SIZE" \
+            --model-tag="$tag" --run="$run_name" \
+            --eval-tokens="$EVAL_TOKENS" \
+            --core-metric-every=999999 --core-metric-max-per-task=-1 \
+            --sample-every=-1 --save-every=-1 \
+            $EXTRA_TRAIN_ARGS \
+            2>&1 | tee "$log_file"
+        train_time=$(( $(date +%s) - start_time ))
+
+        # Static shape/params/FLOPs/KV columns come from the preflight JSON (shapes only, computed
+        # once above); dynamic training-outcome columns are parsed from this row's own log. Plain
+        # python re rather than `grep -oP`: -P is a GNU-grep extension, absent on macOS's BSD grep.
+        plan_file="$RESULTS_DIR/plan_${arch}_d${depth}.json"
+        read -r n_embd num_kv_slots params_total params_scaling flops_per_token kv_mb \
+            total_batch_size num_iterations val_bpb core_score <<< "$(python - "$plan_file" "$log_file" <<'PYEOF'
 import json, re, sys
 plan = json.load(open(sys.argv[1]))[0]
 log_text = open(sys.argv[2]).read()
@@ -193,20 +227,83 @@ print(plan["shape"]["n_embd"], plan["shape"]["num_kv_slots"], plan["params"]["to
       total_batch_size, num_iterations, val_bpb, core_score)
 PYEOF
 )"
-    tokens_trained=$((num_iterations * total_batch_size))
+        tokens_trained=$((num_iterations * total_batch_size))
 
-    log "  ${tag}: params=${params_total}, iters=${num_iterations}, val_bpb=${val_bpb}, CORE=${core_score}, time=${train_time}s"
-    echo "$LABEL,$arch,$depth,\"$extra_args\",$n_embd,$num_kv_slots,$params_total,$params_scaling,$flops_per_token,$kv_mb,$total_batch_size,$num_iterations,$tokens_trained,$val_bpb,$core_score,$train_time" >> "$RESULTS_FILE"
+        log "  ${tag}: params=${params_total}, iters=${num_iterations}, val_bpb=${val_bpb}, CORE=${core_score}, time=${train_time}s"
+        echo "$LABEL,$arch,$depth,\"$extra_args\",$n_embd,$num_kv_slots,$params_total,$params_scaling,$flops_per_token,$kv_mb,$total_batch_size,$num_iterations,$tokens_trained,$val_bpb,$core_score,$train_time" >> "$RESULTS_FILE"
+    fi
+
+    # -------------------------------------------------------------------------
+    # Chat (SFT) step: fine-tune this row's base checkpoint, then chat_eval it. Reuses the same
+    # tag as the base checkpoint -- chat_sft.py's output tag lands in a separate
+    # chatsft_checkpoints/ namespace, so there's no collision, just a clean 1:1 base<->chat pairing.
+    if grep -q "^${LABEL},${arch},${depth}," "$CHAT_RESULTS_FILE" 2>/dev/null; then
+        log "Skipping ${tag} chat SFT (already in chat_results)"
+        continue
+    fi
+
+    log "=============================================="
+    log "SFT training ${tag}"
+    log "=============================================="
+    sft_log_file="$RESULTS_DIR/${tag}_sft.log"
+    sft_start_time=$(date +%s)
+    launch_module scripts.chat_sft \
+        --arch="$arch" --model-tag="$tag" --run="$sft_run_name" \
+        $EXTRA_SFT_ARGS \
+        2>&1 | tee "$sft_log_file"
+    sft_time=$(( $(date +%s) - sft_start_time ))
+
+    log "=============================================="
+    log "Chat eval ${tag}"
+    log "=============================================="
+    eval_log_file="$RESULTS_DIR/${tag}_chateval.log"
+    eval_start_time=$(date +%s)
+    python -m scripts.chat_eval -i sft -g "$tag" \
+        $EXTRA_CHATEVAL_ARGS \
+        2>&1 | tee "$eval_log_file"
+    eval_time=$(( $(date +%s) - eval_start_time ))
+
+    read -r arc_easy arc_challenge mmlu gsm8k humaneval chatcore <<< "$(python - "$eval_log_file" <<'PYEOF'
+import re, sys
+log_text = open(sys.argv[1]).read()
+
+def acc(task):
+    matches = re.findall(rf'{re.escape(task)} accuracy:\s*([\d.]+)%', log_text)
+    return matches[-1] if matches else "0.0"
+
+chatcore = re.findall(r'ChatCORE metric:\s*([\d.]+)', log_text)
+print(acc("ARC-Easy"), acc("ARC-Challenge"), acc("MMLU"), acc("GSM8K"), acc("HumanEval"),
+      chatcore[-1] if chatcore else "0.0")
+PYEOF
+)"
+
+    log "  ${tag} SFT: ChatCORE=${chatcore}, ARC-Easy=${arc_easy}%, MMLU=${mmlu}%, GSM8K=${gsm8k}%, sft_time=${sft_time}s, eval_time=${eval_time}s"
+    echo "$LABEL,$arch,$depth,$tag,$arc_easy,$arc_challenge,$mmlu,$gsm8k,$humaneval,$chatcore,$sft_time,$eval_time" >> "$CHAT_RESULTS_FILE"
 done
+
+# column isn't installed on every minimal image (confirmed missing on a real RunPod pod) --
+# fall back to plain cat rather than fail the whole script on a purely cosmetic step.
+print_csv() {
+    if command -v column &> /dev/null; then
+        column -t -s',' "$1"
+    else
+        cat "$1"
+    fi
+}
 
 log "=============================================="
 log "Contest '${LABEL}' complete"
 log "=============================================="
-log "Results: $RESULTS_FILE"
-log "Checkpoints: $NANOCHAT_BASE_DIR/base_checkpoints/contest_${LABEL}_*"
+log "Base results: $RESULTS_FILE"
+log "Chat (SFT) results: $CHAT_RESULTS_FILE"
+log "Base checkpoints: $NANOCHAT_BASE_DIR/base_checkpoints/contest_${LABEL}_*"
+log "Chat checkpoints: $NANOCHAT_BASE_DIR/chatsft_checkpoints/contest_${LABEL}_*"
 echo ""
-echo "Next: compare locally with"
+echo "Next: compare base checkpoints locally with"
 echo "  python -m scripts.model_info --checkpoints \$(ls $NANOCHAT_BASE_DIR/base_checkpoints | grep contest_${LABEL} | tr '\n' ',')"
 echo ""
-echo "Results:"
-column -t -s',' "$RESULTS_FILE"
+echo "Base results:"
+print_csv "$RESULTS_FILE"
+echo ""
+echo "Chat (SFT) results:"
+print_csv "$CHAT_RESULTS_FILE"

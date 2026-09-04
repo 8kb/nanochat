@@ -161,6 +161,23 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
   - `scripts/base_eval.py`'s CORE-eval CSV filename changed from `base_model_<step>.csv` to
     `<model_tag>_<step>.csv` (using the newly-stamped `meta["model_tag"]`), since three
     architectures evaluated in one `NANOCHAT_BASE_DIR` previously all wrote the same filename.
+- **Stage 5 follow-up** (real-cloud-run fixes + SFT/chat contest extension): two more
+  upstream-adjacent touch points, plus contest-harness-only additions.
+  - `nanochat/flash_attention.py`'s `_load_flash_attention_3()` now returns `(module, reason)`
+    instead of just `module` — the previous bare `except Exception: return None` silently
+    discarded *why* FA3 failed to load. New module-level `FA3_LOAD_ERROR` string, printed by
+    `scripts/base_train.py`'s and `scripts/chat_sft.py`'s existing "SDPA fallback" warnings.
+  - `scripts/chat_sft.py` gained an `--arch` argument (threaded into `load_model`/
+    `load_optimizer_state`, which already accepted it), its auto-generated output tag is now
+    arch-qualified the same way `base_train.py:168` already was (`f"{arch}_d{depth}"` for
+    non-gpt), and its saved checkpoint meta gained `base_model_tag`/`base_model_step` (from
+    `meta["model_tag"]`/`meta["step"]` of the base checkpoint it loaded) for provenance.
+  - Contest-harness-only (not upstream-shared): `runs/contest.sh`/`runs/contest_d12.sh` now run
+    `scripts.chat_sft` + `scripts.chat_eval` per row after base training, recording a second
+    `chat_results.csv`; `nanochat/default_tokenizer/` (a committed portable tokenizer) is copied
+    in during setup instead of training one from scratch; `WANDB_API_KEY` is sourced from
+    `/etc/rp_environment` automatically; the final summary falls back to `cat` when `column` isn't
+    installed.
 
 ## Merge procedure for a new upstream commit
 

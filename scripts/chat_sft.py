@@ -21,7 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -38,6 +38,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
+parser.add_argument("--arch", type=str, default=None, help="restrict base-checkpoint auto-discovery/output tag to this architecture (gpt|llama|llama_kvshare); default None picks any")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
@@ -88,10 +89,10 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 
 # Flash Attention status
 if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+    print0(f"WARNING: Flash Attention 3 not available ({FA3_LOAD_ERROR}), using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step, arch=args.arch)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -137,7 +138,7 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step, arch=args.arch)
     if optimizer_data is not None:
         optimizer_data = type(orig_model).patch_optimizer_state_dict(optimizer_data, orig_model.config, log=print0)
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -391,7 +392,12 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        # Arch-qualify the auto-generated tag the same way base_train.py does (base_train.py:168)
+        # -- without this, an SFT run of two different architectures at the same depth (e.g. gpt
+        # and llama both at d12, auto-discovered rather than given an explicit --model-tag) would
+        # silently overwrite each other's chatsft_checkpoints/d12/ directory.
+        arch = model.config.arch
+        output_dirname = args.model_tag if args.model_tag else (f"d{depth}" if arch == "gpt" else f"{arch}_d{depth}") # e.g. d12, or llama_d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -403,6 +409,11 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model.config.to_dict(),
                 "user_config": user_config, # inputs to the training script
+                # Provenance: which base checkpoint this SFT run started from -- meta["model_tag"]
+                # is always populated by load_model_from_dir (checkpoint_manager.py), whether the
+                # tag was given explicitly or auto-discovered, so this is never missing.
+                "base_model_tag": meta.get("model_tag"),
+                "base_model_step": meta.get("step"),
             },
             rank=ddp_rank,
         )

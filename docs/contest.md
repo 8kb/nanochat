@@ -1,10 +1,17 @@
 # Running the architecture contest on RunPod
 
 `runs/contest.sh` trains all three registered architectures (`gpt`, `llama`, `llama_kvshare`) on
-the same tokenizer and the same compute budget, so the comparison is actually apples-to-apples,
-then leaves everything needed to compare them locally in the checkpoint directory. This page is
-the runbook for the piece that costs real money: renting the GPUs. **Nothing in this repo does
-that automatically** — provisioning a pod is a manual step you take deliberately.
+the same tokenizer and the same compute budget, so the comparison is actually apples-to-apples;
+then it SFT (chat) fine-tunes and `chat_eval`s each resulting base checkpoint, so the contest
+compares both base *and* chat models, not base alone. It leaves everything needed to compare them
+locally in the checkpoint directory. This page is the runbook for the piece that costs real money:
+renting the GPUs. **Nothing in this repo does that automatically** — provisioning a pod is a
+manual step you take deliberately.
+
+A persistent-volume pipeline (pre-staged data/tokenizer, checkpoints written straight to durable
+storage, no live rsync-while-billing) is planned but not yet built — this doc still describes the
+single-ephemeral-pod workflow. Until then, the tokenizer step below is already free (committed to
+the repo, see "One-time setup"), which removes most of what a volume would have saved anyway.
 
 Do not skip the dry run in step 3. It costs nothing and tells you exactly what you're about to
 spend before a single GPU-second runs.
@@ -33,24 +40,26 @@ spend before a single GPU-second runs.
 export NANOCHAT_BASE_DIR=/workspace/.cache/nanochat
 mkdir -p "$NANOCHAT_BASE_DIR"
 git clone <this repo's URL> nanochat && cd nanochat
-wandb login   # optional but recommended -- see "Logging" below; skip and use WANDB_RUN=dummy otherwise
 ```
 
 `runs/contest.sh` handles the rest of setup (venv, dataset shards, tokenizer) itself unless you
-pass `SKIP_SETUP=1`.
+pass `SKIP_SETUP=1`. The tokenizer specifically is **free**: `nanochat/default_tokenizer/`
+(committed to the repo, 532KB — content-derived, no machine identity, so a checked-in copy is
+exactly as valid as a freshly-trained one) is copied into `$NANOCHAT_BASE_DIR/tokenizer/`
+automatically if it's not already there, so `scripts.tok_train` never runs on a fresh pod at all.
 
-**`wandb login` gotcha: run it interactively, not via a scripted/non-interactive SSH command.**
-A RunPod account Secret referenced as `{{ RUNPOD_SECRET_WANDB_API_KEY }}` in a pod's env
-(create-pod's `env` field) does **not** resolve into the process environment the way you'd expect
-via the API used by the RunPod MCP/`create-pod` tool as of this doc — it lands in
-`/etc/rp_environment` on the pod, which `~/.bashrc` only sources under an **interactive**-shell
-guard. A plain `ssh host 'cmd'` (or any script launching training) runs a *non*-interactive shell
-and never sees it, even though an interactive `ssh host` login session does — which is exactly why
-`wandb login` can report "already logged in" in an interactive session while a script launched
-right after (via a separate non-interactive `ssh host 'cmd'`) still crashes with `api_key not
-configured (no-tty)`. If you must launch training non-interactively, `source /etc/rp_environment`
-first in that same command — but the simplest fix is to `wandb login` yourself, interactively, once
-per pod, and paste the key at the prompt.
+**Wandb credentials are sourced automatically now — no manual login step.** `runs/contest.sh` and
+`runs/contest_d12.sh` both do `[ -f /etc/rp_environment ] && source /etc/rp_environment` near the
+top. This closes a real gap found running this for real: a RunPod account Secret referenced as
+`{{ RUNPOD_SECRET_WANDB_API_KEY }}` in a pod's env (create-pod's `env` field) does **not** resolve
+into the process environment the way you'd expect via the API used by the RunPod MCP/`create-pod`
+tool as of this doc — it lands in `/etc/rp_environment` on the pod, which `~/.bashrc` only sources
+under an **interactive**-shell guard, so a script-launched (non-interactive) run used to crash with
+`api_key not configured (no-tty)` even though the secret really was there — which is also why
+`wandb login` could report "already logged in" in a human's interactive SSH session while a script
+launched right after still failed. Sourcing the file directly in the scripts themselves means this
+now just works regardless of how the script is launched. `WANDB_RUN=dummy` still skips wandb
+entirely if you don't want it at all.
 
 ## 3. Always dry-run first
 
@@ -100,20 +109,29 @@ screen -L -Logfile contest.log -S contest bash runs/contest.sh mycontest
 # detach: Ctrl-A D. Reattach: screen -r contest
 ```
 
-`mycontest` becomes the run label: results land in
+`mycontest` becomes the run label: base results land in
 `$NANOCHAT_BASE_DIR/contest_mycontest_results/results.csv`, checkpoints in
-`$NANOCHAT_BASE_DIR/base_checkpoints/contest_mycontest_{arch}_d{depth}/`. Omit the label to default
-to today's date, matching `runs/miniseries.sh`'s convention.
+`$NANOCHAT_BASE_DIR/base_checkpoints/contest_mycontest_{arch}_d{depth}/`. Chat (SFT) results land
+in `chat_results.csv` in the same results dir, checkpoints in
+`$NANOCHAT_BASE_DIR/chatsft_checkpoints/contest_mycontest_{arch}_d{depth}/` — same tag, different
+namespace, so base and chat checkpoints pair up 1:1 by tag. Omit the label to default to today's
+date, matching `runs/miniseries.sh`'s convention.
 
-**Logging**: `WANDB_RUN` defaults to `contest_<label>`, which requires `wandb login` (step 2). Set
-`WANDB_RUN=dummy` to skip wandb entirely (no plots, just the CSV and the terminal log).
+**Logging**: `WANDB_RUN` defaults to `contest_<label>` and now authenticates automatically (see
+"One-time setup" above — no `wandb login` step needed). Set `WANDB_RUN=dummy` to skip wandb
+entirely (no plots, just the CSVs and the terminal logs).
 
 ### What to watch for in the log
 
 - **`✓ Using Flash Attention 3`** near the top of each row's log. FA3 loads for A100 (sm80) via the
-  `kernels` hub but isn't guaranteed — if you instead see `WARNING: Flash Attention 3 not
-  available, using PyTorch SDPA fallback`, training still runs correctly, just slower (this is what
-  every local Mac verification of this repo exercises, since there's no CUDA here).
+  `kernels` hub but isn't guaranteed — if you instead see `WARNING: Flash Attention 3 not available
+  (<reason>), using PyTorch SDPA fallback`, training still runs correctly, just slower (this is
+  what every local Mac verification of this repo exercises, since there's no CUDA here). The
+  `<reason>` is real now (`nanochat.flash_attention.FA3_LOAD_ERROR`) — it used to be silently
+  discarded (`except Exception: return None` with no logging), so a genuinely fixable failure (HF
+  hub unreachable, a broken `kernels` import, ...) was indistinguishable from "this GPU just
+  doesn't have a kernel." If you want to dig further on a live pod:
+  `python -c "from kernels import get_kernel, has_kernel; import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_capability()); print(has_kernel('kernels-community/flash-attn3'))"`.
 - **GPT's row runs with `window_pattern=SSSL`** (its own architecture default; Llama and
   LlamaKVShare default to `L`, full attention) — this is intentional (each architecture competes as
   its author defined it, not with a pattern forced to match). If FA3 didn't load, the SDPA fallback
@@ -138,19 +156,21 @@ isn't worth the complexity).
 rsync -avz --include='model_*.pt' --include='meta_*.json' --exclude='optim_*' \
     pod:/workspace/.cache/nanochat/base_checkpoints/contest_mycontest_*/ \
     ~/.cache/nanochat/base_checkpoints/contest_mycontest_TAG/
+rsync -avz --include='model_*.pt' --include='meta_*.json' --exclude='optim_*' \
+    pod:/workspace/.cache/nanochat/chatsft_checkpoints/contest_mycontest_*/ \
+    ~/.cache/nanochat/chatsft_checkpoints/contest_mycontest_TAG/
 rsync -avz pod:/workspace/.cache/nanochat/contest_mycontest_results/ ~/.cache/nanochat/contest_mycontest_results/
-rsync -avz pod:/workspace/.cache/nanochat/tokenizer/ ~/.cache/nanochat/tokenizer/   # only if this machine has no tokenizer yet
 ```
 
 **Deliberately excluded: `optim_*_rank*.pt`.** They're sharded per rank (ZeRO-2), collectively
 ~2x the model weights, and useless for anything this doc does (inference, eval, sampling) — only
 `--resume-from-step`/`chat_sft --load-optimizer` read them, and you're not resuming a finished pod.
 
-**Do bring the tokenizer** if this machine doesn't already have the one the pod trained with (step
-2's setup trains a fresh one if `$NANOCHAT_BASE_DIR/tokenizer/` is empty). If this machine already
-has a tokenizer — e.g. from `runs/runcpu.sh` — do **not** overwrite it; the whole point of the
-tokenizer fingerprint below is to catch exactly this mismatch, and the fix is to use the *pod's*
-tokenizer, not silently keep a different local one.
+**No need to bring the tokenizer back anymore** — the pod used the same repo-committed
+`nanochat/default_tokenizer/` this machine already has (see "One-time setup"), so there's nothing
+to sync. This also means the tokenizer-mismatch trap the fingerprint check below exists for
+shouldn't come up for a normal contest run; it stays relevant if you deliberately mix in a
+checkpoint trained some other way (e.g. `runs/runcpu.sh`, which still trains its own tokenizer).
 
 ## 6. Compare locally
 
@@ -181,6 +201,18 @@ python -m scripts.base_eval --model-tag contest_mycontest_gpt_d16 --eval sample 
 named after the resolved model tag (`base_eval/<tag>_<step>.csv`), so evaluating all three in the
 same `NANOCHAT_BASE_DIR` no longer overwrites one file three times.
 
+For the **chat (SFT)** checkpoints, `chat_results.csv` already has per-task accuracy and the
+ChatCORE metric from the contest run itself (see "Launch for real"); to re-run or dig into a
+specific task locally:
+
+```bash
+python -m scripts.chat_eval -i sft -g contest_mycontest_gpt_d16 -a GSM8K --device-type mps
+```
+
+Each chat checkpoint's `meta.json` also records `base_model_tag`/`base_model_step` — which exact
+base checkpoint it was fine-tuned from — so a downloaded SFT checkpoint is traceable on its own,
+without needing the run's CSV.
+
 ## Sizing: changing the contest
 
 Everything above assumes the defaults. To change what's being compared:
@@ -208,30 +240,44 @@ Everything above assumes the defaults. To change what's being compared:
 - **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`nanochat/fp8.py`) — irrelevant
   on A100s; if you move the contest to H100s, add `--fp8` to each row's args and expect a real
   speedup, but note it changes precision, so keep it on or off for all three rows equally.
+- **The SFT step has no iso-FLOPs budget of its own.** It's `--num-iterations=-1` (a full epoch of
+  the SmolTalk+GSM8K+MMLU mixture) by default for every row, matching upstream nanochat's own SFT
+  convention (`runs/speedrun.sh`) — not compute-matched the way base training is. Size this into
+  the total budget separately: roughly one SFT run's worth of compute per architecture, on top of
+  the base contest's cost.
 
 ## Local rehearsal (no cloud, plumbing check only)
 
 To confirm the harness itself works before touching a cloud account (this is exactly how this
-stage was verified — no A100 was rented to write this doc):
+stage was verified — no A100 was rented to write the original version of this doc; the base+SFT
+extension below was likewise verified as a full CPU/MPS rehearsal before ever running on a pod):
 
 ```bash
 NPROC_PER_NODE=1 DEVICE_BATCH_SIZE=2 SKIP_SETUP=1 WANDB_RUN=dummy \
 EXTRA_TRAIN_ARGS="--depth=2 --num-iterations=3 --max-seq-len=128 --total-batch-size=256 --core-metric-every=-1 --eval-tokens=2048" \
+EXTRA_SFT_ARGS="--num-iterations=3 --max-seq-len=128 --eval-every=-1 --chatcore-every=200 --mmlu-epochs=0 --gsm8k-epochs=0" \
+EXTRA_CHATEVAL_ARGS="--max-problems=2 --task-name=ARC-Easy" \
 bash runs/contest.sh rehearsal
 ```
 
-`EXTRA_TRAIN_ARGS` is appended last to every `base_train.py` call, so it overrides each row's
-`--depth`/`--target-flops` and forces a 3-step toy run regardless of size. This proves the launcher
-selection (`torchrun` vs. plain `python`), per-row skip-on-resume, tokenizer sharing, distinct
-checkpoint tags, and log parsing all work — but because the *preflight* JSON (used for the CSV's
-static params/FLOPs/KV columns) still reflects each row's nominal `--depth=16`, not the
-`EXTRA_TRAIN_ARGS`-overridden depth actually trained, `results.csv`'s static columns are wrong for
-a rehearsal run specifically (the dynamic columns — val bpb, iterations, tokens trained — are
-correct, read from the real log). `scripts.model_info --checkpoints` on the resulting checkpoints
-reports the true trained shape, since it reads the checkpoint's own saved config rather than the
-preflight file. This mismatch cannot happen in a real contest run, which never overrides `--depth`
-this way. `NPROC_PER_NODE=1` also switches the launcher to plain `python -m scripts.base_train`
-(no `torchrun`), so this works on a CPU/MPS machine with no CUDA at all.
+`EXTRA_TRAIN_ARGS`/`EXTRA_SFT_ARGS`/`EXTRA_CHATEVAL_ARGS` are each appended last to every call of
+their respective script, so they override each row's own settings and force a tiny toy run
+regardless of size — `EXTRA_CHATEVAL_ARGS` above also narrows `chat_eval` to one fast task
+(`ARC-Easy`, capped at 2 problems) instead of its default of all five tasks, since the full
+generative sweep (GSM8K/HumanEval sampling included) is slow even at toy sizes. This proves the
+launcher selection (`torchrun` vs. plain `python`, shared by `base_train` and `chat_sft` via the
+same `launch_module` helper), per-row skip-on-resume (base *and* chat, independently), tokenizer
+sharing, distinct arch-qualified checkpoint tags (both `base_checkpoints/` and
+`chatsft_checkpoints/`), base→SFT provenance stamping, and log parsing all work — but because the
+*preflight* JSON (used for the CSV's static params/FLOPs/KV columns) still reflects each row's
+nominal `--depth=16`, not the `EXTRA_TRAIN_ARGS`-overridden depth actually trained, `results.csv`'s
+static columns are wrong for a rehearsal run specifically (the dynamic columns — val bpb,
+iterations, tokens trained, and everything in `chat_results.csv` — are correct, read from the real
+logs). `scripts.model_info --checkpoints` on the resulting checkpoints reports the true trained
+shape, since it reads the checkpoint's own saved config rather than the preflight file. This
+mismatch cannot happen in a real contest run, which never overrides `--depth` this way.
+`NPROC_PER_NODE=1` also switches the launcher to plain `python` (no `torchrun`), so this works on a
+CPU/MPS machine with no CUDA at all.
 
 ## Cloud shakedown: `runs/contest_d12.sh`
 
@@ -266,6 +312,52 @@ being slowest — a genuine result, not a harness artifact. Total wall clock for
 
 Real gotchas hit running this for real (all fixed in the code/docs you're reading now, documented
 here so they don't need rediscovering): the GPU-hours/cost formula bug described in "Always
-dry-run first" above; the `wandb login`-must-be-interactive gotcha in "One-time setup" above; and
-**4x A100 40GB was not orderable** at the time of this run (see "Pod spec" above) — used 4x
-A100-SXM4-80GB instead, which needed no other changes.
+dry-run first" above; the wandb-secret-sourcing gotcha in "One-time setup" above; the missing FA3
+failure reason noted in "What to watch for" above (FA3 fell back to SDPA on this run with no
+diagnostic at the time); a `column: command not found` on this pod's minimal image, breaking the
+script's final pretty-printed summary (fixed — falls back to plain `cat` when `column` isn't
+installed); and **4x A100 40GB was not orderable** at the time of this run (see "Pod spec" above)
+— used 4x A100-SXM4-80GB instead, which needed no other changes.
+
+**Note:** the table above is from the base-only version of this run, before the SFT/chat extension
+in "Launch for real" existed — it's been verified locally (CPU/MPS rehearsal, above) but not yet on
+a real pod. Re-running `contest_d12.sh` on a real pod (optionally narrowed to one architecture via
+`CONTEST_ROWS`, e.g. just `llama_kvshare`, for the cheapest possible real-cloud validation) is the
+natural next real-money step before trusting the SFT extension for the full d16 contest.
+
+## Lessons from the first real cloud run
+
+Everything below was found running this harness for real (not in local rehearsal) and is now
+fixed in the code/docs on this page — kept here as one place to check before the next real run,
+rather than scattered across commit messages.
+
+- **The GPU-hours/cost estimate was wrong by a factor of `num_gpus` (4x).** `scripts/model_info.py`
+  divided by `num_gpus` to compute wall-clock time, then labeled that number "GPU-hours" and fed it
+  straight into a per-GPU-hour price — undercounting real dollar cost by 4x. The estimate said
+  ~$2.50/25min for the d12 shakedown; the real run cost ~$10.60/100min. Fixed: `gpu_hours` is now
+  true GPU-resource-hours (independent of `num_gpus`), with a separate `wall_clock_hours` field for
+  the ETA display. See "Always dry-run first" above for the corrected numbers.
+- **wandb credentials didn't reach a non-interactively-launched training script**, even though the
+  RunPod Secret genuinely resolved into `/etc/rp_environment` — the interactive-shell guard in
+  `.bashrc` was the gap. Now sourced automatically by the scripts themselves; see "One-time setup"
+  above.
+- **FA3 silently discarded its own failure reason.** `except Exception: return None` with no
+  logging meant a real run falling back to SDPA looked identical whether the cause was fixable
+  (HF hub unreachable, a broken import) or not (genuinely unsupported hardware). Now captured into
+  `nanochat.flash_attention.FA3_LOAD_ERROR` and printed in the fallback warning; see "What to watch
+  for" above.
+- **GPT's "total params" column overstates its size relative to compute.** GPT's `value_embeds`
+  (a per-layer embedding lookup added into the attention value stream, alternating layers, ~150M
+  params at d12) is *not* a matmul — it costs `O(kv_dim)` per token regardless of table size, so
+  it's excluded from both `scripts/model_info.py`'s "scaling params" figure and FLOPs/token
+  (deliberately, matching the repo's existing Chinchilla-style accounting: embedding lookups aren't
+  "flops"). **"Scaling params," not "total params," is the fair axis for comparing architectures**
+  — at d12, gpt/llama both report ~110M scaling params despite gpt's total params being over 2x
+  llama's. It isn't free, though: dense gradient reduce + 2 fp32 AdamW moment buffers for that
+  table, amortized per step, plus a meaningfully larger on-disk checkpoint (fp32 weights scale with
+  *total* params, not scaling params).
+- **An accidental key exposure.** While debugging the wandb gap above, a `grep -i wandb
+  /etc/rp_environment` printed the real API key in plaintext into a conversation transcript instead
+  of just checking whether it was set. The user was asked to rotate the key immediately. The fix
+  going forward: check a secret's *presence/length* (`echo ${#VAR}`), never grep or print its
+  *value* — even when the whole point is confirming it resolved.

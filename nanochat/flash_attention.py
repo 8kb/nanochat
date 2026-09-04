@@ -21,9 +21,18 @@ import torch.nn.functional as F
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
 def _load_flash_attention_3():
-    """Try to load Flash Attention 3."""
+    """Try to load Flash Attention 3. Returns (module_or_None, reason_string).
+
+    The reason string is populated whenever module is None, so a caller printing a fallback
+    warning can say *why* instead of just "not available" -- this used to be silently discarded
+    (a bare `except Exception: return None`), which meant a real, possibly-fixable failure (HF
+    hub unreachable, `kernels` import broken, an auth error, ...) was indistinguishable from a
+    GPU that genuinely doesn't have a published kernel build. Found the hard way: a real
+    4x A100-SXM4-80GB run fell back to SDPA with zero indication of why, even though the code's
+    own compatibility comment (and the live HF hub state) say sm80 should work.
+    """
     if not torch.cuda.is_available():
-        return None
+        return None, "no CUDA device available"
     try:
         major, _ = torch.cuda.get_device_capability()
         # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
@@ -34,19 +43,19 @@ def _load_flash_attention_3():
         # The varunneal kernel obtains better results for H100/Hopper
         if major == 9:
             hf_kernel = "varunneal/flash-attention-3"
-            return get_kernel(hf_kernel).flash_attn_interface
+            return get_kernel(hf_kernel).flash_attn_interface, None
         else:
             hf_kernel = "kernels-community/flash-attn3"
             if has_kernel(hf_kernel):
-                return get_kernel(hf_kernel).flash_attn_interface
+                return get_kernel(hf_kernel).flash_attn_interface, None
             else:
-                return None
+                return None, f"kernels.has_kernel('{hf_kernel}') returned False for this GPU/torch/CUDA build"
 
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
-_fa3 = _load_flash_attention_3()
+_fa3, FA3_LOAD_ERROR = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
 # Override for testing: set to 'fa3', 'sdpa', or None (auto)

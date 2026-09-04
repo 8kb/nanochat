@@ -114,6 +114,19 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   happily load a checkpoint trained against a *different* tokenizer of the same size and produce
   silent garbage, which is exactly the failure mode a multi-machine architecture comparison
   (`runs/contest.sh`, see [docs/contest.md](docs/contest.md)) would otherwise hit undetected.
+- **`nanochat/default_tokenizer/` is a committed, portable default tokenizer** (532KB:
+  `tokenizer.pkl` + `token_bytes.pt`) -- content-derived, so a checked-in copy is exactly as valid
+  as a freshly-trained one. `runs/contest.sh`/`runs/contest_d12.sh` copy it into
+  `$NANOCHAT_BASE_DIR/tokenizer/` if that directory doesn't already have *both* files (checking
+  only `tokenizer.pkl` used to be enough to silently pass a partial copy that then crashed at
+  training start, since `token_bytes.pt` is also required), before ever falling back to
+  `scripts/tok_train.py`. Don't regenerate it casually -- it's the tokenizer every architecture
+  contest checkpoint is trained against.
+- **`chat_sft.py` checkpoints stamp `base_model_tag`/`base_model_step`** into their own meta.json,
+  recording exactly which base checkpoint they were fine-tuned from (in addition to `arch`, already
+  present via `model_config`). `chat_sft.py`'s auto-generated output tag is also arch-qualified
+  (`f"{arch}_d{depth}"` for non-gpt, matching `base_train.py`'s existing pattern) to avoid two
+  architectures' SFT runs at the same depth silently overwriting one directory.
 
 ## What runs on this Mac
 

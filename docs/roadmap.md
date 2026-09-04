@@ -94,50 +94,76 @@ real training script compute identical numbers — the inspector's output was ch
 the prerequisite for Stage 5's architecture contest: choosing matched configs was guesswork before
 this existed.
 
-## Stage 5 — architecture contest (harness done; the cloud runs themselves are not)
+## Stage 5 — architecture contest (harness verified on real cloud GPUs; d16 + persistent-volume pipeline still ahead)
 
 Train all three architectures (`gpt`, `llama`, `llama_kvshare`) on the same tokenizer and the same
-iso-FLOPs compute budget, so the comparison is real. The harness for this is done: `runs/contest.sh`
-(architecture-aware, unlike `runs/scaling_laws.sh`/`runs/miniseries.sh`, which grep GPT-only stdout
-keys) declares one row per architecture, previews every row's params/FLOPs/KV-cache/GPU-hours via
-`scripts/model_info.py` (Stage 4) before training anything (`DRY_RUN=1`, always run first), then
-trains, records dynamic results (val bpb, CORE, wall-clock) into a CSV keyed by architecture, and
-prints exactly what to `rsync` home. `scripts/model_info.py --checkpoints` (new this stage) closes
-the loop: it inspects an *already-trained* checkpoint from its own saved meta.json (no weights
-loaded), reporting the same params/FLOPs/KV block plus what training actually produced. Full
-runbook, RunPod pod spec, and cost table: [docs/contest.md](contest.md).
+iso-FLOPs compute budget, so the comparison is real — and now also SFT (chat) fine-tune and
+`chat_eval` each resulting base checkpoint, so the contest compares base *and* chat models.
+`runs/contest.sh` (architecture-aware, unlike `runs/scaling_laws.sh`/`runs/miniseries.sh`, which
+grep GPT-only stdout keys) declares one row per architecture, previews every row's
+params/FLOPs/KV-cache/GPU-hours via `scripts/model_info.py` (Stage 4) before training anything
+(`DRY_RUN=1`, always run first), trains, SFTs, chat-evals, records results into two CSVs
+(`results.csv` for base, `chat_results.csv` for chat) keyed by architecture, and prints exactly
+what to `rsync` home. `scripts/model_info.py --checkpoints` inspects an *already-trained*
+checkpoint from its own saved meta.json (no weights loaded), reporting the same params/FLOPs/KV
+block plus what training actually produced. Full runbook, RunPod pod spec, and cost table:
+[docs/contest.md](contest.md).
 
-Two real correctness traps this stage's plan-mode research and verification found, both fixed
-generically:
-- **Two checkpoints could share a vocab *size* but not a vocab.** Nothing enforced that a
-  cloud-trained checkpoint and this machine's local tokenizer are the *same* tokenizer, and the
-  failure mode is silent garbage output, not an error. Fixed with
-  `RustBPETokenizer.fingerprint()` (a content hash of the vocab), written into checkpoint meta by
-  `scripts/base_train.py` and checked (warn, not raise, so old checkpoints still load) by
-  `checkpoint_manager.build_model`.
-- **`base_eval.py`'s CORE-eval CSV was named only after the step number**, so evaluating all three
-  contest checkpoints in one `NANOCHAT_BASE_DIR` overwrote the same file three times.
-  `load_model_from_dir` now returns the resolved model tag in `meta["model_tag"]`, and
-  `base_eval.py`'s output filename includes it.
+Correctness traps found and fixed across this stage's plan-mode research *and* its first two real
+runs (the second, a real 4x A100 pod, found bugs plan-mode research couldn't have — see
+docs/contest.md's "Lessons from the first real cloud run" for the full list):
+- **Two checkpoints could share a vocab *size* but not a vocab.** Fixed with
+  `RustBPETokenizer.fingerprint()` (a content hash of the vocab), written into checkpoint meta and
+  checked (warn, not raise) by `checkpoint_manager.build_model`.
+- **`base_eval.py`'s CORE-eval CSV was named only after the step number**, overwriting one file
+  three times when evaluating all three contest checkpoints. Fixed via the resolved model tag now
+  stamped into `meta["model_tag"]`.
+- **The GPU-hours/cost estimate was wrong by a factor of `num_gpus` (4x)**, found running the d12
+  shakedown for real: a wall-clock-hours value got mislabeled "GPU-hours" and fed into a per-GPU
+  price. Fixed — `gpu_hours` is now true GPU-resource-hours.
+- **wandb credentials didn't reach a non-interactively-launched training script**, even though the
+  RunPod Secret genuinely resolved on the pod — an interactive-shell-only `.bashrc` guard was the
+  gap. Now sourced automatically by the scripts themselves.
+- **FA3 silently discarded its own failure reason**, making a fixable environment issue
+  indistinguishable from genuinely unsupported hardware. Now captured into
+  `nanochat.flash_attention.FA3_LOAD_ERROR` and printed in the fallback warning.
 
-The harness was verified entirely locally (no GPU rented): a `DRY_RUN=1` dry run reproduced the
-reference cost table below to the GPU-hour, and a full end-to-end CPU/MPS rehearsal
-(`NPROC_PER_NODE=1`, `EXTRA_TRAIN_ARGS` forcing a 3-step toy run) trained all three architectures,
-produced distinct checkpoints and a real results CSV, and `scripts/model_info.py --checkpoints`
-correctly read back each checkpoint's true trained shape and a `match` tokenizer fingerprint — see
-docs/contest.md's "Local rehearsal" section for the exact command and its one known caveat (the
-rehearsal's CSV *static* columns reflect each row's nominal depth, not the depth
-`EXTRA_TRAIN_ARGS` actually trained; the dynamic columns and `model_info --checkpoints` are both
-correct regardless). Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100):
+Verified in three stages, each on real infrastructure where it matters:
+1. **Locally, no GPU rented**: a `DRY_RUN=1` dry run reproduced a hand-computed reference cost
+   table to the GPU-hour, and a full end-to-end CPU/MPS rehearsal (`NPROC_PER_NODE=1`,
+   `EXTRA_TRAIN_ARGS` forcing a 3-step toy run) trained all three architectures, produced distinct
+   checkpoints and a real results CSV, and `scripts/model_info.py --checkpoints` correctly read
+   back each checkpoint's true trained shape and a `match` tokenizer fingerprint.
+2. **On a real 4x A100-SXM4-80GB pod** (`runs/contest_d12.sh`, d12/`TARGET_FLOPS=1e18`, ~$10.60):
+   all three architectures trained end to end with real val bpb/CORE scores (gpt won on quality,
+   0.1509 CORE, but was slowest at 33% MFU vs. llama/llama_kvshare's 57-58% — SDPA fallback
+   penalizes gpt's sliding-window pattern more). This run is what found the four real-infra bugs
+   above.
+3. **Locally again, for the SFT/chat extension**: after fixing those bugs and adding the
+   base→SFT→chat_eval chain, a second full CPU/MPS rehearsal proved arch-qualified chat checkpoint
+   tags don't collide and base→chat provenance (`base_model_tag`/`base_model_step`) is stamped
+   correctly, before spending any more real money on it.
+
+Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100, `--mfu 0.4` — corrected after
+the GPU-hours fix above; docs/contest.md also gives a more conservative `--mfu 0.33` estimate
+matching what was actually measured):
 
 | arch | scaling params | FLOPs/token | KV slots | GPU-hours |
 |---|---|---|---|---|
-| gpt | 234.9M | 1.585e9 | 16 | ~2.78 |
-| llama | 239.1M | 1.837e9 | 16 | ~2.78 |
-| llama_kvshare | 222.3M | 1.736e9 | 8 | ~2.78 |
+| gpt | 234.9M | 1.585e9 | 16 | ~11.13 |
+| llama | 239.1M | 1.837e9 | 16 | ~11.13 |
+| llama_kvshare | 222.3M | 1.736e9 | 8 | ~11.13 |
 
-**What's left, deliberately not done in this session**: actually renting a RunPod pod and running
-`runs/contest.sh` for real (real money) — a separate, explicitly-confirmed step.
+Total ≈33.4 GPU-hours ≈8.4h wall clock ≈$46-53 — a real, half-day run, not the ~$12-15 the
+pre-fix estimate said.
+
+**What's left**: the SFT/chat extension hasn't been verified on real cloud GPUs yet (only locally
+— see docs/contest.md's "Cloud shakedown" section); a persistent RunPod Network Volume pipeline
+(pre-staged data, checkpoints written straight to durable storage, no live rsync-while-billing) is
+planned but not built; and the real d16 contest itself is still ahead, gated on the smaller stages
+above per the user's own staged rollout — see docs/contest.md and this plan's approved staging for
+the exact sequence (single-architecture validation → FA3 resolution, possibly on H100/H200 → full
+d12 contest on the newer GPU class → re-cost and run d16).
 
 ## Stage 6 — attention variants
 
