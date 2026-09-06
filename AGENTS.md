@@ -1,9 +1,10 @@
 # AGENTS.md
 
 Repo map and non-obvious invariants for anyone (human or agent) working in this fork. Read
-[docs/architecture.md](docs/architecture.md) before touching `nanochat/model/`, and
-[docs/upstream-sync.md](docs/upstream-sync.md) before touching anything that used to live in
-`nanochat/gpt.py`.
+[docs/architecture.md](docs/architecture.md) before touching `modelcore/` or
+`nanochat/architectures/`, and [docs/upstream-sync.md](docs/upstream-sync.md) before touching
+anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section
+for where its code lives today).
 
 ## What this fork is
 
@@ -15,61 +16,98 @@ plan and current progress.
 ## Repo map
 
 ```
-nanochat/            the library
-├── model/              pluggable architectures — see docs/architecture.md
-├── gpt.py               backward-compat shim re-exporting nanochat.model.gpt symbols
-├── engine.py             inference: KVCache, Engine (KV-cached generate), generate_naive
-├── checkpoint_manager.py  save/load; reconstructs models via the nanochat.model registry
-├── optim.py               MuonAdamW (single combined optimizer, ZeRO-2 sharded)
+modelcore/            standalone model subsystem (zero nanochat imports) — see docs/architecture.md
+├── manager.py           ModelManager: the one entrypoint (create/load/save model+optimizer, stats, validate)
+├── model.py              Model: the one model class, built from a materialized config tree
+├── config/                ComponentSpec, ModelConfig, AttentionLayerSpec; validate_config()
+├── catalog.py             component registry: "#type" name -> (cls, needs, validate)
+├── components/             linear, norm, rope, rotary, attention, mlp, block, embedding, unembedding
+├── composers/              base, stack, backout
+├── roles.py               parameter-role protocol (optimizer grouping)
+├── stats.py                FLOPs/param/KV-bytes accounting, ModelStats
+├── store.py                ArtifactStore protocol + FileSystemStore
+├── runtime.py              Runtime: compute dtype + log sink (injected, not a global)
+├── optim/                  MuonAdamW (single combined optimizer, ZeRO-2 sharded)
+├── kernels/                 unified FA3/SDPA attention interface
+└── cache.py                 KVCache
+nanochat/             everything that knows nanochat's own conventions
+├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
+│                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
+├── engine.py             inference: Engine (KV-cached generate), generate_naive; KVCache re-exported
+├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; hands ModelManager a config
+├── optim.py, flash_attention.py   one-line re-export shims onto modelcore.optim/modelcore.kernels
 ├── tokenizer.py            BPE tokenizer wrapper
 ├── dataloader.py / dataset.py   pretraining data
 ├── core_eval.py / loss_eval.py   base-model evaluation (CORE benchmark, bits-per-byte)
 ├── execution.py            sandboxed Python execution (tool use)
-├── flash_attention.py       unified FA3/SDPA attention interface
+├── scaling.py               muP training-plan math (architecture-agnostic)
 └── fp8.py                    FP8 training (CUDA/Hopper only)
 scripts/              entry points, run as `python -m scripts.<name>`
 tasks/                task/dataset definitions for eval (arc, mmlu, gsm8k, humaneval, smoltalk)
 tests/                pytest suite — see "What runs on this Mac" below
 runs/                 shell scripts wiring scripts/ together (speedrun.sh, runcpu.sh, ...)
 docs/                 this fork's documentation; docs/upstream/ holds the original nanochat docs
-dev/                  images, notebooks, dev/repackage_data_reference.py
+dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py
 ```
 
 ## Invariants that will bite you
 
-- **`__init__` may run under `torch.device("meta")`.** `GPT.__init__` (and any architecture's)
-  must not compute anything that depends on real tensor *values* — only shapes/dtypes. Real
-  initialization goes in `init_weights()`, called after `model.to_empty(device=...)`. See
+- **`__init__` may run under `torch.device("meta")`.** `Model.__init__` (and any component's) must
+  not compute anything that depends on real tensor *values* — only shapes/dtypes. Real
+  initialization goes in `init_weights()`, called after `model.to_empty(device=...)`.
+  `ModelManager.create_model`/`load_model` own this dance; nothing else should repeat it. See
   "The meta-device footgun" in [docs/architecture.md](docs/architecture.md).
-- **No `torch.amp.autocast`.** Precision is one global, `COMPUTE_DTYPE`
-  (`nanochat/common.py`, override via `NANOCHAT_DTYPE` env var). Model weights stay fp32; the
-  custom `nanochat.model.components.linear.Linear` casts to `COMPUTE_DTYPE` in `forward()`. Route
-  every matmul-participating parameter through it.
+- **No `torch.amp.autocast`.** Precision is `modelcore.runtime.Runtime.compute_dtype`, injected
+  into any component declaring `needs=("runtime",)` — not a bare global read off an attribute.
+  `nanochat.common.COMPUTE_DTYPE` (override via `NANOCHAT_DTYPE` env var) re-exports the default
+  runtime's value for existing readers. Model weights stay fp32; `modelcore.components.linear.Linear`
+  casts to `COMPUTE_DTYPE` in `forward()`. Route every matmul-participating parameter through it.
 - **`Linear` is the structural marker for "matmul params".**
-  `nanochat.model.flops.num_matmul_params` finds every FLOPs-relevant parameter by scanning for
+  `modelcore.stats.num_matmul_params` finds every FLOPs-relevant parameter by scanning for
   `isinstance(m, Linear)`. A new matmul that uses a raw `nn.Linear` or bare `nn.Parameter`
-  silently disappears from `estimate_flops`, `estimate_decode_flops`, `estimate_prefill_flops`,
-  and every FLOPs/s or MFU number derived from them.
-- **Every parameter needs a declared role.** `nanochat.model.param_roles.collect_param_roles`
-  walks the module tree and raises on any parameter it can't assign a role to (a `Linear.weight`
-  defaults to `"matrix"`; anything else needs a `PARAM_ROLES` class attribute or a `param_roles()`
-  override). `setup_optimizer()`/`num_scaling_params()` are built on this, so a new `nn.Parameter`
-  or submodule that forgets to declare a role raises at construction — far better than it silently
-  defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping). See
-  [docs/architecture.md](docs/architecture.md#parameter-roles).
+  silently disappears from `ModelStats.flops_per_token`/`decode_flops`/`prefill_flops` and every
+  FLOPs/s or MFU number derived from them.
+- **Every parameter needs a declared role.** `modelcore.roles.collect_param_roles` walks the
+  module tree and raises on any parameter it can't assign a role to (a `Linear.weight` defaults to
+  `"matrix"`; anything else needs a `PARAM_ROLES` class attribute or a `param_roles()` override).
+  `ModelManager.create_optimizer`/`ModelStats.params_by_role` are built on this, so a new
+  `nn.Parameter` or submodule that forgets to declare a role raises at construction — far better
+  than it silently defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping).
+  See [docs/architecture.md](docs/architecture.md#component-contracts).
+- **A config tree carries only concrete, already-decided values, never a derivation rule.**
+  `has_value_embed` is a plain bool per block, `window` a concrete int, `kv_slot`/`produces_kv`
+  concrete per-block values — never a pattern string or a fraction a component would need to
+  interpret. Every rule that produces these values (`has_value_embed`'s alternating-parity policy,
+  `compute_window_sizes`, `compute_kv_slots`, the muP depth dial) lives in
+  `nanochat/architectures/derive.py`, run once at tree-expansion time, outside `modelcore` entirely.
+  A component asking "which layer am I" or "how many layers are there" to re-derive a policy is
+  exactly the abstraction leak this fork's Stage 7 redesign eliminated — don't reintroduce it.
 - **`runs/scaling_laws.sh` and `runs/miniseries.sh` grep exact stdout text** out of
-  `scripts/base_train.py`: `runs/scaling_laws.sh` greps six `^key ` lines from the
-  `num_scaling_params()` dump (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`,
-  `scalars`, `total` — all load-bearing key names, even though the underlying role names are more
-  granular); `runs/miniseries.sh` greps a single `"Number of parameters: N (scaling: M)"` line.
-  Both also grep `"Calculated number of iterations"`, `"Total batch size"`, `"Validation bpb:"`,
-  `"CORE metric:"`. Changing those print statements' format breaks those scripts silently.
+  `scripts/base_train.py`: `runs/scaling_laws.sh` greps six `^key ` lines
+  (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`, `scalars`, `total`) from
+  `_legacy_scaling_keys(model_stats.params_by_role)`'s dump — a presentation-layer helper mapping
+  `modelcore`'s generic role names to these load-bearing legacy key names, used for every
+  architecture uniformly now (previously GPT's own frozen dict); `runs/miniseries.sh` greps a
+  single `"Number of parameters: N (scaling: M)"` line. Both also grep `"Calculated number of
+  iterations"`, `"Total batch size"`, `"Validation bpb:"`, `"CORE metric:"`. Changing those print
+  statements' format breaks those scripts silently.
 - **Rotary `cos`/`sin` buffers are `persistent=False`** (not saved in checkpoints) — this is why
-  `checkpoint_manager.build_model` calls `model.init_weights()` even when *loading* a checkpoint,
-  right before `load_state_dict(..., assign=True)` overwrites everything else.
-- **Checkpoint `model_config` carries an `"arch"` key** (from `BaseModelConfig.to_dict()`), read
-  by `nanochat.model.registry.config_from_dict` to pick the right config/model class. Missing
-  `"arch"` (checkpoints saved before Stage 1) defaults to `"gpt"`.
+  `ModelManager.load_model` calls `model.init_weights()` even when *loading* a checkpoint, right
+  before `load_state_dict(..., assign=True)` overwrites everything else.
+- **A checkpoint's `model_config` has no `"arch"` key any more** — `ModelConfig.to_dict()` stamps
+  `"format": "modelcore.v1"` instead, plus an optional `reference: {"preset": name, "kwargs": {...}}`
+  block for provenance. `nanochat.checkpoint_manager.arch_of(model_config_dict)` is the
+  naming-policy helper that reads either shape: `reference.preset` (defaulting to `"custom"`) for
+  a current-format config, or the legacy `"arch"` key (defaulting to `"gpt"`, for checkpoints
+  saved before that key existed) for anything predating modelcore. Nothing should read
+  `model.config.arch` directly — that attribute doesn't exist on `modelcore.ModelConfig` at all.
+- **A checkpoint predating modelcore always routes through `nanochat.architectures.legacy` first.**
+  `checkpoint_manager.build_model` calls `legacy.migrate_checkpoint` unconditionally — a no-op
+  (straight to `ModelConfig.from_dict`) for an already-current `"format"` dict, full
+  reconstruction-from-stored-fields otherwise. See
+  [docs/architecture.md](docs/architecture.md#old-checkpoints) for exactly what each generation
+  needs (pre-Stage-2 flat state-dict layout, the `body.` key prefix, the resid/x0 optimizer split,
+  and — gpt-arch only — `backout_lambda`'s role-rename optimizer fix).
 - **Checkpoint tag naming is architecture-aware; auto-discovery isn't, by default.**
   `scripts/base_train.py`'s default save tag is `d<depth>` for `gpt` (unchanged) and
   `<arch>_d<depth>` otherwise — two architectures at the same `--depth` would otherwise write into
@@ -82,28 +120,24 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
 - **Optimizer state is checkpointed and reloaded positionally.** `torch.optim.Optimizer.state_dict()`
   flattens every parameter across every group into one global index order; a parameter that
   splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state
-  silently (no shape-mismatch error) rather than loudly. `setup_optimizer()`'s policy dict order
-  is therefore part of the on-disk format, not just a style choice — see
-  [docs/architecture.md](docs/architecture.md#parameter-roles). A change that does reorder or
-  resplit needs a `patch_optimizer_state_dict` migration (see
-  `nanochat/model/gpt/migrations.py`'s Stage 2 resid/x0-lambda split for the pattern) or old
-  optimizer shards fail to load — `scripts/base_train.py`'s `--resume-from-step` and
-  `scripts/chat_sft.py`'s `--load-optimizer` are the two call sites that route through it.
-- **`kv_cache.advance()` belongs to `Model.forward`, not the last attention layer.** It used to
-  fire inside `CausalSelfAttention.forward` on `self.layer_idx == kv_cache.n_layers - 1` -- broken
-  the moment a model has fewer KV slots than layers (cross-layer KV sharing), since no layer's
-  index then equals the slot count. Every `BaseModel.forward` now calls
-  `kv_cache.advance(idx.size(1))` itself, once, after its whole block loop runs (see
-  `GPT.forward`/`Llama.forward`/`LlamaKVShare.forward`).
+  silently (no shape-mismatch error) rather than loudly. `ModelManager.create_optimizer`'s policy
+  dict order is therefore part of the on-disk format, not just a style choice — see
+  [docs/architecture.md](docs/architecture.md#component-contracts). A change that does reorder or
+  resplit needs a migration in `nanochat/architectures/legacy.py` (see `_patch_resid_x0_split`/
+  `_split_backout_lambda_from_smear` for the pattern) or old optimizer shards fail to load —
+  `scripts/base_train.py`'s `--resume-from-step` and `scripts/chat_sft.py`'s `--load-optimizer`
+  are the two call sites that route through `migrate_optimizer_state`.
+- **`kv_cache.advance()` belongs to `Model.forward`, not the last attention layer.** It fires once,
+  after the whole block/composer loop runs — broken the moment a model has fewer KV slots than
+  layers (cross-layer KV sharing), since no layer's index then equals the slot count.
 - **`AttentionLayerSpec.kv_slot` decouples layer index from KV-cache slot.**
-  `BaseModel.kv_cache_spec()["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
-  at an earlier layer's slot (cross-layer KV sharing, `nanochat.model.llama_kvshare`) shares that
-  `nanochat.engine.KVCache` allocation instead of getting its own. `KVCache`'s constructor kwarg
-  and attribute are `num_kv_slots`/`n_slots` (not `num_layers`/`n_layers`), and
-  `get_layer_cache(layer_idx)` is now `get_slot_cache(slot)` -- see "Cross-layer KV sharing" in
-  [docs/architecture.md](docs/architecture.md) for the full mechanism, including a real FA3-vs-SDPA
-  divergence in what `k=None` means to `flash_attn_with_kvcache` that a naive sharing
-  implementation would hit.
+  `ModelStats.kv_cache_spec["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
+  at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`
+  allocation instead of getting its own. `KVCache`'s constructor kwarg and attribute are
+  `num_kv_slots`/`n_slots`, and `get_slot_cache(slot)` returns that slot's view — see
+  "Cross-layer KV sharing" in [docs/architecture.md](docs/architecture.md) for the full mechanism,
+  including a real FA3-vs-SDPA divergence in what `k=None` means to `flash_attn_with_kvcache` that
+  a naive sharing implementation would hit.
 - **Checkpoint meta carries `tokenizer_fingerprint` and `core_metric`.**
   `RustBPETokenizer.fingerprint()` (`nanochat/tokenizer.py`) is a content hash of the vocab, not
   the pickle file -- it identifies *what a token id means*. `scripts/base_train.py` writes it (plus
@@ -123,37 +157,30 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   `scripts/tok_train.py`. Don't regenerate it casually -- it's the tokenizer every architecture
   contest checkpoint is trained against.
 - **`chat_sft.py` checkpoints stamp `base_model_tag`/`base_model_step`** into their own meta.json,
-  recording exactly which base checkpoint they were fine-tuned from (in addition to `arch`, already
-  present via `model_config`). `chat_sft.py`'s auto-generated output tag is also arch-qualified
-  (`f"{arch}_d{depth}"` for non-gpt, matching `base_train.py`'s existing pattern) to avoid two
-  architectures' SFT runs at the same depth silently overwriting one directory.
-- **An architecture that only changes config defaults should subclass the model it's based on, not
-  re-register it under a new name.** `nanochat.model.llama_kvshare_win.LlamaKVShareWin(LlamaKVShare):
-  pass` is the pattern — the config subclass carries the real change (`LlamaKVShareWinConfig`
-  overrides `window_pattern`'s default), the model class exists only so `get_model_class(...)`,
-  tracebacks, and checkpoint `repr`s name the right architecture. If the changed default is also a
-  `from_depth(...)` kwarg (e.g. `window_pattern`), `from_depth` itself must be overridden too, not
-  just the dataclass field — the parent classmethod's own signature default (`LlamaConfig.from_depth`
-  hardcodes `window_pattern="L"`) otherwise silently wins over the subclass's field default on any
-  `--depth`-driven run.
-- **`nanochat/model/composed/` (`--arch composed`) is a materialized-config-tree alternative to a
-  hardcoded architecture class, additive alongside gpt/llama/llama_kvshare(_win) — see
-  [docs/architecture.md](docs/architecture.md#composed-architectures).** A composed model's
-  state-dict paths live under `body.` (e.g. `body.blocks.0.attn.c_q.weight`, not
-  `blocks.0.attn.c_q.weight` — the composer is a real submodule wrapping what a native
-  architecture keeps at the top level); `docs/architecture.md`'s "Composed architectures" section
-  has the exact remap `tests/test_model_composed.py` uses to prove a composed preset matches its
-  native architecture bit-for-bit. `ComposedModel.setup_optimizer`'s policy dict order (like every
-  `setup_optimizer`) is part of the on-disk optimizer format, but *which* roles a given tree
-  actually produces varies with tree content — a composed checkpoint's optimizer shard is only
-  guaranteed to reload against the same config it was saved with, not across an edited tree.
-  `ComposedConfig.n_layer` is a derived property (total block count, however the composer arranges
-  them), not a stored field — `--arch-opt n_layer=...` correctly rejects it.
+  recording exactly which base checkpoint they were fine-tuned from. `chat_sft.py`'s
+  auto-generated output tag is also arch-qualified (`f"{arch}_d{depth}"` for non-gpt, via
+  `arch_of(meta["model_config"])`) to avoid two architectures' SFT runs at the same depth silently
+  overwriting one directory.
+- **A new architecture is a preset, not a class.** Adding one means: a `nanochat/architectures/derive.py`
+  helper for any new derivation rule it needs, an `expand_<name>` function in
+  `nanochat/architectures/presets.py` (reusing `assemble_gpt`/`assemble_plain` if its tree shape
+  already fits one of them), and an entry in `PRESETS`. There is no model *class* to register and
+  no registry to add it to — `modelcore` builds every tree through the same `Model` class,
+  regardless of which preset produced it. See
+  [docs/architecture.md](docs/architecture.md#nanochatarchitectures-presets-and-legacy-migration).
+- **`tests/goldens/*.json` is the regression net for anything touching `modelcore`,
+  `nanochat/architectures/`, `nanochat/checkpoint_manager.py`, or `nanochat/engine.py`.** Captured
+  once (`dev/capture_model_goldens.py`, now effectively frozen — it depends on code this refactor
+  deleted) before Stage 7's redesign, from every real checkpoint on this machine plus a seeded
+  synthetic model of every architecture/preset. `tests/test_goldens.py` replays it;
+  `tests/test_modelcore.py`/`tests/test_architectures.py` cross-check the same numbers through the
+  new API directly. Run all three after any change to those areas — see
+  [docs/architecture.md](docs/architecture.md#verifying-a-change-is-behavior-preserving).
 
 ## What runs on this Mac
 
 Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to `float32` here
-(see `nanochat/common.py`'s `_detect_compute_dtype`). Set up with:
+(see `modelcore/runtime.py`'s `detect_compute_dtype`). Set up with:
 
 ```bash
 uv sync --extra cpu --group dev && source .venv/bin/activate
@@ -168,7 +195,7 @@ SDPA fallback classes in that file run fine on CPU). `scripts/base_train.py` /
 
 Untested on this machine as a result: the `bfloat16` compute path, the real FA3 kernel path
 (vs. the SDPA fallback it's checked against), FP8 training (`nanochat/fp8.py`), and multi-GPU/DDP
-gradient reduction in `nanochat/optim.py`. Keep changes to those paths conservative and prefer
+gradient reduction in `modelcore/optim/`. Keep changes to those paths conservative and prefer
 reasoning from the code plus the existing (CUDA-gated) tests over "I ran it and it worked."
 
 **Do not attempt large multi-hour training runs in this environment** (no GPU, thermal/power
@@ -179,5 +206,5 @@ plumbing, not to produce a usable model.
 ## Style
 
 Match the surrounding code: minimal comments explaining *why*, not *what*; no giant config
-objects or factory indirection beyond what `nanochat/model/`'s registry already adds; prefer
-extending an existing module over adding a new abstraction layer.
+objects or factory indirection beyond what `modelcore/catalog.py`'s registry already adds; prefer
+extending an existing component/composer over adding a new abstraction layer.

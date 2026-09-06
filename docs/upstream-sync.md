@@ -197,12 +197,58 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
     `contest.sh`'s (d16) rows gained `llama_kvshare_win` as a fourth entrant alongside the existing
     three.
 
+## Stage 7: `nanochat/model/` deleted; code moved into `modelcore/` + `nanochat/architectures/`
+
+Stages 1-6 moved upstream's `nanochat/gpt.py` into `nanochat/model/`, growing it into a registry
+of four hand-written architecture classes plus (Stage 6) an additive materialized-tree system.
+Stage 7 deletes `nanochat/model/` entirely and replaces it with two things: `modelcore/`, a
+standalone package (zero `nanochat` imports) that knows only the materialized tree and nothing
+about architecture *names*, and `nanochat/architectures/`, which turns a `--depth` dial or an old
+checkpoint into a tree for `modelcore` to build. See [architecture.md](architecture.md) for the
+full contract; this section is only about where Stage-1-6 code specifically ended up, for tracing
+an upstream diff through it.
+
+| Where it was (Stage 1-6) | Now lives in |
+|---|---|
+| `nanochat/model/base.py` (`BaseModel`, `BaseModelConfig`, `AttentionLayerSpec`, three module contracts) | Split: `AttentionLayerSpec`/`ModelConfig` → `modelcore/config/spec.py`; the module contracts → `modelcore/components/contracts.py` (and `modelcore/composers/base.py` for `BaseComposer`); `BaseModel`'s free accounting methods → `modelcore/stats.py` functions, called by `ModelManager`, not a model method |
+| `nanochat/model/registry.py` (`register_model`, `get_model_class`, `config_from_dict`) | Gone. One format needs no registry; `modelcore/catalog.py`'s `register_component` is its structural descendant (components self-register the same way architectures used to) |
+| `nanochat/model/param_roles.py` | `modelcore/roles.py`, otherwise unchanged |
+| `nanochat/model/flops.py` | `modelcore/stats.py`, otherwise unchanged |
+| `nanochat/model/components/*.py` | `modelcore/components/*.py`. `attention.py`'s `has_ve()` and `windows.py`/`kv_sharing.py` did **not** move here — see next row |
+| `has_ve()`, `nanochat/model/components/windows.py`, `.../kv_sharing.py` | `nanochat/architectures/derive.py` (`has_value_embed`, `compute_window_sizes`, `compute_kv_slots`) — these are depth-dial *derivation* rules, never consumed by a component at runtime, so they live outside modelcore entirely now |
+| `nanochat/model/gpt/`, `llama/`, `llama_kvshare/`, `llama_kvshare_win/` (four hand-written classes + flat configs) | Deleted. Their derivation logic lives in `nanochat/architectures/presets.py` (`expand_gpt`/`expand_llama`/`expand_llama_kvshare`/`expand_llama_kvshare_win`, and the shared `assemble_gpt`/`assemble_plain` helpers); an old checkpoint in one of these formats is reconstructed by `nanochat/architectures/legacy.py` instead of being interpreted directly |
+| `nanochat/model/gpt/migrations.py` | `nanochat/architectures/legacy.py`, which now also covers the **new** "flat config → materialized tree" step these migrations never had to do (the native classes used to do that implicitly just by existing) |
+| `nanochat/model/composed/` (Stage 6) | Generalized into all of `modelcore/`: `spec.py`/`registry.py` → `modelcore/config/spec.py`/`modelcore/catalog.py`; `model.py` (`ComposedModel`) → `modelcore/model.py` (`Model`, the only model class now); `composers.py` → `modelcore/composers/`; `presets.py` → `nanochat/architectures/presets.py` (renamed `expand_preset`/`resolve_composed_config`/`resolve_composed_reference_config` → `expand`/`resolve_model_config`/`resolve_reference_config`, since there's no other kind of preset to distinguish from anymore) |
+| `nanochat/optim.py`, `nanochat/flash_attention.py` | Moved into `modelcore/optim/`, `modelcore/kernels/` (zero nanochat dependency once there); `nanochat/optim.py`/`nanochat/flash_attention.py` are now one-line re-export shims, kept for exactly the reason `nanochat/gpt.py` used to be |
+| `nanochat/engine.py`'s `KVCache` | `modelcore/cache.py`, otherwise unchanged; imported back into `nanochat/engine.py` for existing `from nanochat.engine import KVCache` call sites |
+| `nanochat/gpt.py` (the upstream-compat shim) | **Deleted.** `GPT`/`GPTConfig`/`Linear`/`norm`/`apply_rotary_emb`/`has_ve`/`CausalSelfAttention`/`MLP`/`Block` no longer exist under those names or that import path anywhere in the repo. This is the third intentional upstream deviation (alongside the two in the table at the top of this doc): an upstream diff that still does `from nanochat.gpt import GPT` no longer has anywhere to land. There is no compatibility shim for this one — the whole point of Stage 7 was that these classes stop existing, not just move. |
+
+`nanochat/checkpoint_manager.py` no longer imports anything from a model registry at all (there
+isn't one) — `build_model` calls `nanochat.architectures.legacy.migrate_checkpoint` on the raw
+`meta["model_config"]` dict, then `modelcore.ModelManager.create_model`. A model_config dict with
+no `"format"` key (i.e. anything saved before this stage) always goes through `legacy.py`; one
+with `"format": "modelcore.v1"` is already current and passes straight through
+`ModelConfig.from_dict`. On-disk checkpoint files/paths are unchanged by any of this.
+
+`nanochat/engine.py`'s `Engine` now holds a `modelcore.ModelManager` and calls
+`manager.new_kv_cache(model, ...)` instead of splatting `model.kv_cache_spec()` — that method
+doesn't exist on `modelcore.Model` (removed from the model object's own surface; see
+`ModelStats`/`ModelManager` in [architecture.md](architecture.md)).
+
+`scripts/base_train.py`/`scripts/model_info.py`'s `--arch` flag is now a **preset name**, not a
+registry key — same CLI surface (`--arch gpt`, `--arch-opt kv_share_frac=0.5`,
+`--model-config <preset|file>`), but there's no class being looked up, just
+`nanochat.architectures.presets.expand`/`resolve_model_config`. `--model-config` now overrides
+`--arch` uniformly for every preset (Stage 6's special-cased `--arch composed` value doesn't exist
+any more — there's only one way to build a model).
+
 ## Merge procedure for a new upstream commit
 
 1. `git fetch upstream && git log HEAD..upstream/master -- nanochat/gpt.py` to see what changed.
-2. For a change inside one of the functions/classes in the table above: find the new home via
-   the table, apply the diff there by hand (the code is verbatim, so upstream's diff context
-   should still line up almost exactly).
+2. For a change inside one of the functions/classes in the first table above: find the new home
+   via *both* tables in order (Stage 1-6's, then Stage 7's — a symbol may have moved twice), apply
+   the diff there by hand (the code is verbatim through Stage 1-6, so upstream's diff context
+   should still line up almost exactly; Stage 7 renamed several things, listed in its own table).
 3. For a change to `nanochat/checkpoint_manager.py`, `nanochat/engine.py`, or the training
    scripts: check "Other call sites that changed" above first — the surrounding code moved, so a
    textual patch may not apply, but the same edit intent almost always still makes sense.

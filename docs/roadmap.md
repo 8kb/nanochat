@@ -222,39 +222,80 @@ the intended workflow is dump → hand-edit → `--arch composed --model-config 
 deliberately additive: the four native architectures, their checkpoints, and their optimizer state
 are untouched — no migration, no format change, no shared code behavior change for them (verified:
 `BaseModel.shape_summary()`'s default reproduces `scripts/model_info.py`'s old inline shape block
-byte-for-byte, and `Block`'s two new optional kwargs default to exactly today's behavior). Stages 7
-and 8 below should build as new block/composer types under this system where that fits, rather than
-new bespoke model classes — see [architecture.md](architecture.md)'s "Composed architectures".
+byte-for-byte, and `Block`'s two new optional kwargs default to exactly today's behavior).
+Stage 7 below generalizes this additive tree into the *only* format the model subsystem knows;
+Stages 8 and 9 build as new component/composer types under that system, rather than new bespoke
+model classes — see [architecture.md](architecture.md).
 
-## Stage 7 — attention variants
+## Stage 7 — extract `modelcore/`: one entrypoint, one config format (done)
+
+Total redesign of the model subsystem's boundary. Stage 6 made the materialized config tree
+*additive*, alongside four hand-written architecture classes; Stage 7 makes it the *only* format,
+splitting the subsystem in two:
+
+- **`modelcore/`** — a new, standalone package (zero `nanochat` imports) holding everything that
+  only ever needs to know about the materialized tree: components, composers, the catalog,
+  parameter roles, FLOPs/param accounting, the optimizer, the KV cache, the flash-attention
+  kernel interface. `modelcore.ModelManager` is its one public entrypoint — create/load/save a
+  model or its optimizer, validate a config (returning every error found, not just the first),
+  and compute a config's stats, all without the caller ever touching a model class, a registry, or
+  the meta-device dance directly. `Model` itself carries no accounting or optimizer methods
+  (`layer_specs`, `kv_cache_spec`, `estimate_flops`, `setup_optimizer` are all gone from its
+  surface) — those need a model only to read shapes/roles, which `ModelManager` does from outside.
+- **`nanochat/architectures/`** — everything that knows an architecture *by name*: `presets.py`
+  turns a `--depth` dial into a tree (what the four deleted classes' own `from_depth` + `__init__`
+  used to do), `legacy.py` migrates an old checkpoint (any generation, including the four native
+  formats and Stage 6's `"composed"`) into current shape, `derive.py` holds the actual derivation
+  rules (`has_value_embed`'s parity policy, window-pattern tiling, KV-slot sharing, the muP depth
+  dial) exactly once each — previously duplicated up to three times, or embedded inside a
+  component as a leak (`has_ve(layer_idx, n_layer)` no longer exists anywhere near a component;
+  a config tree only ever carries the already-decided output of that rule).
+
+`GPT`/`Llama`/`LlamaKVShare`/`LlamaKVShareWin` and `nanochat/model/` (2300 LOC) are deleted
+entirely, along with `nanochat/gpt.py` (the upstream-compat shim — recorded as the third
+intentional upstream deviation in [upstream-sync.md](upstream-sync.md)). `nanochat.checkpoint_manager`/
+`nanochat.engine` and every training/eval script were rewired onto the new API; the on-disk
+checkpoint format is unchanged (an old checkpoint just migrates through `legacy.py` on load now,
+same as it always migrated through `GPT.patch_state_dict` before). See
+[architecture.md](architecture.md) for the full new contract.
+
+Verified via `tests/goldens/*.json` — state-dict fingerprints, every accounting number,
+greedy-generation token ids, forward-logits hashes, and optimizer layout/state, captured from
+every real checkpoint on the dev machine (including a genuinely pre-Stage-2 one, `d6`) plus a
+seeded synthetic model of every architecture/preset, **before** any code changed — replayed
+against the finished refactor by `tests/test_goldens.py`, with exactly one documented,
+minimal presentation-layer exception (a native gpt checkpoint's `num_scaling_params` key names and
+optimizer group count, both retired along with the `GPT` class itself). `tests/test_modelcore.py`
+and `tests/test_architectures.py` cross-check the same numbers directly through the new API.
+
+## Stage 8 — attention variants
 
 Per-layer attention and position-encoding selection in the config (mixing local/global, or
 different attention types per layer). Position encoding becomes its own swappable component
-(RoPE / NoPE / ALiBi) — Stage 2 already extracted `RotaryEmbedding` as an injected module rather
-than wiring it straight into `CausalSelfAttention`, so this is mostly about adding alternatives
-and a way to pick one, not further extraction. Add MLA (DeepSeek-style latent attention) and
-differential attention as reference implementations. Stage 4 already generalized
-`nanochat.engine.KVCache` from a strict one-slot-per-layer allocation to a slot-indexed one and
-moved `advance()` out of the attention layer; MLA's compressed latent cache will likely still need
-KVCache generalized further (a per-layer state object the layer itself allocates and manages,
-rather than a fixed `(n_slots, B, T, H, D)` k/v tensor pair).
+(RoPE / NoPE / ALiBi) — already an injected module (`RotaryEmbedding`) rather than wired straight
+into `CausalSelfAttention`, so this is mostly about adding alternatives and a way to pick one, not
+further extraction. Add MLA (DeepSeek-style latent attention) and differential attention as
+reference implementations. `KVCache` already generalized from a strict one-slot-per-layer
+allocation to a slot-indexed one (Stage 4) with `advance()` owned by `Model.forward` (Stage 7);
+MLA's compressed latent cache will likely still need it generalized further (a per-layer state
+object the layer itself allocates and manages, rather than a fixed `(n_slots, B, T, H, D)` k/v
+tensor pair).
 
-## Stage 8 — depth and residual topology
+## Stage 9 — depth and residual topology
 
-`GPT._forward_trunk` (Stage 1, refined in Stage 2 to own `x0` and the block loop; Stage 6 pulled
-this apart into named, swappable composers) is the seed for this: weight tying across layers,
-looped/universal transformers, layer skipping, multi-token-prediction (MTP) heads — new composers
-under Stage 6's system. Muon's shape-bucketed param grouping (now
-`nanochat/model/param_roles.py:build_param_groups`, driven by `GPT.setup_optimizer`'s policy
-table) needs generalizing for an architecture with tied or ragged-shaped matrix params — Stage 2's
-role protocol makes this more tractable than before (a tied parameter is already a solved case at
-the role-collection level, just not yet exercised by any real architecture), but the shape-based
-Muon stacking itself still assumes independent, per-layer-shaped matrices.
+Weight tying across layers, looped/universal transformers, layer skipping, multi-token-prediction
+(MTP) heads — new composers under `modelcore/composers/` (`BackoutComposer`/`StackComposer` are
+the seed: Stage 7 made every composer a real, swappable component). Muon's shape-bucketed param
+grouping (`modelcore/roles.py:build_param_groups`, driven by `ModelManager.create_optimizer`'s
+policy table) needs generalizing for an architecture with tied or ragged-shaped matrix params —
+the role protocol makes this more tractable than before (a tied parameter is already a solved case
+at the role-collection level, just not yet exercised by any real architecture), but the
+shape-based Muon stacking itself still assumes independent, per-layer-shaped matrices.
 
-## Stage 9 — experiment ergonomics
+## Stage 10 — experiment ergonomics
 
-Config files as an alternative to pure argparse CLI flags — Stage 6's `--model-config` is this for
-model architecture specifically; this stage is the rest of a run's configuration (data, optimizer,
+Config files as an alternative to pure argparse CLI flags — `--model-config` is this for model
+architecture specifically; this stage is the rest of a run's configuration (data, optimizer,
 eval). A `docs/experiments/` log in the spirit of `docs/upstream/LOG.md`, but for architecture
 ablations specifically — Stage 5's contest is this stage's first real entry.
 
