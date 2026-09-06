@@ -30,6 +30,16 @@ class BaseModelConfig:
         d["arch"] = type(self).arch
         return d
 
+    @classmethod
+    def from_dict(cls, d: dict):
+        """Inverse of to_dict() for this class (arch already resolved by the caller -- see
+        nanochat.model.registry.config_from_dict): default is a flat kwargs splat, correct for
+        every flat-dataclass config. nanochat.model.composed.spec.ComposedConfig overrides this
+        for its nested tree shape, since asdict()/`cls(**d)` can't round-trip a component spec."""
+        d = dict(d)
+        d.pop("arch", None)
+        return cls(**d)
+
 
 @dataclass
 class AttentionLayerSpec:
@@ -68,7 +78,7 @@ class BaseBlock(nn.Module):
     def init_weights(self):
         raise NotImplementedError
 
-    def forward(self, x, x0, idx, kv_cache):
+    def forward(self, x, x0, idx, kv_cache, kv_bus=None):
         raise NotImplementedError
 
     def layer_spec(self):
@@ -161,6 +171,20 @@ class BaseModel(nn.Module):
 
     def get_device(self):
         return next(self.parameters()).device
+
+    def shape_summary(self) -> dict:
+        """Flat n_layer/n_embd/n_head/n_kv_head/sequence_len/window_pattern block for
+        scripts/model_info.py's report (and, via that dict, runs/contest.sh -- see AGENTS.md):
+        the shape every hand-written architecture (gpt, llama, llama_kvshare,
+        llama_kvshare_win) shares today, read directly off the flat config. A model whose blocks
+        can vary per layer overrides this -- see
+        nanochat.model.composed.model.ComposedModel.shape_summary."""
+        c = self.config
+        return {
+            "n_layer": c.n_layer, "n_embd": c.n_embd, "n_head": c.n_head,
+            "n_kv_head": c.n_kv_head, "sequence_len": c.sequence_len,
+            "window_pattern": c.window_pattern,
+        }
 
     def kv_cache_spec(self) -> dict:
         """What nanochat.engine.KVCache needs to allocate: num_kv_slots, num_heads, head_dim.

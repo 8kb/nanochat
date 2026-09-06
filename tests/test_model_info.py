@@ -21,6 +21,7 @@ from scripts import model_info
 def _args(**overrides):
     defaults = dict(
         aspect_ratio=64, head_dim=16, max_seq_len=32, window_pattern=None, arch_opt=None,
+        model_config=None, d_ref_scaling_params=None,
         target_param_data_ratio=12, target_flops=-1.0, num_iterations=-1, total_batch_size=-1,
         weight_decay=0.28, gpu=None, num_gpus=1, mfu=0.4, kv_batch_size=1,
     )
@@ -37,6 +38,36 @@ def test_inspect_one_config_mode_smoke(arch):
     assert row["params"]["total"] > 0
     assert row["flops"]["per_token"] > 0
     assert row["training_plan"]["num_iterations"] > 0
+
+
+@pytest.mark.parametrize("preset", ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"])
+def test_inspect_one_composed_config_mode_smoke(preset):
+    """arch="composed" is inspected via --model-config (a preset name here) rather than bare
+    --depth -- see scripts/model_info.py's _build_composed_meta."""
+    row = model_info.inspect_one("composed", 4, _args(model_config=preset), vocab_size=128)
+    assert row["arch"] == "composed"
+    assert row["params"]["total"] > 0
+    assert row["flops"]["per_token"] > 0
+    assert row["training_plan"]["num_iterations"] > 0
+    # Same shape as the native architecture the preset expands -- direct cross-check.
+    native_row = model_info.inspect_one(preset, 4, _args(), vocab_size=128)
+    assert row["params"]["total"] == native_row["params"]["total"]
+    assert row["flops"]["per_token"] == native_row["flops"]["per_token"]
+
+
+def test_dump_config_round_trips_through_model_config():
+    """The dump -> edit -> train bridge: --dump-config's output must be exactly what
+    resolve_composed_config accepts back as a --model-config file."""
+    import json
+    import tempfile
+    from nanochat.model.composed.presets import expand_preset, resolve_composed_config
+
+    config = expand_preset("gpt", depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(config.to_dict(), f)
+        path = f.name
+    reloaded = resolve_composed_config(path, depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    assert reloaded == config
 
 
 def _save_tiny_checkpoint(base_dir, tag, arch, tokenizer_fingerprint=None, core_metric=None):

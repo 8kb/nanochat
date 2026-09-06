@@ -136,6 +136,19 @@ dev/                  images, notebooks, dev/repackage_data_reference.py
   just the dataclass field — the parent classmethod's own signature default (`LlamaConfig.from_depth`
   hardcodes `window_pattern="L"`) otherwise silently wins over the subclass's field default on any
   `--depth`-driven run.
+- **`nanochat/model/composed/` (`--arch composed`) is a materialized-config-tree alternative to a
+  hardcoded architecture class, additive alongside gpt/llama/llama_kvshare(_win) — see
+  [docs/architecture.md](docs/architecture.md#composed-architectures).** A composed model's
+  state-dict paths live under `body.` (e.g. `body.blocks.0.attn.c_q.weight`, not
+  `blocks.0.attn.c_q.weight` — the composer is a real submodule wrapping what a native
+  architecture keeps at the top level); `docs/architecture.md`'s "Composed architectures" section
+  has the exact remap `tests/test_model_composed.py` uses to prove a composed preset matches its
+  native architecture bit-for-bit. `ComposedModel.setup_optimizer`'s policy dict order (like every
+  `setup_optimizer`) is part of the on-disk optimizer format, but *which* roles a given tree
+  actually produces varies with tree content — a composed checkpoint's optimizer shard is only
+  guaranteed to reload against the same config it was saved with, not across an edited tree.
+  `ComposedConfig.n_layer` is a derived property (total block count, however the composer arranges
+  them), not a stored field — `--arch-opt n_layer=...` correctly rejects it.
 
 ## What runs on this Mac
 

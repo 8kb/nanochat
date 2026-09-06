@@ -37,13 +37,15 @@ def get_config_class(arch):
 
 
 def config_from_dict(d):
-    """Reconstruct a BaseModelConfig subclass instance from a flat dict (as produced by
+    """Reconstruct a BaseModelConfig subclass instance from a dict (as produced by
     BaseModelConfig.to_dict() or loaded from checkpoint meta json). Missing "arch" defaults to
-    "gpt" for checkpoints saved before architectures were pluggable."""
+    "gpt" for checkpoints saved before architectures were pluggable. Dispatches to the resolved
+    class's own from_dict (default: a flat kwargs splat; nanochat.model.composed.spec.ComposedConfig
+    overrides it for its nested tree shape)."""
     d = dict(d)  # don't mutate the caller's dict
     arch = d.pop("arch", "gpt")
     config_cls = get_config_class(arch)
-    return config_cls(**d)
+    return config_cls.from_dict(d)
 
 
 def apply_arch_opts(config, opt_strings):

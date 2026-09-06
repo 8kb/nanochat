@@ -39,9 +39,17 @@ nanochat/model/
 ├── llama_kvshare/          the third architecture -- see "Worked example: llama_kvshare" below
 │   ├── config.py             LlamaKVShareConfig(LlamaConfig) -- adds kv_share_frac
 │   └── model.py                LlamaKVShare(BaseModel) -- Llama + cross-layer KV sharing
-└── llama_kvshare_win/      the fourth architecture -- see "Worked example: llama_kvshare_win" below
-    ├── config.py             LlamaKVShareWinConfig(LlamaKVShareConfig) -- window_pattern default only
-    └── model.py                LlamaKVShareWin(LlamaKVShare) -- no new logic at all
+├── llama_kvshare_win/      the fourth architecture -- see "Worked example: llama_kvshare_win" below
+│   ├── config.py             LlamaKVShareWinConfig(LlamaKVShareConfig) -- window_pattern default only
+│   └── model.py                LlamaKVShareWin(LlamaKVShare) -- no new logic at all
+└── composed/               a fifth, additive path: architecture as a materialized config tree
+                             instead of a Python class -- see "Composed architectures" below
+    ├── spec.py                ComponentSpec, ComposedConfig(BaseModelConfig)
+    ├── registry.py              component catalog: register_component()/build_component()
+    ├── catalog.py                 registers components/'s existing classes under "#type" names
+    ├── composers.py                BaseComposer, StackComposer, BackoutComposer
+    ├── model.py                     ComposedModel(BaseModel), registered under arch "composed"
+    └── presets.py                    from_depth-equivalent compat layer: expand_preset(name, depth, ...)
 ```
 
 `nanochat/scaling.py` (`derive_training_plan`) and `scripts/model_info.py` are outside `nanochat/model/`
@@ -409,6 +417,149 @@ what the producer stores. A short-window consumer layer sharing a long-window pr
 therefore fine in both the training path (`kv_bus`, a full uncropped K/V handed to every consumer,
 each applying its own window at attention time) and the cached-inference path
 (`kv_cache.get_slot_cache`, same reasoning).
+
+## Composed architectures
+
+`nanochat/model/composed/` is a second, additive way to get a model: instead of one hardcoded
+Python class per architecture (the four above), an architecture is a materialized **tree** --
+a config, not code. It exists alongside gpt/llama/llama_kvshare/llama_kvshare_win, doesn't change
+any of them, and reads/writes nothing about their checkpoints or optimizer state.
+
+```json
+{
+  "arch": "composed",
+  "sequence_len": 2048, "vocab_size": 65536, "n_embd": 768, "pad_vocab_size_to": 64,
+  "reference": {"preset": "gpt", "kwargs": {"aspect_ratio": 64, "head_dim": 128}},
+  "shared": {"rope": {"#type": "rotary", "head_dim": 128}},
+  "input":  {"#type": "token_embedding", "smear": true},
+  "body": {
+    "#type": "backout", "backout_layer": 6, "backout_lambda_init": 0.2,
+    "blocks": [
+      {"#type": "gpt_block", "layer_idx": 0, "n_head": 6, "n_kv_head": 6, "window": 2048,
+       "has_value_embed": true, "resid_lambda_init": 1.15, "x0_lambda_init": 0.20}
+    ]
+  },
+  "output": {"#type": "lm_head", "softcap": 15}
+}
+```
+
+Every node is a flat object -- its component type under `"#type"`, its already-concrete
+constructor kwargs as siblings (`nanochat.model.composed.spec.ComponentSpec`; the `#` sigil can't
+collide with a parameter name, so no separate namespacing wrapper is needed). `input`/`body`/
+`output` are all just components -- `body` **is** the composer, and its per-layer list is simply
+one of its own params (conventionally named `blocks`). Nothing here privileges "a stack of
+blocks": a composer with several block lists, or one nesting another composer, needs no schema
+change -- `ComponentSpec.from_dict`'s resolution rule is purely structural (any dict carrying
+`"#type"`, at any depth including inside a list, becomes a spec).
+
+Per-layer values are **already concrete** -- no rule to tile, no pattern string. Want a different
+window on one layer, or more FFN width only on the layers that share KV? Edit that block's entry
+directly; there is nothing to re-derive.
+
+### Component catalog and the build context
+
+`nanochat.model.composed.registry.build_component(spec, ctx)` resolves a `ComponentSpec` into a
+real `nn.Module`: any of its params that are themselves specs (or lists of specs) are built first
+-- so a composer receives its `blocks` already built -- then the class is constructed via
+`cls(**params, **needed)`. `needed` comes from a build `ctx` dict `ComposedModel.__init__` builds
+once: derived globals (`n_embd`, `vocab_size`, `padded_vocab_size`, `sequence_len`, `n_layer`) plus
+whatever `config.shared` components were built (e.g. `rope`). A catalog entry declares which of
+these it needs (`nanochat.model.composed.catalog.py`):
+
+```python
+register_component("token_embedding", needs=("padded_vocab_size", "n_embd"))(TokenEmbedding)
+register_component("gpt_block", needs=("n_embd", "padded_vocab_size", "rope", "n_layer"))(Block)
+register_component("stack")(StackComposer)
+```
+
+One flat namespace, no "kind" of embedding/block/composer -- the parent deciding what a slot means
+is enough, and type names are globally unique. Everything currently cataloged
+(`token_embedding`, `lm_head`, `rotary`, `gpt_block`, `plain_block`) is `nanochat/model/components/`
+reused verbatim, unmodified by this package.
+
+### Composers
+
+A composer (`nanochat.model.composed.composers.BaseComposer`) owns a set of blocks and how they
+connect into one residual-stream transform -- what used to be hardcoded per architecture class as
+`GPT._forward_trunk` vs. `Llama.forward`'s inlined loop. Contract: `forward(x, idx, kv_cache) ->
+x`, `layer_specs()` in forward-pass order (so the generic FLOPs/KV accounting in
+`nanochat/model/flops.py` keeps working unchanged even for a composer wrapping several block
+lists). Two exist:
+
+- **`StackComposer`** -- plain sequential stack, no `x0` residual. Threads a fresh `kv_bus = {}`
+  through every block each forward pass unconditionally; a block that ignores it
+  (`BaseBlock.forward`'s `kv_bus=None` default) is unaffected. Covers llama / llama_kvshare /
+  llama_kvshare_win.
+- **`BackoutComposer`** -- GPT's residual topology: `x0` (post-embedding activations) threaded into
+  every block via each block's own resid/x0 lambdas, plus a mid-depth "backout" subtraction before
+  the final norm. Reproduces `GPT._forward_trunk` exactly; owns `backout_lambda` itself (role
+  `"backout_scalar"`) rather than the top-level model class owning it, as native GPT's own
+  `backout_lambda` historically did -- the same SOLID module-ownership rule from "The three module
+  contracts" above, applied to residual topology instead of embedding/block/unembedding state.
+
+### Presets: the compatibility layer
+
+`nanochat/model/composed/presets.py` reproduces each native architecture's `from_depth` +
+`__init__` derivation exactly, but runs it **once, at expansion time**, materializing the result
+instead of leaving it as a rule the model re-derives on every build: `compute_window_sizes`,
+`compute_kv_slots`, `has_ve`, and GPT's per-layer resid/x0-lambda init schedule all get called
+here, never inside `ComposedModel` itself. `expand_preset(name, depth, **kwargs)` dispatches to
+`expand_gpt` / `expand_llama` / `expand_llama_kvshare` / `expand_llama_kvshare_win` -- one per
+native architecture, each producing an equivalent `ComposedConfig` (`tests/test_model_composed.py`
+proves this: identical `layer_specs()`/`kv_cache_spec()`/`num_matmul_params()`/`estimate_flops()`/
+`kv_bytes_per_token()`, identical total parameter count, and -- after remapping state-dict keys,
+see below -- bit-identical forward output on a real weight copy from the native model).
+
+Each preset stamps a `reference` block onto its output (`{"preset": name, "kwargs": {...}}`) so
+the muP d12 scaling-law reference model (`nanochat.scaling.derive_training_plan`'s `d_ref`) can be
+re-derived at a different depth without hand-editing the tree -- see
+`resolve_composed_reference_config`. A config with no `reference` (e.g. a tree written by hand
+rather than dumped from a preset) needs `--d-ref-scaling-params` instead (both
+`scripts/base_train.py` and `scripts/model_info.py`).
+
+### The CLI: `--arch composed --model-config <preset|file>`
+
+```bash
+# dump a native architecture's own preset as a starting tree
+python -m scripts.model_info --arch gpt --depth 12 --dump-config > gpt_d12.json
+
+# hand-edit gpt_d12.json: a custom window on one layer, extra FFN width on shared-KV layers, ...
+
+# train it
+python -m scripts.base_train --arch composed --model-config gpt_d12.json
+
+# or straight from a preset, no file, --arch-opt still reaches preset kwargs like kv_share_frac:
+python -m scripts.base_train --arch composed --model-config llama_kvshare --depth 12 \
+  --arch-opt kv_share_frac=0.667
+```
+
+`--model-config` is either a preset name (expanded fresh at `--depth`, exactly like `from_depth`
+for a native architecture) or a path to a materialized JSON tree (loaded once; `--arch-opt` is
+rejected in this case since there is no fixed field set to validate a key against -- edit the tree
+directly instead). `scripts/base_train.py`'s checkpoint tag for a composed run is
+`composed_<preset-or-file-stem>_d<n_layer>` (unaffected by `--model-tag`, which still wins if
+given).
+
+### What changed in shared code to support this (nothing that changes existing behavior)
+
+- **`BaseModelConfig.from_dict(cls, d)`** (`nanochat/model/base.py`): a classmethod inverse of
+  `to_dict()`, defaulting to `cls(**d)` -- exactly what `nanochat.model.registry.config_from_dict`
+  already did inline. `ComposedConfig` overrides it for its nested tree shape (`asdict()`'s flat
+  dict can't round-trip a `ComponentSpec`); every native config keeps the inherited default,
+  unchanged.
+- **`BaseModel.shape_summary()`**: the `n_layer`/`n_embd`/`n_head`/`n_kv_head`/`sequence_len`/
+  `window_pattern` block `scripts/model_info.py` reports (and, via that dict,
+  `runs/contest.sh` -- see AGENTS.md), pulled out of `model_info.py` into a method every model has.
+  The default reads the same flat config fields the four native architectures already share, so
+  their output is byte-identical to before. `ComposedModel.shape_summary()` overrides it to report
+  `"mixed"` for any of those fields when per-layer values actually differ.
+- **`Block.__init__`** (`nanochat/model/components/block.py`) gained an optional
+  `has_value_embed=None`, falling back to `has_ve(layer_idx, n_layer)` (today's parity rule) when
+  omitted -- so a composed tree can state the per-layer choice explicitly instead of deriving it.
+  `Block.forward` gained `kv_bus=None` (accepted, threaded through to `self.attn`, a no-op when not
+  given) to close an existing `BaseBlock` contract drift (`PlainBlock.forward` already took it).
+  Neither change affects any existing call site: `GPT.__init__` never passes `has_value_embed`
+  positionally-conflicting, and the model's own `_forward_trunk` never passes `kv_bus`.
 
 ## Checkpoint tags and architecture-aware discovery
 

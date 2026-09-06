@@ -13,6 +13,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import ast
 import gc
 import json
 import time
@@ -25,6 +26,8 @@ import torch
 import torch.distributed as dist
 
 from nanochat.model import get_model_class, get_config_class, apply_arch_opts
+from nanochat.model.composed.model import ComposedModel
+from nanochat.model.composed.presets import resolve_composed_config, resolve_composed_reference_config
 from nanochat.model.param_roles import collect_param_roles
 from nanochat.scaling import derive_training_plan, B_REF
 from nanochat.model.components.linear import Linear
@@ -56,6 +59,8 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default=None, help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'); default is the architecture's own from_depth default (GPT: SSSL, Llama/LlamaKVShare: L) rather than one arch's default overriding another's")
 parser.add_argument("--arch-opt", action="append", default=None, metavar="KEY=VALUE", help="override an architecture-specific config field beyond from_depth's fixed kwargs, e.g. --arch-opt kv_share_frac=0.667 (repeatable)")
+parser.add_argument("--model-config", type=str, default=None, help="for --arch composed: either a registered preset name (gpt, llama, llama_kvshare, llama_kvshare_win -- expanded fresh at --depth, same as from_depth above) or a path to a materialized JSON tree dumped by scripts/model_info.py --dump-config")
+parser.add_argument("--d-ref-scaling-params", type=int, default=None, help="skip re-deriving the muP d12 scaling-law reference model and use this scaling-param count directly; only needed for a --model-config JSON tree with no 'reference' block")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -128,15 +133,51 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+def _parse_arch_opts(opt_strings):
+    """Same KEY=VALUE grammar as apply_arch_opts (nanochat.model.registry), but returns a plain
+    dict of constructor kwargs for a composed preset function instead of dataclasses.replace()'ing
+    a flat config -- a composed preset has no fixed field set to validate keys against, so a typo
+    surfaces as that preset function's own TypeError rather than a friendlier assertion."""
+    opts = {}
+    for raw in (opt_strings or []):
+        assert "=" in raw, f"--arch-opt must be KEY=VALUE, got {raw!r}"
+        key, _, value = raw.partition("=")
+        opts[key] = ast.literal_eval(value)
+    return opts
+
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data).
-    Architecture is selected via --arch; the config class it registers must implement
+
+    For --arch composed, --model-config is either a registered preset name (gpt, llama,
+    llama_kvshare, llama_kvshare_win -- expanded fresh at `depth` via
+    nanochat.model.composed.presets, exactly like from_depth below) or a path to a materialized
+    JSON tree (loaded once for the real depth; called again with depth=12 below for the muP
+    scaling-law reference model, which re-expands via the tree's own config.reference block --
+    see resolve_composed_reference_config).
+
+    Otherwise, architecture is selected via --arch; the config class it registers must implement
     from_depth(...) (the --depth/--aspect-ratio/--head-dim muP-style dial), matching
     GPTConfig.from_depth in nanochat/model/gpt/config.py. --window-pattern is only passed through
     when explicitly given, so each architecture's own from_depth default (e.g. GPT's SSSL vs.
     Llama's L) applies rather than one arch's CLI default silently overriding another's.
     --arch-opt KEY=VALUE overrides reach fields from_depth's fixed kwarg set doesn't know about
     (e.g. LlamaKVShareConfig.kv_share_frac)."""
+    if args.arch == "composed":
+        # Resolved once at the real --depth regardless of which `depth` was asked for here, so
+        # the muP d12 scaling-law reference call below (depth=12) re-expands via the resolved
+        # config's own `reference` block instead of re-reading/re-interpreting --model-config at
+        # a depth it wasn't written for (a --model-config JSON file has its own fixed n_layer,
+        # unrelated to whatever `depth` happens to be passed in).
+        real_config = resolve_composed_config(
+            args.model_config, args.depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+            max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
+            arch_opts=_parse_arch_opts(args.arch_opt),
+        )
+        config = real_config if depth == args.depth else resolve_composed_reference_config(real_config, depth)
+        with torch.device("meta"):
+            return ComposedModel(config)
+
     config_cls = get_config_class(args.arch)
     model_cls = get_model_class(args.arch)
     assert hasattr(config_cls, "from_depth"), (
@@ -157,15 +198,22 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = model_config.to_dict()
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-if not using_fa3 and model_config_kwargs.get("window_pattern", "L") != "L":
-    print0(f"WARNING: SDPA's sliding window support (window_pattern='{model_config_kwargs['window_pattern']}') falls back to an explicit attention mask instead of a fused kernel. Your GPU utilization will be terrible.")
-    print0("WARNING: Recommend --window-pattern L for full context attention without alternating sliding window patterns.")
+has_sliding_window = any(0 <= spec.window < model_config.sequence_len for spec in model.layer_specs())
+if not using_fa3 and has_sliding_window:
+    print0("WARNING: SDPA's sliding window support falls back to an explicit attention mask instead of a fused kernel for at least one layer. Your GPU utilization will be terrible.")
+    print0("WARNING: Recommend full-context attention (every layer's window >= sequence_len) without FA3.")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else (f"d{args.depth}" if args.arch == "gpt" else f"{args.arch}_d{args.depth}") # e.g. d12, or llama_d12
+if args.model_tag:
+    output_dirname = args.model_tag
+elif args.arch == "composed":
+    config_id = os.path.splitext(os.path.basename(args.model_config))[0] # preset name, or a JSON file's stem
+    output_dirname = f"composed_{config_id}_d{model_config.n_layer}"
+else:
+    output_dirname = f"d{args.depth}" if args.arch == "gpt" else f"{args.arch}_d{args.depth}" # e.g. d12, or llama_d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -291,11 +339,15 @@ num_scaling_params = get_scaling_params(model)
 print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})") # runs/miniseries.sh greps this exact line
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+if args.d_ref_scaling_params is not None:
+    d_ref_scaling_params = args.d_ref_scaling_params
+else:
+    d12_ref = build_model_meta(12) # creates the model on meta device
+    d_ref_scaling_params = get_scaling_params(d12_ref)
 
 plan = derive_training_plan(
     num_scaling_params=num_scaling_params,
-    d_ref_scaling_params=get_scaling_params(d12_ref),
+    d_ref_scaling_params=d_ref_scaling_params,
     num_flops_per_token=num_flops_per_token,
     target_param_data_ratio=args.target_param_data_ratio,
     target_flops=args.target_flops,

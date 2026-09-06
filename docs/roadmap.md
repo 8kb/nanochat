@@ -198,7 +198,35 @@ pre-fix estimate said.
 `DEVICE_BATCH_SIZE` is sized correctly for the card, are the best available reference) — see
 docs/contest.md for the exact cost table and sequence.
 
-## Stage 6 — attention variants
+## Stage 6 — composed architectures (materialized config tree) (done)
+
+Added `nanochat/model/composed/`: a second, additive way to get a model, alongside (not replacing)
+gpt/llama/llama_kvshare/llama_kvshare_win. Instead of one hardcoded Python class per architecture,
+`--arch composed` builds from a materialized JSON tree — `ComponentSpec` nodes (`{"#type": ...,
+...params}`) for the embedding, the per-layer blocks, and a **composer** (`StackComposer` /
+`BackoutComposer`) that owns how blocks connect, replacing the near-duplicated trunk loop that used
+to be hardcoded per model class. Per-layer values (window, `has_value_embed`, KV-slot assignment,
+the resid/x0-lambda init schedule) are concrete in the tree, not re-derived by a rule at build
+time — editing one block's entry is now how you get a custom per-layer window or extra FFN width
+on shared-KV layers, no new architecture class required. `nanochat/model/composed/presets.py` is
+the compatibility layer: `expand_preset("gpt"/"llama"/"llama_kvshare"/"llama_kvshare_win", depth,
+...)` reproduces each native architecture's own `from_depth` + `__init__` derivation exactly (the
+same `compute_window_sizes`/`compute_kv_slots`/`has_ve` calls, run once at expansion time instead
+of on every build), verified in `tests/test_model_composed.py` by comparing accounting numbers and
+copying weights across the documented state-dict key remap to assert bit-identical forward output
+against the real native model.
+
+`scripts/base_train.py`/`scripts/model_info.py` gained `--model-config <preset-name|json-file>`;
+`model_info.py --dump-config` emits any architecture's (native or composed) materialized tree, so
+the intended workflow is dump → hand-edit → `--arch composed --model-config <file>`. Kept
+deliberately additive: the four native architectures, their checkpoints, and their optimizer state
+are untouched — no migration, no format change, no shared code behavior change for them (verified:
+`BaseModel.shape_summary()`'s default reproduces `scripts/model_info.py`'s old inline shape block
+byte-for-byte, and `Block`'s two new optional kwargs default to exactly today's behavior). Stages 7
+and 8 below should build as new block/composer types under this system where that fits, rather than
+new bespoke model classes — see [architecture.md](architecture.md)'s "Composed architectures".
+
+## Stage 7 — attention variants
 
 Per-layer attention and position-encoding selection in the config (mixing local/global, or
 different attention types per layer). Position encoding becomes its own swappable component
@@ -211,23 +239,24 @@ moved `advance()` out of the attention layer; MLA's compressed latent cache will
 KVCache generalized further (a per-layer state object the layer itself allocates and manages,
 rather than a fixed `(n_slots, B, T, H, D)` k/v tensor pair).
 
-## Stage 7 — depth and residual topology
+## Stage 8 — depth and residual topology
 
-`GPT._forward_trunk` (Stage 1, refined in Stage 2 to own `x0` and the block loop) is the seed for
-this: weight tying across layers, looped/universal transformers, layer skipping,
-multi-token-prediction (MTP) heads. Muon's shape-bucketed param grouping (now
+`GPT._forward_trunk` (Stage 1, refined in Stage 2 to own `x0` and the block loop; Stage 6 pulled
+this apart into named, swappable composers) is the seed for this: weight tying across layers,
+looped/universal transformers, layer skipping, multi-token-prediction (MTP) heads — new composers
+under Stage 6's system. Muon's shape-bucketed param grouping (now
 `nanochat/model/param_roles.py:build_param_groups`, driven by `GPT.setup_optimizer`'s policy
 table) needs generalizing for an architecture with tied or ragged-shaped matrix params — Stage 2's
 role protocol makes this more tractable than before (a tied parameter is already a solved case at
 the role-collection level, just not yet exercised by any real architecture), but the shape-based
 Muon stacking itself still assumes independent, per-layer-shaped matrices.
 
-## Stage 8 — experiment ergonomics
+## Stage 9 — experiment ergonomics
 
-Config files as an alternative to pure argparse CLI flags (useful once there are several
-architectures with different field sets). A `docs/experiments/` log in the spirit of
-`docs/upstream/LOG.md`, but for architecture ablations specifically — Stage 5's contest is this
-stage's first real entry.
+Config files as an alternative to pure argparse CLI flags — Stage 6's `--model-config` is this for
+model architecture specifically; this stage is the rest of a run's configuration (data, optimizer,
+eval). A `docs/experiments/` log in the spirit of `docs/upstream/LOG.md`, but for architecture
+ablations specifically — Stage 5's contest is this stage's first real entry.
 
 ## Explicitly deferred, not scheduled
 

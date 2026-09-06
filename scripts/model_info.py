@@ -27,6 +27,7 @@ Examples:
 """
 import os
 import io
+import ast
 import json as json_module
 import argparse
 import contextlib
@@ -35,6 +36,8 @@ import torch
 
 from nanochat.model import get_config_class, get_model_class, config_from_dict, apply_arch_opts
 from nanochat.model.param_roles import collect_param_roles
+from nanochat.model.composed.model import ComposedModel
+from nanochat.model.composed.presets import expand_preset, resolve_composed_config, resolve_composed_reference_config
 from nanochat.common import get_peak_flops, get_base_dir
 from nanochat.scaling import derive_training_plan
 from nanochat.checkpoint_manager import find_last_step
@@ -61,10 +64,42 @@ def get_scaling_params(m):
     return matrix + unembedding
 
 
+def _parse_arch_opts(opt_strings):
+    """Same KEY=VALUE grammar as apply_arch_opts (nanochat.model.registry), but returns a plain
+    dict of constructor kwargs for a composed preset function instead of dataclasses.replace()'ing
+    a flat config -- see scripts/base_train.py's identical helper."""
+    opts = {}
+    for raw in (opt_strings or []):
+        assert "=" in raw, f"--arch-opt must be KEY=VALUE, got {raw!r}"
+        key, _, value = raw.partition("=")
+        opts[key] = ast.literal_eval(value)
+    return opts
+
+
+def _build_composed_meta(depth, args, vocab_size, real_config=None):
+    """Build a ComposedModel on meta device at `depth`. If `real_config` is given, `depth` is the
+    muP scaling-law reference depth (12) for that already-resolved config -- see
+    resolve_composed_reference_config; otherwise --model-config is resolved fresh at `depth` (a
+    preset name, or a path to a materialized JSON tree) -- see resolve_composed_config. Mirrors
+    scripts/base_train.py's build_model_meta, which shares both helpers."""
+    if real_config is not None:
+        config = resolve_composed_reference_config(real_config, depth)
+    else:
+        config = resolve_composed_config(
+            args.model_config, depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+            max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
+            arch_opts=_parse_arch_opts(args.arch_opt),
+        )
+    with torch.device("meta"):
+        return ComposedModel(config)
+
+
 def build_meta(arch, depth, args, vocab_size):
     """Build a model on meta device: shapes/dtypes only, no real weight values -- and therefore
     no to_empty()/init_weights() needed either, since every number this script reports (param
-    counts, FLOPs, KV-cache bytes) depends only on shapes, not values."""
+    counts, FLOPs, KV-cache bytes) depends only on shapes, not values. For arch="composed", use
+    _build_composed_meta directly instead (see inspect_one) -- it needs the resolved real config
+    to correctly build the muP d12 reference model, which this from_depth-only path can't express."""
     config_cls = get_config_class(arch)
     model_cls = get_model_class(arch)
     assert hasattr(config_cls, "from_depth"), (
@@ -101,12 +136,7 @@ def inspect_model(model, arch, depth, args):
     return {
         "arch": arch,
         "depth": depth,
-        "shape": {
-            "n_layer": config.n_layer, "n_embd": config.n_embd,
-            "n_head": config.n_head, "n_kv_head": config.n_kv_head,
-            "sequence_len": config.sequence_len, "window_pattern": config.window_pattern,
-            "num_kv_slots": kv_cache_spec["num_kv_slots"],
-        },
+        "shape": {**model.shape_summary(), "num_kv_slots": kv_cache_spec["num_kv_slots"]},
         "params": {**role_counts, "matmul": num_matmul_params, "scaling": scaling_params},
         "flops": {
             "per_token": flops_per_token, "prefill_at_seqlen": prefill_flops, "decode_at_seqlen": decode_flops,
@@ -122,14 +152,21 @@ def inspect_model(model, arch, depth, args):
 def inspect_one(arch, depth, args, vocab_size):
     """Config mode: a hypothetical (arch, depth) that hasn't been trained -- reports the static
     block plus the training plan a real base_train.py run would derive for it."""
-    model = build_meta(arch, depth, args, vocab_size)
+    model = _build_composed_meta(depth, args, vocab_size) if arch == "composed" else build_meta(arch, depth, args, vocab_size)
     row = inspect_model(model, arch, depth, args)
     scaling_params = row["params"]["scaling"]
 
-    d12_ref = build_meta(arch, 12, args, vocab_size)
+    if args.d_ref_scaling_params is not None:
+        d_ref_scaling_params = args.d_ref_scaling_params
+    elif arch == "composed":
+        d12_ref = _build_composed_meta(12, args, vocab_size, real_config=model.config)
+        d_ref_scaling_params = get_scaling_params(d12_ref)
+    else:
+        d12_ref = build_meta(arch, 12, args, vocab_size)
+        d_ref_scaling_params = get_scaling_params(d12_ref)
     plan = derive_training_plan(
         num_scaling_params=scaling_params,
-        d_ref_scaling_params=get_scaling_params(d12_ref),
+        d_ref_scaling_params=d_ref_scaling_params,
         num_flops_per_token=row["flops"]["per_token"],
         target_param_data_ratio=args.target_param_data_ratio,
         target_flops=args.target_flops,
@@ -256,6 +293,8 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--window-pattern", type=str, default=None, help="default: each architecture's own from_depth default")
     parser.add_argument("--arch-opt", action="append", default=None, metavar="KEY=VALUE", help="repeatable; same as scripts/base_train.py's --arch-opt")
+    parser.add_argument("--model-config", type=str, default=None, help="for --arch composed: a registered preset name (gpt, llama, llama_kvshare, llama_kvshare_win) or a path to a materialized JSON tree (see --dump-config)")
+    parser.add_argument("--dump-config", action="store_true", help="print the materialized ComposedConfig tree for one --arch/--depth (any architecture -- a native one is expanded via its matching composed preset) instead of inspecting it, so it can be edited and fed back in via --arch composed --model-config <file>")
     parser.add_argument("--vocab-size", type=int, default=None, help="default: the local tokenizer's, if trained, else 32768")
     # Training horizon: same flags/defaults as scripts/base_train.py, so the two agree exactly given the same arguments
     parser.add_argument("--target-param-data-ratio", type=float, default=12)
@@ -263,6 +302,7 @@ def main():
     parser.add_argument("--num-iterations", type=int, default=-1)
     parser.add_argument("--total-batch-size", type=int, default=-1)
     parser.add_argument("--weight-decay", type=float, default=0.28)
+    parser.add_argument("--d-ref-scaling-params", type=int, default=None, help="skip re-deriving the muP d12 scaling-law reference model and use this scaling-param count directly; only needed for a --model-config JSON tree with no 'reference' block")
     # Cloud budgeting
     parser.add_argument("--gpu", type=str, default=None, help="GPU name for a GPU-hours estimate, e.g. 'NVIDIA A100' (see nanochat.common.get_peak_flops)")
     parser.add_argument("--num-gpus", type=int, default=1)
@@ -275,6 +315,26 @@ def main():
                               "checkpoint's own saved config)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+
+    if args.dump_config:
+        archs = [a.strip() for a in args.arch.split(",")]
+        depths = [int(d.strip()) for d in args.depth.split(",")]
+        assert len(archs) == 1 and len(depths) == 1, "--dump-config takes exactly one --arch and one --depth"
+        arch, depth = archs[0], depths[0]
+        vocab_size = args.vocab_size if args.vocab_size is not None else default_vocab_size()[0]
+        if arch == "composed":
+            config = resolve_composed_config(
+                args.model_config, depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+                max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
+                arch_opts=_parse_arch_opts(args.arch_opt),
+            )
+        else:
+            kwargs = dict(aspect_ratio=args.aspect_ratio, head_dim=args.head_dim, max_seq_len=args.max_seq_len, vocab_size=vocab_size)
+            if args.window_pattern is not None:
+                kwargs["window_pattern"] = args.window_pattern
+            config = expand_preset(arch, depth, **kwargs, **_parse_arch_opts(args.arch_opt))
+        print(json_module.dumps(config.to_dict(), indent=2))
+        return
 
     # Model construction (via print0) prints diagnostics like Llama/GPT's "Padding vocab_size..."
     # or LlamaKVShare's "KV sharing: ..." -- fine for human output, but would pollute --json's

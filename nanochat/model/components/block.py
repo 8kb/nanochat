@@ -17,9 +17,15 @@ class Block(BaseBlock):
     PARAM_ROLES = {"resid_lambda": "resid_scalar", "x0_lambda": "x0_scalar"}
 
     def __init__(self, n_embd, n_head, n_kv_head, layer_idx, n_layer, window, rope, padded_vocab_size,
-                 resid_lambda_init, x0_lambda_init):
+                 resid_lambda_init, x0_lambda_init, has_value_embed=None):
+        """has_value_embed=None (the default) derives the alternating-by-parity choice from
+        n_layer, matching every hand-written architecture's own behavior; a caller that already
+        knows the per-layer choice (e.g. a materialized composed-architecture tree, see
+        nanochat.model.composed) can pass it explicitly instead."""
         super().__init__()
-        self.attn = CausalSelfAttention(n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size, has_ve(layer_idx, n_layer))
+        if has_value_embed is None:
+            has_value_embed = has_ve(layer_idx, n_layer)
+        self.attn = CausalSelfAttention(n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size, has_value_embed)
         self.mlp = MLP(n_embd)
         self.resid_lambda = nn.Parameter(torch.empty(()))  # fake init, real init in init_weights()
         self.x0_lambda = nn.Parameter(torch.empty(()))     # fake init, real init in init_weights()
@@ -36,9 +42,9 @@ class Block(BaseBlock):
     def layer_spec(self):
         return self.attn.layer_spec()
 
-    def forward(self, x, x0, idx, kv_cache):
+    def forward(self, x, x0, idx, kv_cache, kv_bus=None):
         x = self.resid_lambda * x + self.x0_lambda * x0
-        x = x + self.attn(norm(x), idx, kv_cache)
+        x = x + self.attn(norm(x), idx, kv_cache, kv_bus)
         x = x + self.mlp(norm(x))
         return x
 
