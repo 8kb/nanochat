@@ -1,0 +1,164 @@
+"""
+ModelManager: the one entrypoint modelcore exposes. Everything a caller needs to create, load,
+save, or validate a model or its optimizer, or measure a config's cost, goes through here.
+Nothing else in modelcore (components, composers, catalog, roles, stats' free functions) is meant
+to be used directly from outside the package -- see the module docstrings for why each exists,
+but ModelManager is the seam.
+"""
+from dataclasses import dataclass
+
+import torch
+
+from modelcore.cache import KVCache
+from modelcore.config.spec import ModelConfig
+from modelcore.config.validate import validate_config as _validate_config
+from modelcore.errors import ValidationReport
+from modelcore.model import Model
+from modelcore.optim import MuonAdamW
+from modelcore.roles import build_param_groups, collect_param_roles
+from modelcore.runtime import DEFAULT_RUNTIME, Runtime
+from modelcore.stats import (
+    ModelStats, estimate_flops, has_sliding_window as _has_sliding_window, kv_cache_spec as _kv_cache_spec,
+    num_matmul_params as _num_matmul_params, shape_summary as _shape_summary,
+)
+
+
+@dataclass
+class OptimizerHparams:
+    """Numeric dials for create_optimizer(); the role -> hyperparameters *policy* itself (which
+    roles exist, their relative learning rates, AdamW vs Muon, and -- load-bearing -- the order
+    they're iterated in, which is the on-disk optimizer param_group layout) lives in
+    ModelManager.create_optimizer, not here."""
+    unembedding_lr: float = 0.004
+    embedding_lr: float = 0.2
+    matrix_lr: float = 0.02
+    scalar_lr: float = 0.5
+    weight_decay: float = 0.0
+
+
+class ModelManager:
+    def __init__(self, runtime: Runtime | None = None):
+        self.runtime = runtime or DEFAULT_RUNTIME
+
+    # -- config --
+
+    def config_from_dict(self, d: dict) -> ModelConfig:
+        return ModelConfig.from_dict(d)
+
+    def config_to_dict(self, config: ModelConfig) -> dict:
+        return config.to_dict()
+
+    def validate_config(self, config: ModelConfig) -> ValidationReport:
+        return _validate_config(config)
+
+    def _require_valid(self, config: ModelConfig) -> None:
+        report = self.validate_config(config)
+        if not report.ok:
+            raise ValueError(f"invalid model config:\n{report}")
+
+    # -- create --
+
+    def create_model(self, config: ModelConfig, *, device, seed: int | None = None) -> Model:
+        self._require_valid(config)
+        with torch.device("meta"):
+            model = Model(config, runtime=self.runtime)
+        model.to_empty(device=device)
+        if seed is not None:
+            torch.manual_seed(seed)
+        model.init_weights()
+        return model
+
+    def create_optimizer(self, model: Model, hparams: OptimizerHparams | None = None) -> MuonAdamW:
+        """One policy table for every model modelcore can build, regardless of which roles a
+        given tree actually produces (build_param_groups skips a policy role with no params
+        present) -- covers every role any currently-cataloged component can emit."""
+        hparams = hparams or OptimizerHparams()
+        dmodel_lr_scale = (model.config.n_embd / 768) ** -0.5
+        self.runtime.log(f"Scaling the LR for the AdamW parameters ∝1/√({model.config.n_embd}/768) = {dmodel_lr_scale:.6f}")
+        policy = {
+            "unembedding": dict(kind='adamw', lr=hparams.unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            "embedding": dict(kind='adamw', lr=hparams.embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            "value_embedding": dict(kind='adamw', lr=hparams.embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            "resid_scalar": dict(kind='adamw', lr=hparams.scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            "x0_scalar": dict(kind='adamw', lr=hparams.scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            "smear": dict(kind='adamw', lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            "backout_scalar": dict(kind='adamw', lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            "matrix": dict(kind='muon', lr=hparams.matrix_lr, momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=hparams.weight_decay),
+        }
+        param_groups = build_param_groups(collect_param_roles(model), policy)
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    # -- load --
+
+    def load_model(self, store, *, device, config: ModelConfig | None = None, train: bool = False) -> Model:
+        if config is None:
+            config = self.config_from_dict(store.read_config())
+        self._require_valid(config)
+        state = store.read_model_state(map_location=device)
+        with torch.device("meta"):
+            model = Model(config, runtime=self.runtime)
+        model.to_empty(device=device)
+        # Some buffers (e.g. rotary cos/sin) are persistent=False -- never saved to a checkpoint
+        # -- so they need real values from init_weights() before load_state_dict overwrites
+        # everything else.
+        model.init_weights()
+        model.load_state_dict(state, strict=True, assign=True)
+        model.train(train)
+        return model
+
+    def load_optimizer(self, model: Model, store, *, rank: int = 0,
+                        hparams: OptimizerHparams | None = None) -> MuonAdamW | None:
+        """Loads just the optimizer shard for a given rank; returns None if the store has none
+        (not every checkpoint saves optimizer state)."""
+        state = store.read_optimizer_state(rank=rank, map_location=model.get_device())
+        if state is None:
+            return None
+        optimizer = self.create_optimizer(model, hparams)
+        optimizer.load_state_dict(state)
+        return optimizer
+
+    # -- save --
+
+    def save_model(self, model: Model, store) -> None:
+        store.write_config(self.config_to_dict(model.config))
+        store.write_model_state(model.state_dict())
+
+    def save_optimizer(self, optimizer: MuonAdamW, store, *, rank: int = 0) -> None:
+        store.write_optimizer_state(optimizer.state_dict(), rank=rank)
+
+    # -- stats & runtime helpers --
+
+    def stats(self, config: ModelConfig) -> ModelStats:
+        """Computed from a meta-device model -- shapes/dtypes only, no real weights ever
+        allocated, so this is cheap regardless of model size."""
+        self._require_valid(config)
+        with torch.device("meta"):
+            model = Model(config, runtime=self.runtime)
+        layer_specs = model.layer_specs()
+        matmul_params = _num_matmul_params(model)
+        params_by_role = {
+            role: sum(p.numel() for p in params)
+            for role, params in collect_param_roles(model).items()
+        }
+        return ModelStats(
+            n_layer=config.n_layer,
+            params_by_role=params_by_role,
+            num_params=sum(params_by_role.values()),
+            num_matmul_params=matmul_params,
+            layer_specs=layer_specs,
+            kv_cache_spec=_kv_cache_spec(layer_specs),
+            shape_summary=_shape_summary(config, layer_specs),
+            flops_per_token=estimate_flops(layer_specs, matmul_params, config.sequence_len),
+            has_sliding_window=_has_sliding_window(layer_specs, config.sequence_len),
+            _kv_dtype_itemsize=self.runtime.compute_dtype.itemsize,
+        )
+
+    def new_kv_cache(self, model: Model, *, batch_size: int, seq_len: int, device=None) -> KVCache:
+        spec = _kv_cache_spec(model.layer_specs())
+        return KVCache(
+            batch_size=batch_size, seq_len=seq_len, device=device or model.get_device(),
+            dtype=self.runtime.compute_dtype, **spec,
+        )
