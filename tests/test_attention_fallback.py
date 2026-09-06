@@ -15,8 +15,8 @@ Note on test structure:
 """
 import torch
 import pytest
-import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
+import modelcore.kernels.flash_attn as fa_module
+from modelcore.kernels.flash_attn import flash_attn, HAS_FA3
 from nanochat.engine import KVCache
 
 
