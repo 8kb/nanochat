@@ -1,0 +1,66 @@
+{
+  "model_config": {
+    "sequence_len": 32,
+    "vocab_size": 128,
+    "n_embd": 64,
+    "pad_vocab_size_to": 64,
+    "reference": {
+      "preset": "llama",
+      "kwargs": {
+        "aspect_ratio": 16,
+        "head_dim": 32,
+        "max_seq_len": 32,
+        "vocab_size": 128,
+        "window_pattern": "L"
+      }
+    },
+    "shared": {
+      "rope": {
+        "#type": "rotary",
+        "head_dim": 32
+      }
+    },
+    "input": {
+      "#type": "token_embedding",
+      "smear": false
+    },
+    "body": {
+      "#type": "stack",
+      "blocks": [
+        {
+          "#type": "plain_block",
+          "layer_idx": 0,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 32
+        },
+        {
+          "#type": "plain_block",
+          "layer_idx": 1,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 32
+        },
+        {
+          "#type": "plain_block",
+          "layer_idx": 2,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 32
+        },
+        {
+          "#type": "plain_block",
+          "layer_idx": 3,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 32
+        }
+      ]
+    },
+    "output": {
+      "#type": "lm_head",
+      "softcap": 15
+    },
+    "arch": "composed"
+  }
+}

@@ -1,0 +1,929 @@
+{
+ "source": "tiny_composed_llama_kvshare_win",
+ "model_tag": "tiny_composed_llama_kvshare_win",
+ "meta_model_config": {
+  "sequence_len": 32,
+  "vocab_size": 128,
+  "n_embd": 64,
+  "pad_vocab_size_to": 64,
+  "reference": {
+   "preset": "llama_kvshare_win",
+   "kwargs": {
+    "aspect_ratio": 16,
+    "head_dim": 32,
+    "max_seq_len": 32,
+    "vocab_size": 128,
+    "window_pattern": "SSSL",
+    "kv_share_frac": 0.5
+   }
+  },
+  "shared": {
+   "rope": {
+    "#type": "rotary",
+    "head_dim": 32
+   }
+  },
+  "input": {
+   "#type": "token_embedding",
+   "smear": false
+  },
+  "body": {
+   "#type": "stack",
+   "blocks": [
+    {
+     "#type": "plain_block",
+     "layer_idx": 0,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "kv_slot": 0,
+     "produces_kv": true
+    },
+    {
+     "#type": "plain_block",
+     "layer_idx": 1,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "kv_slot": 1,
+     "produces_kv": true
+    },
+    {
+     "#type": "plain_block",
+     "layer_idx": 2,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "kv_slot": 1,
+     "produces_kv": false
+    },
+    {
+     "#type": "plain_block",
+     "layer_idx": 3,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 32,
+     "kv_slot": 1,
+     "produces_kv": false
+    }
+   ]
+  },
+  "output": {
+   "#type": "lm_head",
+   "softcap": 15
+  },
+  "arch": "composed"
+ },
+ "state_dict_fingerprint": {
+  "by_key": {
+   "embedding.wte.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "25e1a1e69efa357fad205f7056e22de52f2b776cab494b284224d946290c7ee2"
+   ],
+   "body.blocks.0.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "e9d1df2a873bc874746044f1a0bef71933862312d397eacff38ee0bf9bb8f3de"
+   ],
+   "body.blocks.0.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "f5b2475977dabe589365bd1224fc2d07bbca14ba73f4dd4f09660a380b7c0944"
+   ],
+   "body.blocks.0.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "995f08e01080392db898207a24139b00d9fab2a0666004cde7d02af42a099bcc"
+   ],
+   "body.blocks.0.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.0.mlp.gate_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "e61b4c4642ef7e1ed4c1ce72b6d564a0ef3b74b1bdca4fa1816ae1554a03134f"
+   ],
+   "body.blocks.0.mlp.up_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "ac3fce2ed7513bf2d87b5a22108309d3a6ef89ef8886dd6449c6455103b0e4d5"
+   ],
+   "body.blocks.0.mlp.down_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.1.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fffb611a7a27728dcce5b370b58b028280de6cc5fc7fa6f878d26d5773ee4c9"
+   ],
+   "body.blocks.1.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "052db9cff479c5331a17ece5556e54174b5181e4511de789afc6236e9666cca8"
+   ],
+   "body.blocks.1.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "70694d8791ac595c3dff9801af209fd4815660f8073b501f3d7d9fc9eb8dca79"
+   ],
+   "body.blocks.1.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.1.mlp.gate_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "3f4e5080fc0d80b18d1e98c55f50c306ee95b3028760c67fdf152b1fb71741d8"
+   ],
+   "body.blocks.1.mlp.up_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "a86315c5e7293a5ed27c1e9b667d0a8a3d45c4b1856dbeceacfeefa79cfb85fe"
+   ],
+   "body.blocks.1.mlp.down_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.2.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "a7e96a62bed090c34b118c8fa54ce1103660f0f35ea421253ef09e7f227ecee7"
+   ],
+   "body.blocks.2.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.2.mlp.gate_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "838c94057d5011c6df554b73b6f8f265e8e790d7d957bc13c6a704b2cb85291b"
+   ],
+   "body.blocks.2.mlp.up_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "9621f1b849b87c14016edab07cf5eaefba6c642ad7427bc391d59e5974e92ef7"
+   ],
+   "body.blocks.2.mlp.down_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.3.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "28d30872e1c4a9988e157fa63fde1440c6d72141e0e481597c512fa6db162ef4"
+   ],
+   "body.blocks.3.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.3.mlp.gate_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "d2c91e2438ab976e0ea043ec5ce7ce7c8697ef6a84c17f666af6630932455c9e"
+   ],
+   "body.blocks.3.mlp.up_proj.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "2e0a90159f4d8f6f445e0985b7dedde5cb783a047a5423c3a46a60a045cdb3a5"
+   ],
+   "body.blocks.3.mlp.down_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "unembedding.lm_head.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "f0781f60221f390a5bd453120806022144daadfb9ff58dd4b9eee608d1a77af6"
+   ]
+  },
+  "multiset": [
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "052db9cff479c5331a17ece5556e54174b5181e4511de789afc6236e9666cca8"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "28d30872e1c4a9988e157fa63fde1440c6d72141e0e481597c512fa6db162ef4"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fffb611a7a27728dcce5b370b58b028280de6cc5fc7fa6f878d26d5773ee4c9"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "70694d8791ac595c3dff9801af209fd4815660f8073b501f3d7d9fc9eb8dca79"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "995f08e01080392db898207a24139b00d9fab2a0666004cde7d02af42a099bcc"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "a7e96a62bed090c34b118c8fa54ce1103660f0f35ea421253ef09e7f227ecee7"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "e9d1df2a873bc874746044f1a0bef71933862312d397eacff38ee0bf9bb8f3de"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "f5b2475977dabe589365bd1224fc2d07bbca14ba73f4dd4f09660a380b7c0944"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "25e1a1e69efa357fad205f7056e22de52f2b776cab494b284224d946290c7ee2"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "f0781f60221f390a5bd453120806022144daadfb9ff58dd4b9eee608d1a77af6"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "2e0a90159f4d8f6f445e0985b7dedde5cb783a047a5423c3a46a60a045cdb3a5"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "3f4e5080fc0d80b18d1e98c55f50c306ee95b3028760c67fdf152b1fb71741d8"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "838c94057d5011c6df554b73b6f8f265e8e790d7d957bc13c6a704b2cb85291b"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "9621f1b849b87c14016edab07cf5eaefba6c642ad7427bc391d59e5974e92ef7"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "a86315c5e7293a5ed27c1e9b667d0a8a3d45c4b1856dbeceacfeefa79cfb85fe"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "ac3fce2ed7513bf2d87b5a22108309d3a6ef89ef8886dd6449c6455103b0e4d5"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "d2c91e2438ab976e0ea043ec5ce7ce7c8697ef6a84c17f666af6630932455c9e"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "e61b4c4642ef7e1ed4c1ce72b6d564a0ef3b74b1bdca4fa1816ae1554a03134f"
+   ]
+  ],
+  "num_tensors": 26,
+  "num_params": 262144
+ },
+ "accounting": {
+  "num_scaling_params": {
+   "embedding": 8192,
+   "matrix": 245760,
+   "unembedding": 8192,
+   "total": 262144
+  },
+  "num_matmul_params": 253952,
+  "estimate_flops": 1622016,
+  "estimate_decode_flops_256": 614400,
+  "estimate_prefill_flops_256": 150917120,
+  "kv_bytes_per_token": 1024,
+  "kv_read_bytes_256": 212992,
+  "kv_cache_spec": {
+   "num_heads": 2,
+   "head_dim": 32,
+   "num_kv_slots": 2
+  },
+  "layer_specs": [
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 0
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 1
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 1
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 32,
+    "kv_slot": 1
+   }
+  ],
+  "shape_summary": {
+   "n_layer": 4,
+   "n_embd": 64,
+   "n_head": 2,
+   "n_kv_head": 2,
+   "sequence_len": 32,
+   "window_pattern": "mixed"
+  }
+ },
+ "logits_hash": "099a6c4460e9417849b85e88c75342eb4324c041bef3842cedabffd0d0ea4369",
+ "optimizer_layout": [
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.013856406460551019,
+    "betas": [
+     0.8,
+     0.96
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.01,
+    "initial_lr": 0.013856406460551019
+   },
+   "shapes": [
+    [
+     128,
+     64
+    ]
+   ],
+   "num_params": 1
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.692820323027551,
+    "betas": [
+     0.8,
+     0.995
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.001,
+    "initial_lr": 0.692820323027551
+   },
+   "shapes": [
+    [
+     128,
+     64
+    ]
+   ],
+   "num_params": 1
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ]
+   ],
+   "num_params": 12
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ]
+   ],
+   "num_params": 4
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ]
+   ],
+   "num_params": 8
+  }
+ ],
+ "generate_naive_tokens": [
+  0,
+  106,
+  9,
+  59,
+  15,
+  38,
+  127,
+  118,
+  10,
+  109,
+  62,
+  72,
+  96,
+  42,
+  21,
+  34,
+  44,
+  69,
+  67,
+  66,
+  19,
+  103,
+  12,
+  90,
+  53,
+  42,
+  21,
+  34,
+  44,
+  69,
+  67,
+  66
+ ],
+ "generate_batch_tokens": [
+  0,
+  106,
+  9,
+  59,
+  15,
+  38,
+  127,
+  118,
+  10,
+  109,
+  62,
+  72,
+  96,
+  42,
+  21,
+  34,
+  44,
+  69,
+  67,
+  66,
+  19,
+  103,
+  12,
+  90,
+  53,
+  42,
+  21,
+  34,
+  44,
+  69,
+  67,
+  66
+ ],
+ "optimizer_shard": {
+  "step": 0,
+  "num_groups": 5,
+  "num_state_entries": 0,
+  "group_param_shapes": [
+   [
+    [
+     128,
+     64
+    ]
+   ],
+   [
+    [
+     128,
+     64
+    ]
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ]
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ]
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ]
+   ]
+  ],
+  "state_digest": {}
+ }
+}

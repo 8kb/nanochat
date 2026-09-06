@@ -1,0 +1,12 @@
+{
+  "model_config": {
+    "sequence_len": 32,
+    "vocab_size": 128,
+    "n_layer": 4,
+    "n_head": 2,
+    "n_kv_head": 2,
+    "n_embd": 64,
+    "window_pattern": "L",
+    "arch": "gpt"
+  }
+}

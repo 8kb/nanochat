@@ -1,0 +1,80 @@
+{
+  "model_config": {
+    "sequence_len": 32,
+    "vocab_size": 128,
+    "n_embd": 64,
+    "pad_vocab_size_to": 64,
+    "reference": {
+      "preset": "gpt",
+      "kwargs": {
+        "aspect_ratio": 16,
+        "head_dim": 32,
+        "max_seq_len": 32,
+        "vocab_size": 128,
+        "window_pattern": "SSSL"
+      }
+    },
+    "shared": {
+      "rope": {
+        "#type": "rotary",
+        "head_dim": 32
+      }
+    },
+    "input": {
+      "#type": "token_embedding",
+      "smear": true
+    },
+    "body": {
+      "#type": "backout",
+      "backout_layer": 2,
+      "backout_lambda_init": 0.2,
+      "blocks": [
+        {
+          "#type": "gpt_block",
+          "layer_idx": 0,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 128,
+          "has_value_embed": false,
+          "resid_lambda_init": 1.15,
+          "x0_lambda_init": 0.2
+        },
+        {
+          "#type": "gpt_block",
+          "layer_idx": 1,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 128,
+          "has_value_embed": true,
+          "resid_lambda_init": 1.1166666666666665,
+          "x0_lambda_init": 0.15000000000000002
+        },
+        {
+          "#type": "gpt_block",
+          "layer_idx": 2,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 128,
+          "has_value_embed": false,
+          "resid_lambda_init": 1.0833333333333333,
+          "x0_lambda_init": 0.10000000000000002
+        },
+        {
+          "#type": "gpt_block",
+          "layer_idx": 3,
+          "n_head": 2,
+          "n_kv_head": 2,
+          "window": 32,
+          "has_value_embed": true,
+          "resid_lambda_init": 1.0499999999999998,
+          "x0_lambda_init": 0.05000000000000002
+        }
+      ]
+    },
+    "output": {
+      "#type": "lm_head",
+      "softcap": 15
+    },
+    "arch": "composed"
+  }
+}

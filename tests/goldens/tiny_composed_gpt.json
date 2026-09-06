@@ -1,0 +1,1285 @@
+{
+ "source": "tiny_composed_gpt",
+ "model_tag": "tiny_composed_gpt",
+ "meta_model_config": {
+  "sequence_len": 32,
+  "vocab_size": 128,
+  "n_embd": 64,
+  "pad_vocab_size_to": 64,
+  "reference": {
+   "preset": "gpt",
+   "kwargs": {
+    "aspect_ratio": 16,
+    "head_dim": 32,
+    "max_seq_len": 32,
+    "vocab_size": 128,
+    "window_pattern": "SSSL"
+   }
+  },
+  "shared": {
+   "rope": {
+    "#type": "rotary",
+    "head_dim": 32
+   }
+  },
+  "input": {
+   "#type": "token_embedding",
+   "smear": true
+  },
+  "body": {
+   "#type": "backout",
+   "backout_layer": 2,
+   "backout_lambda_init": 0.2,
+   "blocks": [
+    {
+     "#type": "gpt_block",
+     "layer_idx": 0,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "has_value_embed": false,
+     "resid_lambda_init": 1.15,
+     "x0_lambda_init": 0.2
+    },
+    {
+     "#type": "gpt_block",
+     "layer_idx": 1,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "has_value_embed": true,
+     "resid_lambda_init": 1.1166666666666665,
+     "x0_lambda_init": 0.15000000000000002
+    },
+    {
+     "#type": "gpt_block",
+     "layer_idx": 2,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 128,
+     "has_value_embed": false,
+     "resid_lambda_init": 1.0833333333333333,
+     "x0_lambda_init": 0.10000000000000002
+    },
+    {
+     "#type": "gpt_block",
+     "layer_idx": 3,
+     "n_head": 2,
+     "n_kv_head": 2,
+     "window": 32,
+     "has_value_embed": true,
+     "resid_lambda_init": 1.0499999999999998,
+     "x0_lambda_init": 0.05000000000000002
+    }
+   ]
+  },
+  "output": {
+   "#type": "lm_head",
+   "softcap": 15
+  },
+  "arch": "composed"
+ },
+ "state_dict_fingerprint": {
+  "by_key": {
+   "embedding.wte.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "25e1a1e69efa357fad205f7056e22de52f2b776cab494b284224d946290c7ee2"
+   ],
+   "embedding.smear.lambda_": [
+    [],
+    "torch.float32",
+    "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+   ],
+   "embedding.smear.gate.weight": [
+    [
+     1,
+     24
+    ],
+    "torch.float32",
+    "248ff9822e048e83cb32ee07c8b853faa64704a157a6956e20e7da2c394ca20a"
+   ],
+   "body.backout_lambda": [
+    [],
+    "torch.float32",
+    "5d96a77c55b4ac1eea2d77815396c4349292b85e3b07beaca6aff933e7ef8752"
+   ],
+   "body.blocks.0.resid_lambda": [
+    [],
+    "torch.float32",
+    "ea418640b9fd4008d3436ff251ae3612366a2acc83b4d846384ae196aa44c3f8"
+   ],
+   "body.blocks.0.x0_lambda": [
+    [],
+    "torch.float32",
+    "5d96a77c55b4ac1eea2d77815396c4349292b85e3b07beaca6aff933e7ef8752"
+   ],
+   "body.blocks.0.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "b27c3266dc9bd46bc2b6456cdd295b2efd68e793e967c274d22ef0fe99aff7ad"
+   ],
+   "body.blocks.0.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "26eb225731abf4f5f6e137d290ba4988d35893c9082565ceadb5b32d6d569bda"
+   ],
+   "body.blocks.0.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "65b30484e76064fb8eac6391e5d5ed54435a02a50a6ead2185bc7caa939655ae"
+   ],
+   "body.blocks.0.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.0.mlp.c_fc.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "11157e0a86081404d32a7d8c2d364e2fc57254f9ddb337d056680a207c4b679c"
+   ],
+   "body.blocks.0.mlp.c_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.1.resid_lambda": [
+    [],
+    "torch.float32",
+    "26af537120e6f6681755f04998a5223da29779e890a29c67fa51da34a7c12ae1"
+   ],
+   "body.blocks.1.x0_lambda": [
+    [],
+    "torch.float32",
+    "5059b35a51a066cc88e72daa9017c4e126068c6368cd3b9f45b4d8d5cc94b3e5"
+   ],
+   "body.blocks.1.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "3dd74eef3d7f3c2590361ae01658c052e37ee324277038712ea0c3252ed3e5db"
+   ],
+   "body.blocks.1.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "5edb7bdfe339262733920431efa799cbe0bf3e5394f2cd0caef8de604999b7b5"
+   ],
+   "body.blocks.1.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "f68487d8c398c6577765a03253b672d556445d70962ea1782f999d0d0b4f348e"
+   ],
+   "body.blocks.1.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.1.attn.value_embed.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "765fb08c22dc0a0cf4597e5def9c1f6a7f28ef9f5dd75599a9f5e7660e007196"
+   ],
+   "body.blocks.1.attn.ve_gate.weight": [
+    [
+     2,
+     12
+    ],
+    "torch.float32",
+    "091f5573c9f226be6c964e87976dc33a238a217c44ca31dfc08b98187fdd017b"
+   ],
+   "body.blocks.1.mlp.c_fc.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "9da140f7348b89d3731d541d23ec057ec6a370c56bbdff0bd4c18bd112ee67de"
+   ],
+   "body.blocks.1.mlp.c_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.2.resid_lambda": [
+    [],
+    "torch.float32",
+    "4e8556aebed6a6890ee326c0119f1ce4259e96b1af2f8f5f77feacf97f2d4d5b"
+   ],
+   "body.blocks.2.x0_lambda": [
+    [],
+    "torch.float32",
+    "fb360f7241a770dc32cade9a1d1273c92b13bd4959b1c130931312b7fe95e63f"
+   ],
+   "body.blocks.2.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "9dfd3ed44b633bc0a243f296c149ff2c8df8b81cdc779c1146ade18d24702996"
+   ],
+   "body.blocks.2.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "11a138cc5066cc5f2d8485cb5b72d65482fe01d046318d2dc3b308c9a67e32d4"
+   ],
+   "body.blocks.2.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4d110a62ec74311d6342b253eb32f09f60fedc6d3e92d3f0e3b81a3a1d1c0a2c"
+   ],
+   "body.blocks.2.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.2.mlp.c_fc.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "430e17246c5d4eef08a49989d280b6bba45669669df13c5482bfd55d52e6ebac"
+   ],
+   "body.blocks.2.mlp.c_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "body.blocks.3.resid_lambda": [
+    [],
+    "torch.float32",
+    "5af2169fc7e6a3268ca6146f2ba18f312fde17563e7dff42572633d9b0b92c7c"
+   ],
+   "body.blocks.3.x0_lambda": [
+    [],
+    "torch.float32",
+    "0b9d79ff0fc4d0a77ef398763bbe45c445501e826219f2b6a1aa709411ab631d"
+   ],
+   "body.blocks.3.attn.c_q.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "fde31834e75cddba35f20af717d6371be4f6215e96a5cc7bf47be1dba610ad1b"
+   ],
+   "body.blocks.3.attn.c_k.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "3f9ac300c516e69532ed50204399fac4af3401781da1f31f6d0a4b4d3734bdf9"
+   ],
+   "body.blocks.3.attn.c_v.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "5fe196941bf1b940e06671f7bd172bfa4ea570a9fba80cd69354fdb7068722b6"
+   ],
+   "body.blocks.3.attn.c_proj.weight": [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   "body.blocks.3.attn.value_embed.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "91833a1f07cb7060652eebd5a0af83c5762b23740420a4d856081a43d18f0555"
+   ],
+   "body.blocks.3.attn.ve_gate.weight": [
+    [
+     2,
+     12
+    ],
+    "torch.float32",
+    "5c918645152e8b63c0b71be914aa8911bd46254e384b3e4b9ea6991ae5d6e3c0"
+   ],
+   "body.blocks.3.mlp.c_fc.weight": [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "d379387743c78a3c6e6a93c8b0170f42088043404c8f43bad5cc62d20ead1e61"
+   ],
+   "body.blocks.3.mlp.c_proj.weight": [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   "unembedding.lm_head.weight": [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "eb55868a30a9a92a4d19eb2a271c4b7fc5c0315db02c5a8bf8f7775ac7590453"
+   ]
+  },
+  "multiset": [
+   [
+    [],
+    "torch.float32",
+    "0b9d79ff0fc4d0a77ef398763bbe45c445501e826219f2b6a1aa709411ab631d"
+   ],
+   [
+    [],
+    "torch.float32",
+    "26af537120e6f6681755f04998a5223da29779e890a29c67fa51da34a7c12ae1"
+   ],
+   [
+    [],
+    "torch.float32",
+    "4e8556aebed6a6890ee326c0119f1ce4259e96b1af2f8f5f77feacf97f2d4d5b"
+   ],
+   [
+    [],
+    "torch.float32",
+    "5059b35a51a066cc88e72daa9017c4e126068c6368cd3b9f45b4d8d5cc94b3e5"
+   ],
+   [
+    [],
+    "torch.float32",
+    "5af2169fc7e6a3268ca6146f2ba18f312fde17563e7dff42572633d9b0b92c7c"
+   ],
+   [
+    [],
+    "torch.float32",
+    "5d96a77c55b4ac1eea2d77815396c4349292b85e3b07beaca6aff933e7ef8752"
+   ],
+   [
+    [],
+    "torch.float32",
+    "5d96a77c55b4ac1eea2d77815396c4349292b85e3b07beaca6aff933e7ef8752"
+   ],
+   [
+    [],
+    "torch.float32",
+    "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+   ],
+   [
+    [],
+    "torch.float32",
+    "ea418640b9fd4008d3436ff251ae3612366a2acc83b4d846384ae196aa44c3f8"
+   ],
+   [
+    [],
+    "torch.float32",
+    "fb360f7241a770dc32cade9a1d1273c92b13bd4959b1c130931312b7fe95e63f"
+   ],
+   [
+    [
+     1,
+     24
+    ],
+    "torch.float32",
+    "248ff9822e048e83cb32ee07c8b853faa64704a157a6956e20e7da2c394ca20a"
+   ],
+   [
+    [
+     2,
+     12
+    ],
+    "torch.float32",
+    "091f5573c9f226be6c964e87976dc33a238a217c44ca31dfc08b98187fdd017b"
+   ],
+   [
+    [
+     2,
+     12
+    ],
+    "torch.float32",
+    "5c918645152e8b63c0b71be914aa8911bd46254e384b3e4b9ea6991ae5d6e3c0"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "11a138cc5066cc5f2d8485cb5b72d65482fe01d046318d2dc3b308c9a67e32d4"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "26eb225731abf4f5f6e137d290ba4988d35893c9082565ceadb5b32d6d569bda"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "3dd74eef3d7f3c2590361ae01658c052e37ee324277038712ea0c3252ed3e5db"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "3f9ac300c516e69532ed50204399fac4af3401781da1f31f6d0a4b4d3734bdf9"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4d110a62ec74311d6342b253eb32f09f60fedc6d3e92d3f0e3b81a3a1d1c0a2c"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "5edb7bdfe339262733920431efa799cbe0bf3e5394f2cd0caef8de604999b7b5"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "5fe196941bf1b940e06671f7bd172bfa4ea570a9fba80cd69354fdb7068722b6"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "65b30484e76064fb8eac6391e5d5ed54435a02a50a6ead2185bc7caa939655ae"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "9dfd3ed44b633bc0a243f296c149ff2c8df8b81cdc779c1146ade18d24702996"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "b27c3266dc9bd46bc2b6456cdd295b2efd68e793e967c274d22ef0fe99aff7ad"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "f68487d8c398c6577765a03253b672d556445d70962ea1782f999d0d0b4f348e"
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    "torch.float32",
+    "fde31834e75cddba35f20af717d6371be4f6215e96a5cc7bf47be1dba610ad1b"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    "torch.float32",
+    "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "25e1a1e69efa357fad205f7056e22de52f2b776cab494b284224d946290c7ee2"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "765fb08c22dc0a0cf4597e5def9c1f6a7f28ef9f5dd75599a9f5e7660e007196"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "91833a1f07cb7060652eebd5a0af83c5762b23740420a4d856081a43d18f0555"
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    "torch.float32",
+    "eb55868a30a9a92a4d19eb2a271c4b7fc5c0315db02c5a8bf8f7775ac7590453"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "11157e0a86081404d32a7d8c2d364e2fc57254f9ddb337d056680a207c4b679c"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "430e17246c5d4eef08a49989d280b6bba45669669df13c5482bfd55d52e6ebac"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "9da140f7348b89d3731d541d23ec057ec6a370c56bbdff0bd4c18bd112ee67de"
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    "torch.float32",
+    "d379387743c78a3c6e6a93c8b0170f42088043404c8f43bad5cc62d20ead1e61"
+   ]
+  ],
+  "num_tensors": 41,
+  "num_params": 229458
+ },
+ "accounting": {
+  "num_scaling_params": {
+   "embedding": 8192,
+   "smear": 25,
+   "matrix": 196656,
+   "resid_scalar": 4,
+   "x0_scalar": 4,
+   "value_embedding": 16384,
+   "backout_scalar": 1,
+   "unembedding": 8192,
+   "total": 229458
+  },
+  "num_matmul_params": 204872,
+  "estimate_flops": 1327536,
+  "estimate_decode_flops_256": 516240,
+  "estimate_prefill_flops_256": 125788160,
+  "kv_bytes_per_token": 2048,
+  "kv_read_bytes_256": 212992,
+  "kv_cache_spec": {
+   "num_heads": 2,
+   "head_dim": 32,
+   "num_kv_slots": 4
+  },
+  "layer_specs": [
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 0
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 1
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 128,
+    "kv_slot": 2
+   },
+   {
+    "n_head": 2,
+    "n_kv_head": 2,
+    "head_dim": 32,
+    "window": 32,
+    "kv_slot": 3
+   }
+  ],
+  "shape_summary": {
+   "n_layer": 4,
+   "n_embd": 64,
+   "n_head": 2,
+   "n_kv_head": 2,
+   "sequence_len": 32,
+   "window_pattern": "mixed"
+  }
+ },
+ "logits_hash": "b5ef1c61424dd55961487e41097637077a598da9ef2a78215811f45ff1112ace",
+ "optimizer_layout": [
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.013856406460551019,
+    "betas": [
+     0.8,
+     0.96
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.01,
+    "initial_lr": 0.013856406460551019
+   },
+   "shapes": [
+    [
+     128,
+     64
+    ]
+   ],
+   "num_params": 1
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.692820323027551,
+    "betas": [
+     0.8,
+     0.995
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.001,
+    "initial_lr": 0.692820323027551
+   },
+   "shapes": [
+    [
+     128,
+     64
+    ]
+   ],
+   "num_params": 1
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.3464101615137755,
+    "betas": [
+     0.8,
+     0.995
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.01,
+    "initial_lr": 0.3464101615137755
+   },
+   "shapes": [
+    [
+     128,
+     64
+    ],
+    [
+     128,
+     64
+    ]
+   ],
+   "num_params": 2
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.005,
+    "betas": [
+     0.8,
+     0.95
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.05,
+    "initial_lr": 0.005
+   },
+   "shapes": [
+    [],
+    [],
+    [],
+    []
+   ],
+   "num_params": 4
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.5,
+    "betas": [
+     0.96,
+     0.95
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.0,
+    "initial_lr": 0.5
+   },
+   "shapes": [
+    [],
+    [],
+    [],
+    []
+   ],
+   "num_params": 4
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.2,
+    "betas": [
+     0.8,
+     0.95
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.0,
+    "initial_lr": 0.2
+   },
+   "shapes": [
+    [],
+    [
+     1,
+     24
+    ]
+   ],
+   "num_params": 2
+  },
+  {
+   "hparams": {
+    "kind": "adamw",
+    "lr": 0.2,
+    "betas": [
+     0.8,
+     0.95
+    ],
+    "eps": 1e-10,
+    "weight_decay": 0.0,
+    "initial_lr": 0.2
+   },
+   "shapes": [
+    []
+   ],
+   "num_params": 1
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     2,
+     12
+    ],
+    [
+     2,
+     12
+    ]
+   ],
+   "num_params": 2
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ]
+   ],
+   "num_params": 16
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ]
+   ],
+   "num_params": 4
+  },
+  {
+   "hparams": {
+    "kind": "muon",
+    "lr": 0.02,
+    "momentum": 0.95,
+    "ns_steps": 5,
+    "beta2": 0.9,
+    "weight_decay": 0.0,
+    "initial_lr": 0.02
+   },
+   "shapes": [
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ]
+   ],
+   "num_params": 4
+  }
+ ],
+ "generate_naive_tokens": [
+  31,
+  76,
+  41,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66
+ ],
+ "generate_batch_tokens": [
+  31,
+  76,
+  41,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66,
+  21,
+  61,
+  86,
+  74,
+  121,
+  95,
+  97,
+  72,
+  66
+ ],
+ "optimizer_shard": {
+  "step": 0,
+  "num_groups": 11,
+  "num_state_entries": 0,
+  "group_param_shapes": [
+   [
+    [
+     128,
+     64
+    ]
+   ],
+   [
+    [
+     128,
+     64
+    ]
+   ],
+   [
+    [
+     128,
+     64
+    ],
+    [
+     128,
+     64
+    ]
+   ],
+   [
+    [],
+    [],
+    [],
+    []
+   ],
+   [
+    [],
+    [],
+    [],
+    []
+   ],
+   [
+    [
+     1,
+     24
+    ],
+    []
+   ],
+   [
+    []
+   ],
+   [
+    [
+     2,
+     12
+    ],
+    [
+     2,
+     12
+    ]
+   ],
+   [
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ],
+    [
+     64,
+     64
+    ]
+   ],
+   [
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ],
+    [
+     64,
+     256
+    ]
+   ],
+   [
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ],
+    [
+     256,
+     64
+    ]
+   ]
+  ],
+  "state_digest": {}
+ }
+}
