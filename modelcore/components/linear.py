@@ -7,7 +7,7 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings).
 
-    Also the structural marker nanochat.model.flops.num_matmul_params uses to find every
+    Also the structural marker modelcore.stats.num_matmul_params uses to find every
     matmul-participating parameter in a model: any new matmul must go through this class
     (rather than a raw nn.Linear or nn.Parameter) or FLOPs accounting will silently miss it."""
     def forward(self, x):

@@ -129,6 +129,26 @@ def test_num_matmul_params_matches_manual_scan(manager, config):
     assert stats.num_matmul_params == manual
 
 
+def test_llama_flavor_has_no_gpt_residual_topology_extras(manager):
+    """Structural proof of the roadmap's "boring baseline" claim: llama's tree has no value
+    embeddings, smear, or per-layer resid/x0 scalars -- unlike gpt, which has all four roles."""
+    llama_config = FLAVORS["llama"]()
+    model = build(manager, llama_config)
+    roles = collect_param_roles(model)
+    assert "value_embedding" not in roles
+    assert "smear" not in roles
+    assert "resid_scalar" not in roles
+    assert "x0_scalar" not in roles
+
+    gpt_config = FLAVORS["gpt"]()
+    gpt_model = build(manager, gpt_config)
+    gpt_roles = collect_param_roles(gpt_model)
+    assert "value_embedding" in gpt_roles
+    assert "smear" in gpt_roles
+    assert "resid_scalar" in gpt_roles and "x0_scalar" in gpt_roles
+    assert "backout_scalar" in gpt_roles
+
+
 def test_optimizer_groups_partition_parameters_exactly(manager, config):
     model = build(manager, config)
     optimizer = manager.create_optimizer(model, OptimizerHparams())

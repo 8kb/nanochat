@@ -128,7 +128,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
-    parser.add_argument('--arch', type=str, default='gpt', help='architecture name to filter auto-discovery by when --model-tag is not given (see nanochat.model.registry); ignored if --model-tag is set')
+    parser.add_argument('--arch', type=str, default='gpt', help='preset name to filter auto-discovery by when --model-tag is not given (see nanochat.architectures.presets); ignored if --model-tag is set')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')

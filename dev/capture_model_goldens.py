@@ -31,8 +31,11 @@ from nanochat import checkpoint_manager
 from nanochat.checkpoint_manager import load_checkpoint, load_model_from_dir, save_checkpoint
 from nanochat.common import get_base_dir
 from nanochat.engine import Engine, generate_naive
-from nanochat.model import get_config_class, get_model_class
-from tests.conftest import TINY_KWARGS_BY_ARCH
+# NOTE: capture_synthetic() and main() below import nanochat.model / tests.conftest.TINY_KWARGS_BY_ARCH
+# lazily, inside the functions that use them -- both were deleted along with nanochat/model/ at
+# Stage 7 step 5, so this module can still be imported (for its utility functions, reused by
+# tests/test_goldens.py and tests/test_modelcore.py) even though main()/capture_synthetic() can
+# no longer actually run; they only ever ran once, against the pre-Stage-7 commit.
 
 GOLDENS_DIR = os.path.join(os.path.dirname(__file__), "..", "tests", "goldens")
 TINY_DIR = os.path.join(GOLDENS_DIR, "tiny")
@@ -101,21 +104,48 @@ def state_dict_fingerprint(sd: dict) -> dict:
 
 
 def accounting(model) -> dict:
+    """Reused by tests/test_goldens.py to recompute the same numbers post-refactor. Handles both
+    a legacy nanochat.model.BaseModel-based model (the shape every number here was originally
+    captured against) and a modelcore.Model (post Stage 7 step 5, once checkpoint_manager itself
+    was rewired) -- see ModelManager.stats() for the latter. The one field whose *shape* legitimately
+    differs between the two -- num_scaling_params was GPT's own legacy six-key dict
+    (wte/value_embeds/lm_head/transformer_matrices/scalars/total), now modelcore's generic
+    role-keyed dict for every architecture uniformly -- is why tests/test_goldens.py compares its
+    *total* rather than the dict itself; every other field here is unaffected and compared exactly."""
+    if hasattr(model, "num_scaling_params"):
+        return {
+            "num_scaling_params": model.num_scaling_params(),
+            "num_matmul_params": model.num_matmul_params(),
+            "estimate_flops": model.estimate_flops(),
+            "estimate_decode_flops_256": model.estimate_decode_flops(256),
+            "estimate_prefill_flops_256": model.estimate_prefill_flops(256),
+            "kv_bytes_per_token": model.kv_bytes_per_token(),
+            "kv_read_bytes_256": model.kv_read_bytes(256),
+            "kv_cache_spec": model.kv_cache_spec(),
+            "layer_specs": [
+                {"n_head": s.n_head, "n_kv_head": s.n_kv_head, "head_dim": s.head_dim,
+                 "window": s.window, "kv_slot": s.kv_slot}
+                for s in model.layer_specs()
+            ],
+            "shape_summary": model.shape_summary(),
+        }
+    from modelcore import ModelManager
+    stats = ModelManager().stats(model.config)
     return {
-        "num_scaling_params": model.num_scaling_params(),
-        "num_matmul_params": model.num_matmul_params(),
-        "estimate_flops": model.estimate_flops(),
-        "estimate_decode_flops_256": model.estimate_decode_flops(256),
-        "estimate_prefill_flops_256": model.estimate_prefill_flops(256),
-        "kv_bytes_per_token": model.kv_bytes_per_token(),
-        "kv_read_bytes_256": model.kv_read_bytes(256),
-        "kv_cache_spec": model.kv_cache_spec(),
+        "num_scaling_params": stats.params_by_role,
+        "num_matmul_params": stats.num_matmul_params,
+        "estimate_flops": stats.flops_per_token,
+        "estimate_decode_flops_256": stats.decode_flops(256),
+        "estimate_prefill_flops_256": stats.prefill_flops(256),
+        "kv_bytes_per_token": stats.kv_bytes_per_token(),
+        "kv_read_bytes_256": stats.kv_read_bytes(256),
+        "kv_cache_spec": stats.kv_cache_spec,
         "layer_specs": [
             {"n_head": s.n_head, "n_kv_head": s.n_kv_head, "head_dim": s.head_dim,
              "window": s.window, "kv_slot": s.kv_slot}
-            for s in model.layer_specs()
+            for s in stats.layer_specs
         ],
-        "shape_summary": model.shape_summary(),
+        "shape_summary": stats.shape_summary,
     }
 
 
@@ -142,10 +172,24 @@ def _jsonify(d):
     return out
 
 
+def _build_optimizer(model):
+    """Dual-path, like accounting() above: a legacy model builds its own optimizer; a
+    modelcore.Model's optimizer comes from ModelManager.create_optimizer() instead (Model itself
+    carries no setup_optimizer method -- see modelcore/model.py)."""
+    if hasattr(model, "setup_optimizer"):
+        return model.setup_optimizer()
+    from modelcore import ModelManager
+    return ModelManager().create_optimizer(model)
+
+
 def optimizer_layout(model) -> list:
     """Freshly-built optimizer groups (default hparams), independent of whether a saved shard
-    exists -- captures role -> policy -> group order/hparams/shapes."""
-    optimizer = model.setup_optimizer()
+    exists -- captures role -> policy -> group order/hparams/shapes. NOTE: for a gpt-arch model,
+    the post-refactor group *count* legitimately differs by one from a pre-refactor golden's
+    recorded layout (backout_lambda moves from inside the "smear" role to its own "backout_scalar"
+    role -- see nanochat.architectures.legacy._split_backout_lambda_from_smear); every other
+    architecture's layout is unaffected. tests/test_goldens.py accounts for this."""
+    optimizer = _build_optimizer(model)
     groups = []
     for g in optimizer.param_groups:
         hparams = {k: v for k, v in g.items() if k != "params"}
@@ -159,17 +203,23 @@ def _find_optimizer_step(checkpoint_dir) -> int | None:
     return max(steps) if steps else None
 
 
-def optimizer_digest_from_dir(model, checkpoint_dir) -> dict | None:
-    """Load whatever optimizer shard is saved in `checkpoint_dir` (if any), patch it for this
+def optimizer_digest_from_dir(model, checkpoint_dir, raw_config_dict=None) -> dict | None:
+    """Load whatever optimizer shard is saved in `checkpoint_dir` (if any), migrate it for this
     model's config, and load it into a fresh optimizer -- records success plus a digest of every
     state tensor, so migration (positional flat-index splitting, role renaming) and plain
-    save/load round-tripping are both provably unchanged after the refactor."""
+    save/load round-tripping are both provably unchanged after the refactor. `raw_config_dict`
+    (the checkpoint's raw, pre-migration meta.json "model_config") selects the modelcore path via
+    nanochat.architectures.legacy; omit it for a legacy nanochat.model.BaseModel-based model."""
     step = _find_optimizer_step(checkpoint_dir)
     if step is None:
         return None
     _, optimizer_data, _ = load_checkpoint(checkpoint_dir, step, DEVICE, load_optimizer=True)
-    optimizer = model.setup_optimizer()
-    patched = type(model).patch_optimizer_state_dict(optimizer_data, model.config, log=lambda m: None)
+    optimizer = _build_optimizer(model)
+    if raw_config_dict is not None:
+        from nanochat.architectures import legacy
+        patched = legacy.migrate_optimizer_state_from_meta(optimizer_data, raw_config_dict, model.config.n_layer, log=lambda m: None)
+    else:
+        patched = type(model).patch_optimizer_state_dict(optimizer_data, model.config, log=lambda m: None)
     optimizer.load_state_dict(patched)
     state = optimizer.state_dict()
     state_digest = {
@@ -230,6 +280,8 @@ def capture_synthetic(arch, out_name, preset_kwargs=None):
         with torch.device("meta"):
             model = ComposedModel(config)
     else:
+        from nanochat.model import get_config_class, get_model_class
+        from tests.conftest import TINY_KWARGS_BY_ARCH
         config_cls = get_config_class(arch)
         model_cls = get_model_class(arch)
         kwargs = TINY_KWARGS_BY_ARCH[arch]
@@ -262,6 +314,8 @@ def capture_real(checkpoints_dir, tag, out_name):
 
 
 def main():
+    from tests.conftest import TINY_KWARGS_BY_ARCH
+
     os.makedirs(GOLDENS_DIR, exist_ok=True)
     os.makedirs(TINY_DIR, exist_ok=True)
 

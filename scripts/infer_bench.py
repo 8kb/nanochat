@@ -42,11 +42,12 @@ import torch
 from nanochat.common import compute_init, compute_cleanup, autodetect_device_type, get_peak_bandwidth, get_peak_flops
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+from modelcore import ModelManager
 
 # -----------------------------------------------------------------------------
 # Measurement
-# (the architecture-side cost accounting - FLOPs, KV cache bytes - lives on the
-# GPT model itself: estimate_decode_flops, estimate_prefill_flops, kv_bytes_per_token, kv_read_bytes)
+# (the architecture-side cost accounting - FLOPs, KV cache bytes - lives on
+# modelcore.ModelStats: decode_flops, prefill_flops, kv_bytes_per_token, kv_read_bytes)
 
 def weight_bytes(model):
     """Bytes of parameters as stored (each decode step reads all of them)."""
@@ -110,9 +111,12 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     assert ddp_world_size == 1, "infer_bench is a single GPU benchmark, run without torchrun"
 
+    manager = ModelManager()
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     config = model.config
-    engine = Engine(model, tokenizer)
+    stats = manager.stats(config)
+    shape = stats.shape_summary
+    engine = Engine(model, tokenizer, manager=manager)
 
     # Clamp the prompt so prompt + decode fits in the training context
     max_prompt = config.sequence_len - args.decode_tokens
@@ -129,9 +133,9 @@ def main():
     total_vram = torch.cuda.get_device_properties(device).total_memory
     w_bytes = weight_bytes(model)
     num_params = sum(p.numel() for p in model.parameters())
-    kv_store = model.kv_bytes_per_token()
+    kv_store = stats.kv_bytes_per_token()
     context_mid = prompt_len + args.decode_tokens // 2 # representative decode context
-    kv_read = model.kv_read_bytes(context_mid)
+    kv_read = stats.kv_read_bytes(context_mid)
     # tokens/sec ceiling at batch 1: every step must at least re-read weights + KV
     ceiling_bs1 = peak_bw / (w_bytes + kv_read)
     # how many rows of full-context KV fit next to the weights
@@ -139,7 +143,7 @@ def main():
 
     print("=" * 100)
     print(f"Model: {args.source} {meta.get('model_tag', '')} (step {meta['step']}) | "
-          f"depth {config.n_layer}, dim {config.n_embd}, heads {config.n_head}, kv heads {config.n_kv_head} (GQA)")
+          f"depth {shape['n_layer']}, dim {shape['n_embd']}, heads {shape['n_head']}, kv heads {shape['n_kv_head']} (GQA)")
     print(f"GPU: {device_name} | peak bandwidth {peak_bw/1e12:.2f} TB/s | peak compute {peak_flops/1e12:.0f} TFLOPS | VRAM {total_vram/2**30:.0f} GiB")
     print("-" * 100)
     dtype_counts = {}
@@ -149,7 +153,7 @@ def main():
     param_dtypes = ", ".join(f"{n:,} {dtype_name}" for dtype_name, n in sorted(dtype_counts.items()))
     print(f"Parameters: {num_params:,} ({param_dtypes}) | weight bytes as stored: {w_bytes/2**20:.0f} MiB")
     print(f"KV cache: {kv_store:,} bytes/token stored | {kv_read:,} bytes read/step at context {context_mid} "
-          f"(window pattern {config.window_pattern})")
+          f"(window pattern {shape['window_pattern']})")
     print(f"Theoretical decode ceiling at batch 1: {ceiling_bs1:,.0f} tok/s | "
           f"max ~{max_rows:,} full-context rows in VRAM")
     print("=" * 100)
@@ -170,7 +174,7 @@ def main():
         "kv_read_bytes_per_step": kv_read,
         "context_mid": context_mid,
         "peak_flops_per_sec": peak_flops if peak_flops != float("inf") else None,
-        "decode_flops_per_token": model.estimate_decode_flops(context_mid),
+        "decode_flops_per_token": stats.decode_flops(context_mid),
         "ceiling_bs1_tok_per_sec": round(ceiling_bs1, 1) if ceiling_bs1 != float("inf") else None,
         "max_full_context_rows": max_rows,
         "prompt_tokens": prompt_len,
@@ -185,7 +189,7 @@ def main():
     bench_generate(engine, prompt_tokens, 1, 2, args.temperature) # warmup
     prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature)
     prefill_time = prefill_result["ttft"]
-    prefill_mfu = 100 * model.estimate_prefill_flops(prompt_len) / prefill_time / peak_flops
+    prefill_mfu = 100 * stats.prefill_flops(prompt_len) / prefill_time / peak_flops
     prefill_tok_per_sec = prompt_len / prefill_time
     print(f"Prefill (batch 1, {prompt_len} tokens): {prefill_tok_per_sec:,.0f} tok/s | MFU {prefill_mfu:.1f}%")
     payload["prefill"] = {
@@ -218,7 +222,7 @@ def main():
         bytes_per_step = w_bytes + batch_size * kv_read
         mbu = 100 * (bytes_per_step / tpot) / peak_bw
         # MFU: FLOPs each decode step must do, over what the GPU can do
-        flops_per_step = batch_size * model.estimate_decode_flops(context_mid)
+        flops_per_step = batch_size * stats.decode_flops(context_mid)
         mfu = 100 * (flops_per_step / tpot) / peak_flops
         vram_gib = result["peak_vram"] / 2**30
         note = "" if num_steps == args.decode_tokens - 1 else f" (early stop @ {num_steps})"

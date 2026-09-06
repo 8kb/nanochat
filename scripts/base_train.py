@@ -25,12 +25,10 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.model import get_model_class, get_config_class, apply_arch_opts
-from nanochat.model.composed.model import ComposedModel
-from nanochat.model.composed.presets import resolve_composed_config, resolve_composed_reference_config
-from nanochat.model.param_roles import collect_param_roles
+from modelcore import Model, ModelManager, OptimizerHparams
+from modelcore.components.linear import Linear
+from nanochat.architectures import presets
 from nanochat.scaling import derive_training_plan, B_REF
-from nanochat.model.components.linear import Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,14 +50,14 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--arch", type=str, default="gpt", help="architecture name, registered under nanochat/model/ (see nanochat.model.registry)")
+parser.add_argument("--arch", type=str, default="gpt", help="preset name (gpt, llama, llama_kvshare, llama_kvshare_win -- see nanochat.architectures.presets), used unless --model-config is also given")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default=None, help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'); default is the architecture's own from_depth default (GPT: SSSL, Llama/LlamaKVShare: L) rather than one arch's default overriding another's")
 parser.add_argument("--arch-opt", action="append", default=None, metavar="KEY=VALUE", help="override an architecture-specific config field beyond from_depth's fixed kwargs, e.g. --arch-opt kv_share_frac=0.667 (repeatable)")
-parser.add_argument("--model-config", type=str, default=None, help="for --arch composed: either a registered preset name (gpt, llama, llama_kvshare, llama_kvshare_win -- expanded fresh at --depth, same as from_depth above) or a path to a materialized JSON tree dumped by scripts/model_info.py --dump-config")
+parser.add_argument("--model-config", type=str, default=None, help="overrides --arch: either a preset name (gpt, llama, llama_kvshare, llama_kvshare_win) or a path to a materialized JSON tree dumped by scripts/model_info.py --dump-config")
 parser.add_argument("--d-ref-scaling-params", type=int, default=None, help="skip re-deriving the muP d12 scaling-law reference model and use this scaling-param count directly; only needed for a --model-config JSON tree with no 'reference' block")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -134,10 +132,9 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def _parse_arch_opts(opt_strings):
-    """Same KEY=VALUE grammar as apply_arch_opts (nanochat.model.registry), but returns a plain
-    dict of constructor kwargs for a composed preset function instead of dataclasses.replace()'ing
-    a flat config -- a composed preset has no fixed field set to validate keys against, so a typo
-    surfaces as that preset function's own TypeError rather than a friendlier assertion."""
+    """KEY=VALUE grammar for --arch-opt: returns a plain dict of constructor kwargs for a preset
+    expander (nanochat.architectures.presets.expand). A preset function has no fixed field set to
+    validate keys against, so a typo surfaces as that function's own TypeError."""
     opts = {}
     for raw in (opt_strings or []):
         assert "=" in raw, f"--arch-opt must be KEY=VALUE, got {raw!r}"
@@ -146,60 +143,41 @@ def _parse_arch_opts(opt_strings):
     return opts
 
 
+manager = ModelManager()
+
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data).
 
-    For --arch composed, --model-config is either a registered preset name (gpt, llama,
-    llama_kvshare, llama_kvshare_win -- expanded fresh at `depth` via
-    nanochat.model.composed.presets, exactly like from_depth below) or a path to a materialized
-    JSON tree (loaded once for the real depth; called again with depth=12 below for the muP
-    scaling-law reference model, which re-expands via the tree's own config.reference block --
-    see resolve_composed_reference_config).
-
-    Otherwise, architecture is selected via --arch; the config class it registers must implement
-    from_depth(...) (the --depth/--aspect-ratio/--head-dim muP-style dial), matching
-    GPTConfig.from_depth in nanochat/model/gpt/config.py. --window-pattern is only passed through
-    when explicitly given, so each architecture's own from_depth default (e.g. GPT's SSSL vs.
-    Llama's L) applies rather than one arch's CLI default silently overriding another's.
-    --arch-opt KEY=VALUE overrides reach fields from_depth's fixed kwarg set doesn't know about
-    (e.g. LlamaKVShareConfig.kv_share_frac)."""
-    if args.arch == "composed":
-        # Resolved once at the real --depth regardless of which `depth` was asked for here, so
-        # the muP d12 scaling-law reference call below (depth=12) re-expands via the resolved
-        # config's own `reference` block instead of re-reading/re-interpreting --model-config at
-        # a depth it wasn't written for (a --model-config JSON file has its own fixed n_layer,
-        # unrelated to whatever `depth` happens to be passed in).
-        real_config = resolve_composed_config(
-            args.model_config, args.depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
-            max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
-            arch_opts=_parse_arch_opts(args.arch_opt),
-        )
-        config = real_config if depth == args.depth else resolve_composed_reference_config(real_config, depth)
-        with torch.device("meta"):
-            return ComposedModel(config)
-
-    config_cls = get_config_class(args.arch)
-    model_cls = get_model_class(args.arch)
-    assert hasattr(config_cls, "from_depth"), (
-        f"Architecture {args.arch!r} ({config_cls.__name__}) has no from_depth(...) classmethod; "
-        "the --depth/--aspect-ratio/--head-dim CLI dial requires one (see GPTConfig.from_depth)."
+    --model-config overrides --arch: either a preset name (gpt, llama, llama_kvshare,
+    llama_kvshare_win -- expanded fresh at `depth` via nanochat.architectures.presets) or a path
+    to a materialized JSON tree (loaded once for the real depth; called again with depth=12 below
+    for the muP scaling-law reference model, which re-expands via the tree's own config.reference
+    block -- see presets.resolve_reference_config). Resolved once at the real --depth regardless
+    of which `depth` was asked for here, so the d12 reference call re-expands via the resolved
+    config's own `reference` block instead of re-reading --model-config at a depth it wasn't
+    written for (a JSON file has its own fixed n_layer, unrelated to whatever `depth` is passed
+    in). --window-pattern is only passed through when explicitly given, so each preset's own
+    default (e.g. gpt's SSSL vs. llama's L) applies rather than one arch's default silently
+    overriding another's. --arch-opt KEY=VALUE overrides reach fields the depth dial doesn't know
+    about (e.g. kv_share_frac)."""
+    model_config_selector = args.model_config or args.arch
+    real_config = presets.resolve_model_config(
+        model_config_selector, args.depth, aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+        max_seq_len=args.max_seq_len, vocab_size=vocab_size, window_pattern=args.window_pattern,
+        arch_opts=_parse_arch_opts(args.arch_opt),
     )
-    from_depth_kwargs = dict(aspect_ratio=args.aspect_ratio, head_dim=args.head_dim, max_seq_len=args.max_seq_len, vocab_size=vocab_size)
-    if args.window_pattern is not None:
-        from_depth_kwargs["window_pattern"] = args.window_pattern
-    config = config_cls.from_depth(depth, **from_depth_kwargs)
-    config = apply_arch_opts(config, args.arch_opt)
+    config = real_config if depth == args.depth else presets.resolve_reference_config(real_config, depth)
     with torch.device("meta"):
-        model_meta = model_cls(config)
-    return model_meta
+        return Model(config, runtime=manager.runtime)
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = model_config.to_dict()
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-has_sliding_window = any(0 <= spec.window < model_config.sequence_len for spec in model.layer_specs())
-if not using_fa3 and has_sliding_window:
+model_stats = manager.stats(model_config)
+if not using_fa3 and model_stats.has_sliding_window:
     print0("WARNING: SDPA's sliding window support falls back to an explicit attention mask instead of a fused kernel for at least one layer. Your GPU utilization will be terrible.")
     print0("WARNING: Recommend full-context attention (every layer's window >= sequence_len) without FA3.")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
@@ -209,7 +187,7 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 if args.model_tag:
     output_dirname = args.model_tag
-elif args.arch == "composed":
+elif args.model_config:
     config_id = os.path.splitext(os.path.basename(args.model_config))[0] # preset name, or a JSON file's stem
     output_dirname = f"composed_{config_id}_d{model_config.n_layer}"
 else:
@@ -219,7 +197,6 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model_data = get_model_class(args.arch).patch_state_dict(model_data, model_config, log=print0)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -314,36 +291,37 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 # anything; this script owns every print statement (some are grepped verbatim by
 # runs/scaling_laws.sh and runs/miniseries.sh -- see AGENTS.md).
 
-# Get the parameter counts of our model
-param_counts = model.num_scaling_params()
+# Get the parameter counts of our model. Every architecture used to present a different key set
+# (GPT's own six-key dict, everything else a generic role-named default); one materialized-tree
+# system means one presentation, mapping modelcore's generic role names to the same six legacy
+# keys runs/scaling_laws.sh greps verbatim out of this script's stdout (see AGENTS.md).
+def _legacy_scaling_keys(role_counts):
+    return {
+        'wte': role_counts.get('embedding', 0),
+        'value_embeds': role_counts.get('value_embedding', 0),
+        'lm_head': role_counts.get('unembedding', 0),
+        'transformer_matrices': role_counts.get('matrix', 0),
+        'scalars': (role_counts.get('resid_scalar', 0) + role_counts.get('x0_scalar', 0)
+                    + role_counts.get('smear', 0) + role_counts.get('backout_scalar', 0)),
+        'total': sum(role_counts.values()),
+    }
+param_counts = _legacy_scaling_keys(model_stats.params_by_role)
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model_stats.flops_per_token
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-def get_scaling_params(m):
-    # As for which params to use exactly, matrix + unembedding params gives cleanest scaling laws
-    # (see dev/LOG.md Jan 27, 2026). Reads role names directly via collect_param_roles rather than
-    # m.num_scaling_params()'s dict keys: role names ("matrix", "unembedding") are stable across
-    # architectures by construction, but num_scaling_params()'s keys are a presentation layer --
-    # GPT overrides it to keep legacy names ("transformer_matrices", "lm_head") that
-    # runs/scaling_laws.sh greps, while other architectures use BaseModel's generic role-named
-    # default (see nanochat/model/base.py).
-    roles = collect_param_roles(m)
-    matrix = sum(p.numel() for p in roles.get('matrix', []))
-    unembedding = sum(p.numel() for p in roles.get('unembedding', []))
-    return matrix + unembedding
-num_scaling_params = get_scaling_params(model)
+num_scaling_params = model_stats.num_scaling_params
 print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})") # runs/miniseries.sh greps this exact line
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 if args.d_ref_scaling_params is not None:
     d_ref_scaling_params = args.d_ref_scaling_params
 else:
-    d12_ref = build_model_meta(12) # creates the model on meta device
-    d_ref_scaling_params = get_scaling_params(d12_ref)
+    d12_ref_config = build_model_meta(12).config # creates the config for the muP reference model
+    d_ref_scaling_params = manager.stats(d12_ref_config).num_scaling_params
 
 plan = derive_training_plan(
     num_scaling_params=num_scaling_params,
@@ -379,18 +357,15 @@ print0(f"Total training FLOPs estimate: {plan.total_flops:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
+optimizer = manager.create_optimizer(orig_model, OptimizerHparams(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
-)
+))
 
 if resuming:
-    optimizer_data = get_model_class(args.arch).patch_optimizer_state_dict(optimizer_data, model_config, log=print0)
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 

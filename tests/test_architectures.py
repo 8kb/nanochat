@@ -78,6 +78,59 @@ def test_expand_matches_pre_refactor_golden(manager, preset, kwargs):
     assert _tensor_hash(logits.float()) == golden["logits_hash"]
 
 
+def test_expand_llama_kvshare_materializes_derive_compute_kv_slots_exactly():
+    from nanochat.architectures.derive import compute_kv_slots
+
+    n_layer, kv_share_frac = 8, 0.5
+    config = presets.expand_llama_kvshare(depth=n_layer, aspect_ratio=16, head_dim=32,
+                                           max_seq_len=32, vocab_size=128, kv_share_frac=kv_share_frac)
+    expected_slots = compute_kv_slots(n_layer, kv_share_frac)
+    n_own = max(expected_slots) + 1
+    actual_slots = [b.params["kv_slot"] for b in config.body.params["blocks"]]
+    actual_produces_kv = [b.params["produces_kv"] for b in config.body.params["blocks"]]
+    assert actual_slots == expected_slots
+    assert actual_produces_kv == [slot == i for i, slot in enumerate(expected_slots)]
+    assert sum(actual_produces_kv) == n_own < n_layer
+
+
+def test_expand_llama_kvshare_win_windows_match_compute_window_sizes():
+    from nanochat.architectures.derive import compute_window_sizes
+
+    n_layer, pattern, seq_len = 8, "SSSL", 512
+    config = presets.expand_llama_kvshare_win(depth=n_layer, aspect_ratio=16, head_dim=32,
+                                               max_seq_len=seq_len, vocab_size=128,
+                                               window_pattern=pattern, kv_share_frac=0.5)
+    expected = compute_window_sizes(pattern, n_layer, seq_len)
+    actual = [b.params["window"] for b in config.body.params["blocks"]]
+    assert actual == expected
+    assert actual[-1] == seq_len  # final layer always forced to full context
+
+
+def test_kv_sharing_strictly_shrinks_params_and_kv_bytes_vs_plain_llama(manager):
+    """Same shape, only kv_share_frac differs from plain llama's implicit "no sharing" -- sharing
+    should have strictly fewer params (dropped c_k/c_v on consumer layers) and strictly fewer
+    KV-cache bytes/token (fewer distinct slots)."""
+    dims = dict(depth=4, aspect_ratio=16, head_dim=32, max_seq_len=32, vocab_size=128)
+    llama = presets.expand_llama(**dims)
+    kvshare = presets.expand_llama_kvshare(**dims, kv_share_frac=0.5)
+    llama_stats = manager.stats(llama)
+    kvshare_stats = manager.stats(kvshare)
+    assert kvshare_stats.num_params < llama_stats.num_params
+    assert kvshare_stats.kv_bytes_per_token() < llama_stats.kv_bytes_per_token()
+
+
+def test_windowing_lowers_flops_at_identical_param_count(manager):
+    """Windowing changes nothing about parameter count (it's a mask, not a shape change) but
+    strictly lowers FLOPs/token relative to full-context at the same shape. sequence_len=512
+    because compute_window_sizes's short-window formula rounds up to a 128-token tile, so at
+    tiny sequence lengths "short" already has no effect once _effective_window caps it."""
+    dims = dict(depth=4, aspect_ratio=16, head_dim=32, max_seq_len=512, vocab_size=128, kv_share_frac=0.5)
+    full_context = presets.expand_llama_kvshare(**dims, window_pattern="L")
+    windowed = presets.expand_llama_kvshare_win(**dims, window_pattern="SL")
+    assert manager.stats(windowed).num_params == manager.stats(full_context).num_params
+    assert manager.stats(windowed).flops_per_token < manager.stats(full_context).flops_per_token
+
+
 def test_expand_unknown_preset_raises(manager):
     with pytest.raises(ValueError, match="Unknown preset"):
         presets.expand("nonexistent", depth=4)

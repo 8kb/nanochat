@@ -7,20 +7,22 @@ exercise the tokenizer-fingerprint match/mismatch/unknown reporting this stage a
 python -m pytest tests/test_model_info.py -v
 """
 
-import json
 import argparse
 
 import pytest
 
+from modelcore import ModelManager
+from nanochat.architectures import presets
 from nanochat.checkpoint_manager import save_checkpoint
-from tests.conftest import build_tiny_model, TINY_KWARGS_BY_ARCH
 
 from scripts import model_info
+
+PRESET_NAMES = ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"]
 
 
 def _args(**overrides):
     defaults = dict(
-        aspect_ratio=64, head_dim=16, max_seq_len=32, window_pattern=None, arch_opt=None,
+        arch="gpt", aspect_ratio=64, head_dim=16, max_seq_len=32, window_pattern=None, arch_opt=None,
         model_config=None, d_ref_scaling_params=None,
         target_param_data_ratio=12, target_flops=-1.0, num_iterations=-1, total_batch_size=-1,
         weight_decay=0.28, gpu=None, num_gpus=1, mfu=0.4, kv_batch_size=1,
@@ -29,56 +31,54 @@ def _args(**overrides):
     return argparse.Namespace(**defaults)
 
 
-@pytest.mark.parametrize("arch", list(TINY_KWARGS_BY_ARCH.keys()))
-def test_inspect_one_config_mode_smoke(arch):
-    """Every registered architecture can be inspected purely from --arch/--depth (no checkpoint,
-    no data, no training) -- this is the tool's primary use case."""
-    row = model_info.inspect_one(arch, 4, _args(), vocab_size=128)
-    assert row["arch"] == arch
+@pytest.mark.parametrize("preset", PRESET_NAMES)
+def test_inspect_one_config_mode_smoke(preset):
+    """Every preset can be inspected purely from --arch/--depth (no checkpoint, no data, no
+    training) -- this is the tool's primary use case."""
+    row = model_info.inspect_one(preset, 4, _args(arch=preset), vocab_size=128)
+    assert row["arch"] == preset
     assert row["params"]["total"] > 0
     assert row["flops"]["per_token"] > 0
     assert row["training_plan"]["num_iterations"] > 0
 
 
-@pytest.mark.parametrize("preset", ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"])
-def test_inspect_one_composed_config_mode_smoke(preset):
-    """arch="composed" is inspected via --model-config (a preset name here) rather than bare
-    --depth -- see scripts/model_info.py's _build_composed_meta."""
-    row = model_info.inspect_one("composed", 4, _args(model_config=preset), vocab_size=128)
-    assert row["arch"] == "composed"
-    assert row["params"]["total"] > 0
-    assert row["flops"]["per_token"] > 0
-    assert row["training_plan"]["num_iterations"] > 0
-    # Same shape as the native architecture the preset expands -- direct cross-check.
-    native_row = model_info.inspect_one(preset, 4, _args(), vocab_size=128)
-    assert row["params"]["total"] == native_row["params"]["total"]
-    assert row["flops"]["per_token"] == native_row["flops"]["per_token"]
+@pytest.mark.parametrize("preset", PRESET_NAMES)
+def test_inspect_one_via_model_config_matches_via_arch(preset):
+    """--model-config <preset> (overriding --arch) resolves to exactly the same tree as bare
+    --arch <preset> -- the two are the same code path (see model_info.build_config)."""
+    via_model_config = model_info.inspect_one("gpt", 4, _args(model_config=preset), vocab_size=128)
+    via_arch = model_info.inspect_one(preset, 4, _args(arch=preset), vocab_size=128)
+    assert via_model_config["params"]["total"] == via_arch["params"]["total"]
+    assert via_model_config["flops"]["per_token"] == via_arch["flops"]["per_token"]
 
 
 def test_dump_config_round_trips_through_model_config():
     """The dump -> edit -> train bridge: --dump-config's output must be exactly what
-    resolve_composed_config accepts back as a --model-config file."""
+    presets.resolve_model_config accepts back as a --model-config file."""
     import json
     import tempfile
-    from nanochat.model.composed.presets import expand_preset, resolve_composed_config
 
-    config = expand_preset("gpt", depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    config = presets.expand("gpt", depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(config.to_dict(), f)
+        json.dump(ModelManager().config_to_dict(config), f)
         path = f.name
-    reloaded = resolve_composed_config(path, depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    reloaded = presets.resolve_model_config(path, depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
     assert reloaded == config
 
 
-def _save_tiny_checkpoint(base_dir, tag, arch, tokenizer_fingerprint=None, core_metric=None):
-    model = build_tiny_model(arch)
+def _save_tiny_checkpoint(base_dir, tag, preset, tokenizer_fingerprint=None, core_metric=None, **preset_kwargs):
+    manager = ModelManager()
+    kwargs = dict(depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    kwargs.update(preset_kwargs)
+    config = presets.expand(preset, **kwargs)
+    model = manager.create_model(config, device="cpu", seed=0)
     checkpoint_dir = base_dir / "base_checkpoints" / tag
     meta = {
         "step": 3,
         "val_bpb": 1.23,
         "core_metric": core_metric,
         "tokenizer_fingerprint": tokenizer_fingerprint,
-        "model_config": model.config.to_dict(),
+        "model_config": manager.config_to_dict(config),
         "total_batch_size": 1024,
         "user_config": {"depth": 4},
         "loop_state": {"total_training_time": 60.0},
@@ -118,6 +118,28 @@ def test_inspect_checkpoint_unknown_when_fingerprint_missing(tmp_path, monkeypat
 
     row = model_info.inspect_checkpoint("gpt_tiny", _args(), local_fingerprint="abc123")
     assert row["trained"]["tokenizer_fingerprint_status"] == "unknown"
+
+
+def test_inspect_checkpoint_migrates_a_legacy_flat_config(tmp_path, monkeypatch):
+    """A checkpoint's model_config predating modelcore (no "format" key) must still be
+    inspectable -- routed through nanochat.architectures.legacy just like checkpoint_manager."""
+    monkeypatch.setattr(model_info, "get_base_dir", lambda: str(tmp_path))
+    manager = ModelManager()
+    config = presets.expand("llama", depth=4, aspect_ratio=16, head_dim=16, max_seq_len=32, vocab_size=128)
+    model = manager.create_model(config, device="cpu", seed=0)
+    flat_config = {
+        "sequence_len": config.sequence_len, "vocab_size": config.vocab_size, "n_layer": 4,
+        "n_head": config.n_embd // 16, "n_kv_head": config.n_embd // 16, "n_embd": config.n_embd,
+        "window_pattern": "L", "arch": "llama",
+    }
+    checkpoint_dir = tmp_path / "base_checkpoints" / "llama_legacy"
+    save_checkpoint(str(checkpoint_dir), step=0, model_data=model.state_dict(), optimizer_data=None,
+                     meta_data={"step": 0, "model_config": flat_config})
+
+    row = model_info.inspect_checkpoint("llama_legacy", _args(), local_fingerprint=None)
+    assert row["arch"] == "llama"
+    assert row["shape"]["n_layer"] == 4
+    assert row["params"]["total"] > 0
 
 
 def test_list_checkpoint_tags_explicit_list(tmp_path, monkeypatch):

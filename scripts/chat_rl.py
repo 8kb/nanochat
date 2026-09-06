@@ -25,6 +25,7 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
+from modelcore import ModelManager, OptimizerHparams
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -194,12 +195,13 @@ def run_gsm8k_eval(task, tokenizer, engine,
 # Training loop
 
 # Init the optimizer
-optimizer = model.setup_optimizer(
+manager = ModelManager()
+optimizer = manager.create_optimizer(model, OptimizerHparams(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
-)
+))
 
 # Set the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:

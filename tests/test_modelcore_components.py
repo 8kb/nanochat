@@ -1,21 +1,23 @@
 """
-Test the reusable building blocks under nanochat/model/components/. CPU-only, no real model
-needed -- these operate directly on small tensors.
+Test the reusable building blocks under modelcore/components/, plus the window-pattern
+derivation rule (now outside modelcore -- see nanochat/architectures/derive.py). CPU-only, no
+real model needed -- these operate directly on small tensors.
 
-python -m pytest tests/test_model_components.py -v
+python -m pytest tests/test_modelcore_components.py -v
 """
 
 import torch
 import torch.nn.functional as F
 import pytest
 
-from nanochat.model.components.rope import apply_rotary_emb, precompute_rotary_embeddings
-from nanochat.model.components.norm import norm
-from nanochat.model.components.linear import Linear
-from nanochat.model.components.windows import compute_window_sizes
-from nanochat.model.components.embedding import Smear
-from nanochat.model.components.unembedding import LMHead
-from nanochat.model.components.rotary import RotaryEmbedding
+from modelcore.components.rope import apply_rotary_emb, precompute_rotary_embeddings
+from modelcore.components.norm import norm
+from modelcore.components.linear import Linear
+from modelcore.components.mlp import SwiGLUMLP
+from modelcore.components.embedding import Smear
+from modelcore.components.unembedding import LMHead
+from modelcore.components.rotary import RotaryEmbedding
+from nanochat.architectures.derive import compute_window_sizes
 
 
 # -----------------------------------------------------------------------------
@@ -74,26 +76,38 @@ def test_linear_casts_activations_but_keeps_fp32_master_weight():
 
 
 # -----------------------------------------------------------------------------
-# windows
+# MLP variants
+
+def test_swiglu_mlp_shape_and_finite():
+    mlp = SwiGLUMLP(n_embd=32)
+    mlp.init_weights()
+    x = torch.randn(2, 5, 32)
+    y = mlp(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+# -----------------------------------------------------------------------------
+# window-pattern derivation (nanochat.architectures.derive.compute_window_sizes)
 
 def test_compute_window_sizes_full_context():
     ws = compute_window_sizes("L", n_layer=4, sequence_len=512)
-    assert ws == [(512, 0)] * 4
+    assert ws == [512] * 4
 
 
 def test_compute_window_sizes_last_layer_always_full_context():
     # Every layer requests a short window, but the final layer is always forced to full context.
     ws = compute_window_sizes("SS", n_layer=3, sequence_len=1024)
-    assert ws[0][0] < 1024 and ws[1][0] < 1024
-    assert ws[-1] == (1024, 0)
+    assert ws[0] < 1024 and ws[1] < 1024
+    assert ws[-1] == 1024
 
 
 def test_compute_window_sizes_tiles_pattern_across_layers():
     ws = compute_window_sizes("SL", n_layer=4, sequence_len=2048)
-    assert ws[0][0] < 2048  # S
-    assert ws[1] == (2048, 0)  # L
-    assert ws[2][0] < 2048  # S (pattern repeats)
-    assert ws[3] == (2048, 0)  # L, also forced as the last layer
+    assert ws[0] < 2048  # S
+    assert ws[1] == 2048  # L
+    assert ws[2] < 2048  # S (pattern repeats)
+    assert ws[3] == 2048  # L, also forced as the last layer
 
 
 def test_compute_window_sizes_invalid_chars_assert():
@@ -102,7 +116,7 @@ def test_compute_window_sizes_invalid_chars_assert():
 
 
 # -----------------------------------------------------------------------------
-# Smear (nanochat.model.components.embedding)
+# Smear (modelcore.components.embedding)
 
 def test_smear_token_by_token_decode_matches_full_sequence():
     """Feeding one token at a time through the KV-cache decode path must reproduce, position by
@@ -146,7 +160,7 @@ def test_smear_prefill_matches_full_sequence_and_caches_last_position():
 
 
 # -----------------------------------------------------------------------------
-# LMHead (nanochat.model.components.unembedding)
+# LMHead (modelcore.components.unembedding)
 
 def test_lm_head_softcap_bounds_logits_and_crops_vocab():
     n_embd, vocab_size, padded = 8, 20, 32
@@ -180,7 +194,7 @@ def test_lm_head_tied_weight_shares_storage_and_declares_no_role():
 
 
 # -----------------------------------------------------------------------------
-# RotaryEmbedding (nanochat.model.components.rotary)
+# RotaryEmbedding (modelcore.components.rotary)
 
 def test_rotary_embedding_offset_matches_manual_slice():
     head_dim, seq_len = 8, 16

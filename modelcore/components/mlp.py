@@ -31,8 +31,8 @@ class SwiGLUMLP(nn.Module):
     expansion (to keep matmul FLOPs roughly matched to a plain 4x MLP despite the extra gate
     projection), rounded up to a multiple of multiple_of for clean tiling.
 
-    All three projections are nanochat.model.components.linear.Linear, so they default to
-    PARAM_ROLES role "matrix" (see nanochat.model.param_roles) with no declaration needed here."""
+    All three projections are modelcore.components.linear.Linear, so they default to
+    PARAM_ROLES role "matrix" (see modelcore.roles) with no declaration needed here."""
 
     def __init__(self, n_embd, multiple_of=256):
         super().__init__()

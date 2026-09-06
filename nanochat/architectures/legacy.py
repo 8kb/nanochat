@@ -55,11 +55,14 @@ def _materialize_plain(cfg: dict) -> ModelConfig:
 
 
 def migrate_config(config_dict: dict) -> ModelConfig:
-    """Any config dict with no "format" key -- every checkpoint saved before modelcore existed,
-    regardless of which of the four flat architectures produced it (missing "arch" defaults to
-    "gpt", the only architecture old enough to predate that key too)."""
-    if "format" in config_dict:
-        return ModelConfig.from_dict(config_dict)  # already current; nothing to migrate
+    """Any config dict with no "format" key -- every checkpoint saved before modelcore existed.
+    Stage 6's "composed" architecture (arch="composed") is already a materialized tree in exactly
+    modelcore's shape (it predates modelcore only in name, stamping "arch" where modelcore stamps
+    "format") -- ModelConfig.from_dict reads it directly, ignoring the leftover "arch" key it
+    never looks at. Every *other* arch is a flat, per-layer-derivable config (missing "arch"
+    defaults to "gpt", the only architecture old enough to predate that key too)."""
+    if "format" in config_dict or config_dict.get("arch") == "composed":
+        return ModelConfig.from_dict(config_dict)  # already a materialized tree; nothing to migrate
     cfg = patch_missing_config_keys(dict(config_dict))
     arch = cfg.pop("arch", "gpt")
     if arch not in _FLAT_ARCH_EXPANDERS:
@@ -249,6 +252,16 @@ def migrate_optimizer_state(optimizer_data: dict, config_dict: dict, arch: str, 
     optimizer_data = _patch_resid_x0_split(optimizer_data, n_layer, log=log)
     optimizer_data = _split_backout_lambda_from_smear(optimizer_data, log=log)
     return optimizer_data
+
+
+def migrate_optimizer_state_from_meta(optimizer_data: dict, config_dict: dict, n_layer: int,
+                                       log=lambda msg: None) -> dict:
+    """Same as migrate_optimizer_state, but derives `arch` from config_dict itself -- for a
+    caller (e.g. scripts/chat_sft.py's --load-optimizer) that has the checkpoint's raw
+    meta.json["model_config"] dict but not necessarily the arch it already resolved for the model
+    side of the same checkpoint."""
+    arch = config_dict.get("arch", "gpt") if "format" not in config_dict else None
+    return migrate_optimizer_state(optimizer_data, config_dict, arch or "gpt", n_layer, log=log)
 
 
 # -----------------------------------------------------------------------------

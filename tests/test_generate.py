@@ -1,17 +1,19 @@
 """
 Test that nanochat.engine.generate_naive (no KV cache, recomputes the full forward every step)
 and Engine.generate (KV cache, prefill + decode) agree exactly at temperature=0. This exercises
-KV cache allocation via kv_cache_spec(), the RoPE position offset from kv_cache.get_pos(), and
-(for GPT) the smear decode path (kv_cache.state["prev_embedding"]) together, for both a
-full-context and a sliding-window attention pattern, and for every registered architecture.
+KV cache allocation via ModelManager.new_kv_cache(), the RoPE position offset from
+kv_cache.get_pos(), and (for gpt) the smear decode path (kv_cache.state["prev_embedding"])
+together, for both a full-context and a sliding-window attention pattern, and for every preset.
 
 python -m pytest tests/test_generate.py -v
 """
 
 import pytest
+import torch
 
+from modelcore import ModelManager
+from nanochat.architectures import presets
 from nanochat.engine import Engine, generate_naive
-from tests.conftest import build_tiny_model
 
 
 class _FakeTokenizer:
@@ -40,16 +42,26 @@ class _FakeTokenizer:
         return "".join(str(i) for i in ids)
 
 
-@pytest.mark.parametrize("arch", ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"])
+def _build(preset, window_pattern, manager, **extra):
+    kwargs = dict(depth=4, aspect_ratio=16, head_dim=32, max_seq_len=32, vocab_size=128, window_pattern=window_pattern)
+    kwargs.update(extra)
+    config = presets.expand(preset, **kwargs)
+    return manager.create_model(config, device=torch.device("cpu"), seed=0)
+
+
+@pytest.mark.parametrize("preset,extra", [
+    ("gpt", {}), ("llama", {}), ("llama_kvshare", {"kv_share_frac": 0.5}), ("llama_kvshare_win", {"kv_share_frac": 0.5}),
+])
 @pytest.mark.parametrize("window_pattern", ["L", "SSSL"])
-def test_generate_naive_matches_engine_generate_at_temperature_zero(window_pattern, arch):
-    model = build_tiny_model(arch, window_pattern=window_pattern)
+def test_generate_naive_matches_engine_generate_at_temperature_zero(window_pattern, preset, extra):
+    manager = ModelManager()
+    model = _build(preset, window_pattern, manager, **extra)
     tokenizer = _FakeTokenizer(model.config.vocab_size)
     prompt = [1, 2, 3, 4]
 
     naive_tokens = list(generate_naive(model, prompt, max_tokens=8, temperature=0.0))
 
-    engine = Engine(model, tokenizer)
+    engine = Engine(model, tokenizer, manager=manager)
     results, masks = engine.generate_batch(prompt, num_samples=1, max_tokens=8, temperature=0.0)
     engine_tokens = results[0][len(prompt):]
 

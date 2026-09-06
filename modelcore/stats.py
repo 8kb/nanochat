@@ -115,10 +115,10 @@ def kv_cache_spec(layer_specs) -> dict:
 
 
 def shape_summary(config, layer_specs) -> dict:
-    """n_layer/n_embd/n_head/n_kv_head/sequence_len/window, reporting "mixed" wherever layers
-    disagree -- a materialized tree's per-layer choices can vary by construction, so this is the
-    one implementation every config gets (a uniform tree just degenerates to a single value
-    everywhere, rather than needing a separate "flat config" code path)."""
+    """n_layer/n_embd/n_head/n_kv_head/sequence_len/window_pattern, reporting "mixed" wherever
+    layers disagree -- a materialized tree's per-layer choices can vary by construction, so this
+    is the one implementation every config gets (a uniform tree just degenerates to a single
+    value everywhere, rather than needing a separate "flat config" code path)."""
     n_heads = {s.n_head for s in layer_specs}
     n_kv_heads = {s.n_kv_head for s in layer_specs}
     windows = {s.window for s in layer_specs}
@@ -127,7 +127,7 @@ def shape_summary(config, layer_specs) -> dict:
         "n_head": next(iter(n_heads)) if len(n_heads) == 1 else "mixed",
         "n_kv_head": next(iter(n_kv_heads)) if len(n_kv_heads) == 1 else "mixed",
         "sequence_len": config.sequence_len,
-        "window": next(iter(windows)) if len(windows) == 1 else "mixed",
+        "window_pattern": next(iter(windows)) if len(windows) == 1 else "mixed",
     }
 
 

@@ -17,8 +17,9 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type, COMPUTE_DTYPE
+from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
+from modelcore import ModelManager
 from modelcore.cache import KVCache
 
 # -----------------------------------------------------------------------------
@@ -146,17 +147,16 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, manager=None):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        self.manager = manager or ModelManager() # owns KV-cache allocation (model.kv_cache_spec() is not part of Model's public surface -- see modelcore/model.py)
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # Allocate the KV cache in the compute dtype so it matches what the forward pass emits
-        dtype = COMPUTE_DTYPE
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
@@ -170,27 +170,14 @@ class Engine:
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
         # 1) Run a batch 1 prefill of the prompt tokens
-        kv_model_kwargs = self.model.kv_cache_spec()
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_prefill = self.manager.new_kv_cache(self.model, batch_size=1, seq_len=len(tokens), device=device)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_decode = self.manager.new_kv_cache(self.model, batch_size=num_samples, seq_len=kv_length_hint, device=device)
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 

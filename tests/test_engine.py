@@ -7,6 +7,7 @@ python -m pytest tests/test_engine.py -v
 import torch
 from nanochat.engine import KVCache, Engine
 from dataclasses import dataclass
+from modelcore import AttentionLayerSpec
 
 
 # -----------------------------------------------------------------------------
@@ -36,11 +37,12 @@ class MockModel:
     def get_device(self):
         return self._device
 
-    def kv_cache_spec(self):
-        """Matches nanochat.model.base.BaseModel.kv_cache_spec, which Engine.generate calls to
-        size the KV cache."""
+    def layer_specs(self):
+        """Matches modelcore.model.Model.layer_specs, which ModelManager.new_kv_cache calls (via
+        Engine.generate) to size the KV cache."""
         m = self.config
-        return {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_kv_slots": m.n_layer}
+        head_dim = m.n_embd // m.n_head
+        return [AttentionLayerSpec(n_head=m.n_head, n_kv_head=m.n_kv_head, head_dim=head_dim) for _ in range(m.n_layer)]
 
     def forward(self, ids, kv_cache=None):
         """Return uniform logits so sampling is spread across vocab."""

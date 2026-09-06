@@ -18,11 +18,13 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, arch_of
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from nanochat.engine import Engine
+from nanochat.architectures import legacy
+from modelcore import ModelManager, OptimizerHparams
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -115,10 +117,11 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+manager = ModelManager()
 orig_model = model
 model = torch.compile(model, dynamic=False)
-depth = model.config.n_layer
-num_flops_per_token = model.estimate_flops()
+depth = orig_model.config.n_layer
+num_flops_per_token = manager.stats(orig_model.config).flops_per_token
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert args.total_batch_size % world_tokens_per_fwdbwd == 0, f"total_batch_size ({args.total_batch_size}) must be a multiple of {world_tokens_per_fwdbwd}."
@@ -130,7 +133,9 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = manager.create_optimizer(orig_model, OptimizerHparams(
+    unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0,
+))
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -140,7 +145,7 @@ base_dir = get_base_dir()
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step, arch=args.arch)
     if optimizer_data is not None:
-        optimizer_data = type(orig_model).patch_optimizer_state_dict(optimizer_data, orig_model.config, log=print0)
+        optimizer_data = legacy.migrate_optimizer_state_from_meta(optimizer_data, meta["model_config"], depth, log=print0)
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
@@ -396,7 +401,7 @@ while True:
         # -- without this, an SFT run of two different architectures at the same depth (e.g. gpt
         # and llama both at d12, auto-discovered rather than given an explicit --model-tag) would
         # silently overwrite each other's chatsft_checkpoints/d12/ directory.
-        arch = model.config.arch
+        arch = arch_of(meta["model_config"])
         output_dirname = args.model_tag if args.model_tag else (f"d{depth}" if arch == "gpt" else f"{arch}_d{depth}") # e.g. d12, or llama_d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
@@ -407,7 +412,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": model.config.to_dict(),
+                "model_config": orig_model.config.to_dict(),
                 "user_config": user_config, # inputs to the training script
                 # Provenance: which base checkpoint this SFT run started from -- meta["model_tag"]
                 # is always populated by load_model_from_dir (checkpoint_manager.py), whether the

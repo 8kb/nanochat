@@ -1,5 +1,11 @@
 """
 Utilities for saving and loading model/optim/state checkpoints.
+
+This is naming policy only -- which directory, which step, which tag, plus meta.json's extra
+fields (val_bpb, user_config, tokenizer_fingerprint, dataloader_state, loop_state, ...). The
+actual model/optimizer artifact format belongs to modelcore (see modelcore.manager.ModelManager);
+this module hands it a modelcore.store.FileSystemStore over the right directory+step, routing an
+old (pre-modelcore) checkpoint through nanochat.architectures.legacy first.
 """
 import os
 import re
@@ -7,8 +13,10 @@ import json
 import logging
 import torch
 
+from modelcore import ModelManager
+
+from nanochat.architectures import legacy
 from nanochat.common import get_base_dir
-from nanochat.model import get_model_class, config_from_dict
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -18,6 +26,8 @@ logger = logging.getLogger(__name__)
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
+
+_manager = ModelManager()
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -72,18 +82,10 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = dict(meta_data["model_config"]) # copy, don't mutate meta_data in place
-    arch = model_config_kwargs.get("arch", "gpt") # old checkpoints predate the "arch" key
-    model_cls = get_model_class(arch)
-    model_config_kwargs = model_cls.patch_config_dict(model_config_kwargs, log=log0)
-    log0(f"Building model with config: {model_config_kwargs}")
-    model_config = config_from_dict(model_config_kwargs)
-    model_data = model_cls.patch_state_dict(model_data, model_config, log=log0)
-    with torch.device("meta"):
-        model = model_cls(model_config)
-    # Load the model state
-    model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    raw_config = dict(meta_data["model_config"])  # copy, don't mutate meta_data in place
+    config, model_data = legacy.migrate_checkpoint(raw_config, model_data, log=log0)
+    log0(f"Building model with config: {_manager.config_to_dict(config)}")
+    model = _manager.create_model(config, device=device)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -93,7 +95,7 @@ def build_model(checkpoint_dir, step, device, phase):
     # Load the Tokenizer
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+    assert tokenizer.get_vocab_size() == config.vocab_size, f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {config.vocab_size}"
     # Same vocab_size doesn't mean same vocab (e.g. a checkpoint trained on a different machine's
     # tokenizer): checkpoints saved before this fingerprint existed have no key to check, so this
     # only warns, and only when there's something to compare.
@@ -142,11 +144,22 @@ def find_last_step(checkpoint_dir):
     return last_step
 
 
+def arch_of(model_config: dict) -> str:
+    """Best-effort preset/architecture name for a raw model_config dict (as read from a
+    checkpoint's meta.json), for tag naming and auto-discovery filtering. A current-format
+    (post-modelcore) model_config has no "arch" key at all -- its `reference.preset` (stamped by
+    nanochat.architectures.presets) is the closest equivalent, defaulting to "custom" for a
+    hand-written tree with no reference block. A legacy model_config (no "format" key) still
+    carries the old "arch" key directly, defaulting to "gpt" for checkpoints predating even that."""
+    if "format" in model_config:
+        return (model_config.get("reference") or {}).get("preset", "custom")
+    return model_config.get("arch", "gpt")
+
+
 def _checkpoint_arch(checkpoints_dir, model_tag):
-    """Best-effort: the "arch" of a checkpoint tag's latest saved step (meta.json's
-    model_config.arch, defaulting to "gpt" for checkpoints predating that key -- see
-    nanochat.model.base.BaseModelConfig.to_dict). Returns None if the tag has no valid
-    checkpoint at all (an empty or malformed directory), so it never matches a real arch filter."""
+    """Best-effort: arch_of() applied to a checkpoint tag's latest saved step, read straight off
+    disk. Returns None if the tag has no valid checkpoint at all (an empty or malformed
+    directory), so it never matches a real arch filter."""
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     try:
         step = find_last_step(checkpoint_dir)
@@ -158,7 +171,7 @@ def _checkpoint_arch(checkpoints_dir, model_tag):
             meta = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
-    return meta.get("model_config", {}).get("arch", "gpt")
+    return arch_of(meta.get("model_config", {}))
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure

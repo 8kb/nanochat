@@ -1,16 +1,16 @@
 """
-Test the parameter-role protocol (nanochat/model/param_roles.py) in isolation, with small
-hand-built nn.Module trees -- no GPT model needed.
+Test the parameter-role protocol (modelcore/roles.py) in isolation, with small hand-built
+nn.Module trees -- no real model needed.
 
-python -m pytest tests/test_param_roles.py -v
+python -m pytest tests/test_modelcore_roles.py -v
 """
 
 import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.model.components.linear import Linear
-from nanochat.model.param_roles import build_param_groups, collect_param_roles
+from modelcore.components.linear import Linear
+from modelcore.roles import build_param_groups, collect_param_roles
 
 
 class _Declared(nn.Module):
