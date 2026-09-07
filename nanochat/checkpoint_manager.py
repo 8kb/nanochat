@@ -5,7 +5,8 @@ This is naming policy only -- which directory, which step, which tag, plus meta.
 fields (val_bpb, user_config, tokenizer_fingerprint, dataloader_state, loop_state, ...). The
 actual model/optimizer artifact format belongs to modelcore (see modelcore.manager.ModelManager);
 this module hands it a modelcore.store.FileSystemStore over the right directory+step, routing an
-old (pre-modelcore) checkpoint through nanochat.architectures.legacy first.
+old (pre-modelcore) checkpoint through nanochat.architectures.legacy first (see
+LegacyCheckpointStore below).
 """
 import os
 import re
@@ -14,6 +15,7 @@ import logging
 import torch
 
 from modelcore import ModelManager
+from modelcore.store import FileSystemStore
 
 from nanochat.architectures import legacy
 from nanochat.common import get_base_dir
@@ -30,38 +32,90 @@ def log0(message):
 _manager = ModelManager()
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    store = FileSystemStore(checkpoint_dir, step)
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
-        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
+        store.write_model_state(model_data)
+        logger.info(f"Saved model parameters to: {os.path.join(checkpoint_dir, f'model_{step:06d}.pt')}")
+        # meta_data bundles modelcore's "model_config" key alongside nanochat's own sibling keys
+        # (val_bpb, user_config, dataloader_state, ...) in one dict -- write nanochat's keys
+        # directly (naming/training-loop policy, which this module owns), then let write_config
+        # own the model_config key specifically, so a save always goes through the same code
+        # ModelManager.save_model does.
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        existing = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        existing.update({k: v for k, v in meta_data.items() if k != "model_config"})
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
+            json.dump(existing, f, indent=2)
+        if "model_config" in meta_data:
+            store.write_config(meta_data["model_config"])
         logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+        store.write_optimizer_state(optimizer_data, rank=rank)
+        logger.info(f"Saved optimizer state to: {os.path.join(checkpoint_dir, f'optim_{step:06d}_rank{rank}.pt')}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    store = FileSystemStore(checkpoint_dir, step)
     # Load the model state
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    model_data = store.read_model_state(map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = store.read_optimizer_state(rank=rank, map_location=device)
+        if optimizer_data is None:
+            raise FileNotFoundError(
+                f"No optimizer state found for step {step} in {checkpoint_dir} (rank {rank})"
+            )
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+class LegacyCheckpointStore(FileSystemStore):
+    """A FileSystemStore that migrates an old (pre-modelcore) checkpoint's config and state dict
+    through nanochat.architectures.legacy before handing them to ModelManager -- so ModelManager
+    (and a fresh, post-modelcore checkpoint) never has to know legacy formats exist. Migrates once,
+    on first access to either read method, and memoizes: migrate_checkpoint needs the raw config to
+    migrate the state dict, so the two must happen together.
+
+    Note: the *raw* config dict in meta.json is left completely untouched on disk -- build_model
+    reads it separately (via load_checkpoint) for its own purposes, because arch_of()/tag naming
+    needs to keep seeing a legacy checkpoint's original "arch" key, not the migrated tree's (always
+    unset) `reference` field."""
+
+    def __init__(self, checkpoint_dir, step, *, device, log=lambda msg: None):
+        super().__init__(checkpoint_dir, step)
+        self._device = device
+        self._log = log
+        self._migrated = None  # (ModelConfig, state dict), computed once
+
+    def _migrate(self):
+        if self._migrated is None:
+            raw_config = super().read_config()
+            raw_state = super().read_model_state(map_location=self._device)
+            if self._device.type in {"cpu", "mps"}:
+                # Convert bfloat16 tensors to float for CPU/MPS inference
+                raw_state = {k: v.float() if v.dtype == torch.bfloat16 else v for k, v in raw_state.items()}
+            # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
+            raw_state = {k.removeprefix("_orig_mod."): v for k, v in raw_state.items()}
+            self._migrated = legacy.migrate_checkpoint(dict(raw_config), raw_state, log=self._log)
+        return self._migrated
+
+    def read_config(self):
+        config, _ = self._migrate()
+        return config.to_dict()
+
+    def read_model_state(self, map_location=None):
+        _, state = self._migrate()
+        return state
 
 
 def build_model(checkpoint_dir, step, device, phase):
@@ -73,29 +127,18 @@ def build_model(checkpoint_dir, step, device, phase):
     - meta data saved during base model training
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        model_data = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in model_data.items()
-        }
-    # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
-    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    raw_config = dict(meta_data["model_config"])  # copy, don't mutate meta_data in place
-    config, model_data = legacy.migrate_checkpoint(raw_config, model_data, log=log0)
-    log0(f"Building model with config: {_manager.config_to_dict(config)}")
-    model = _manager.create_model(config, device=device)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    # Put the model in the right training phase / mode
-    if phase == "eval":
-        model.eval()
-    else:
-        model.train()
+    store = LegacyCheckpointStore(checkpoint_dir, step, device=device, log=log0)
+    model = _manager.load_model(store, device=device, train=(phase == "train"))
+    log0(f"Building model with config: {_manager.config_to_dict(model.config)}")
+    # Load the metadata (kept as a separate, untouched read -- see LegacyCheckpointStore's
+    # docstring for why this must stay the checkpoint's raw model_config, not the migrated one)
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
     # Load the Tokenizer
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == config.vocab_size, f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {config.vocab_size}"
+    assert tokenizer.get_vocab_size() == model.config.vocab_size, f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model.config.vocab_size}"
     # Same vocab_size doesn't mean same vocab (e.g. a checkpoint trained on a different machine's
     # tokenizer): checkpoints saved before this fingerprint existed have no key to check, so this
     # only warns, and only when there's something to compare.
@@ -216,10 +259,10 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None, arch=N
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     if step is None:
         step = find_last_step(checkpoint_dir)
-    optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-    if not os.path.exists(optimizer_path):
-        log0(f"Optimizer checkpoint not found: {optimizer_path}")
+    store = FileSystemStore(checkpoint_dir, step)
+    optimizer_data = store.read_optimizer_state(rank=rank, map_location=device)
+    if optimizer_data is None:
+        log0(f"Optimizer checkpoint not found: optim_{step:06d}_rank{rank}.pt in {checkpoint_dir}")
         return None
-    log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=device)
+    log0(f"Loading optimizer state from {checkpoint_dir} (step {step}, rank {rank})")
     return optimizer_data
