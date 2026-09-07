@@ -332,8 +332,11 @@ Everything above assumes the defaults. To change what's being compared:
   identical across every row regardless of `NUM_SHARDS`, which is what makes the val-bpb numbers
   comparable to each other.
 - **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`modelcore/precision/fp8.py`) — irrelevant
-  on A100s; if you move the contest to H100s, add `--fp8` to each row's args and expect a real
-  speedup, but note it changes precision, so keep it on or off for every row equally.
+  on A100s; if you move the contest to H100s, add `--fp8` to each row's args, but keep it on or off
+  for every row equally (it changes precision). Confirmed working on real H100 hardware for the
+  first time in "Stage 4 results" below (via the dedicated `runs/contest_fp8_d13.sh`, not
+  `runs/contest.sh` itself) — mixed result, not a clean win: ~9.6% faster but a small, consistent
+  val-bpb regression and *higher*, not lower, peak memory. Measure before assuming either direction.
 - **The SFT step has no iso-FLOPs budget of its own.** It's `--num-iterations=-1` (a full epoch of
   the SmolTalk+GSM8K+MMLU mixture) by default for every row, matching upstream nanochat's own SFT
   convention (`runs/speedrun.sh`) — not compute-matched the way base training is. Size this into
@@ -500,6 +503,70 @@ hardware is the concrete, checkable signal.
 Checkpoints (base + SFT, no optimizer state) were rsynced home before terminating the pod — RunPod
 S3 keys are still deferred, so this remains the only way to get local access without another
 billed pod.
+
+## Stage 4 results: FP8 sanity + `kvshare4_win` d13 on H100
+
+Not a multi-architecture contest — one architecture, two base-training-only rows (`bf16` vs.
+`--fp8`), run via a dedicated script rather than `runs/contest.sh`/`contest_d12.sh`:
+`runs/contest_fp8_d13.sh`. Two questions, answered by one run: does `--fp8` actually work on real
+Hopper hardware (it never had — see below), and what does a more aggressive KV-sharing point look
+like (4 KV-owning layers of 13, vs. Stage 3's 6 of 12)?
+
+**Why FP8 needed a sanity check at all**: `Float8Linear` used to subclass `torch.nn.Linear` instead
+of `modelcore.components.linear.Linear`, so `collect_param_roles` raised `ValueError` and
+`create_optimizer` died at startup — `--fp8` was a hard crash on any CUDA box, on every architecture,
+always. Fixed on `stage7-modelcore-extraction` (commit `8e59911`) by subclassing core's own
+`Linear`, but that fix had only ever run on CPU, where the `_scaled_mm` kernel doesn't execute — see
+`AGENTS.md`'s "untested on this machine" list. This run is that fix's first execution on real
+hardware.
+
+**Architecture**: `llama_kvshare_win`, depth 13 (not 12 — `compute_window_sizes` forces the final
+layer to full context unconditionally, which would have silently turned a 12-layer `...S S` tail
+into `...S L`; at 13 layers the pattern already ends in `L`, so the override is a no-op),
+`--window-pattern=LLLLSSLSSLSSL --arch-opt kv_share_frac=0.6923`:
+
+```
+layer:   1  2  3  4  5  6  7  8  9 10 11 12 13
+window:  L  L  L  L  S  S  L  S  S  L  S  S  L
+kv slot: 0  1  2  3  3  3  3  3  3  3  3  3  3
+```
+
+**Infra**: same volume as Stage 3 (`w6ndh50xcl`, US-GA-2). 4x H100 wasn't orderable (same
+"reports stock, still fails to order" pattern as Stage 3) — fell back to 2x H100 SXM 80GB directly
+rather than probing further downward, since each successful probe is a real billed pod.
+`device-batch-size=64` (`grad_accum=2` at 2 GPUs) confirmed safe via a 20-step probe of each
+condition before committing to the full 1,793-iteration run.
+
+| row | val bpb | tok/sec | bf16_mfu¹ | peak mem | fp8 converted | train time |
+|---|---|---|---|---|---|---|
+| bf16 | 0.881810 | 825,689 | 44.41% | 60.0 GB | — | 21.6 min |
+| fp8 | 0.883870 | 904,694 | 48.66%¹ | 69.9 GB | 74/74 | 20.2 min |
+
+¹ `bf16_mfu` divides by *bf16* peak FLOPS for both rows (`base_train.py`), so it isn't a real
+ceiling for the fp8 row — `tok/sec` is the honest cross-row number.
+
+**FP8 sanity: confirmed.** All 74 linear layers converted (0 skipped — every shape in this model
+is 16-aligned with `min(in,out) >= 128`), no NaN, no crash, `fp8_disabled` round-tripped cleanly
+through every eval cycle during training (not just in a unit test). The role/accounting bug fix
+holds under real training.
+
+**Quality**: fp8's val bpb is 0.2% worse than bf16 — tracked step-by-step during the run (grepped
+both logs at identical steps 560-569, not just the final checkpoint): fp8 ran consistently
+~0.004–0.006 higher loss than bf16 across that window, never crossing or diverging. The shape of a
+small, stable precision tax, not instability.
+
+**Speed**: fp8 was **~9.6% faster** (904.7K vs 825.7K tok/sec) — a genuine surprise against
+upstream's own benchmarking (`docs/upstream/LOG.md`: "d12 was still slower with FP8; d26+ shows
+gains"). One run isn't a controlled ablation, but it's a real data point at a different shape
+(13 layers, `n_embd=896`, heavy KV sharing) than upstream measured.
+
+**Memory**: fp8 used *more* peak memory than bf16 (69.9GB vs 60.0GB), not less — the opposite of
+the ~9GB activation savings other fp8 write-ups describe. Not investigated further; flagged rather
+than explained away.
+
+**Cost**: ~53 min of 2x H100 pod time ($6.98/hr) plus ~2 min of CPU pod time for the pull ≈ **$6.20**
+total — under the ~$10-14 estimate, since both rows finished slightly faster than planned and no
+probe needed a retry.
 
 ## Lessons from the first real cloud run
 

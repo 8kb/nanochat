@@ -217,7 +217,9 @@ Untested on this machine as a result: the `bfloat16` compute path, the real FA3 
 (`modelcore/precision/fp8.py` — the role/accounting bookkeeping around it is CPU-tested, see
 `modelcore/tests/test_precision.py`), and multi-GPU/DDP gradient reduction in `modelcore/optim/`.
 Keep changes to those paths conservative and prefer reasoning from the code plus the existing
-(CUDA-gated) tests over "I ran it and it worked."
+(CUDA-gated) tests over "I ran it and it worked." (FP8 itself *has* now been verified end to end on
+real 2x H100 hardware — see `docs/contest.md`'s "Stage 4 results" — so the disclaimer here is about
+this machine specifically, not the feature.)
 
 **Do not attempt large multi-hour training runs in this environment** (no GPU, thermal/power
 constraints of a laptop) — use tiny smoke configs (see

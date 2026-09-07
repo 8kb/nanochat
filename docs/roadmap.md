@@ -179,6 +179,17 @@ Verified in stages, each on real infrastructure where it matters:
    quality-per-byte. A mid-run tuning fix (batch size sized for A100 was leaving 80% of the H100's
    memory idle, capping MFU at ~30-35% despite FA3) doubled MFU to ~42-44% once caught and fixed —
    see docs/contest.md's "Lessons" for the full diagnosis and numbers.
+6. **On a fresh 2x H100 SXM 80GB pod, a dedicated FP8-sanity run** (`runs/contest_fp8_d13.sh`, not
+   the multi-architecture contest scripts): one architecture (`llama_kvshare_win` d13, 4 of 13
+   layers KV-owning — a more aggressive sharing point than step 5's 6 of 12), two base-training-only
+   rows, `bf16` vs. `--fp8`. This is `--fp8`'s first execution on real hardware anywhere in this
+   repo — Stage 8's role/accounting bug fix (`Float8Linear` subclassing core's own `Linear`) had
+   only ever run on CPU before, where the `_scaled_mm` kernel doesn't execute. Confirmed: all 74
+   linear layers converted, no NaN, no crash, `fp8_disabled` round-tripped through every eval cycle.
+   Mixed result on the actual numbers: fp8 was ~9.6% faster (904.7K vs 825.7K tok/sec) but had a
+   small, consistent val-bpb regression (0.883870 vs 0.881810) and *higher* peak memory (69.9GB vs
+   60.0GB) — not the clean win some fp8 write-ups suggest. Full numbers: docs/contest.md's
+   "Stage 4 results".
 
 Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100, `--mfu 0.4` — corrected after
 the GPU-hours fix above; docs/contest.md also gives a more conservative `--mfu 0.33` estimate
