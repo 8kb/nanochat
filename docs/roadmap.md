@@ -190,6 +190,19 @@ Verified in stages, each on real infrastructure where it matters:
    small, consistent val-bpb regression (0.883870 vs 0.881810) and *higher* peak memory (69.9GB vs
    60.0GB) — not the clean win some fp8 write-ups suggest. Full numbers: docs/contest.md's
    "Stage 4 results".
+7. **Same architecture and pod, trained to a proper Chinchilla ratio** (`--target-param-data-ratio=20`
+   instead of an arbitrary FLOPs cap), single `--fp8` row, base + a full uncapped CORE eval, no
+   SFT/chat_eval/wandb. 2.92B tokens over 5,573 iterations. Val bpb decreased monotonically to
+   0.833913 (confirmed by checking every logged step, not just the final one) and CORE reached
+   **0.1597** — the best CORE recorded in this repo so far (Stage 3's d12 contest: gpt 0.1553,
+   llama 0.1109, llama_kvshare_win 0.1359), though not a controlled ablation against those (different
+   depth and horizon). fp8 held up over the full ~53-minute run with no drift from step 6's shorter
+   one (peak memory 69.87GB both times). Against upstream nanochat's own leaderboard
+   (docs/upstream/README.md): well below GPT-2's 0.2565 CORE threshold and nanochat's own
+   0.2578-0.2690 d24/d26-class entries, but expected given ~5x fewer scaling params and ~7-12x less
+   compute — the more meaningful comparison is val bpb on the same ClimbMix dataset nanochat's own
+   runs #4-6 use, where 0.8339 vs. their 0.718-0.719 tracks the scale gap honestly. Full numbers:
+   docs/contest.md's "Stage 5 results".
 
 Reference numbers at the defaults (d16, `TARGET_FLOPS=5e18`, 4x A100, `--mfu 0.4` — corrected after
 the GPU-hours fix above; docs/contest.md also gives a more conservative `--mfu 0.33` estimate

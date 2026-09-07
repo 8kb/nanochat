@@ -568,6 +568,61 @@ than explained away.
 total — under the ~$10-14 estimate, since both rows finished slightly faster than planned and no
 probe needed a retry.
 
+## Stage 5 results: `kvshare4_win` d13 at Chinchilla ratio, fp8, on H100
+
+Same architecture as Stage 4 (`llama_kvshare_win`, depth 13, `--window-pattern=LLLLSSLSSLSSL
+--arch-opt kv_share_frac=0.6923`), but trained to a proper compute-optimal horizon instead of an
+arbitrary FLOPs cap: `--target-param-data-ratio=20` (Chinchilla) instead of `--target-flops=1e18`.
+Single row, `--fp8` on throughout (no bf16 comparison this time — Stage 4 already established fp8
+works; the point here is a real quality number at a real training budget). Base training + a full,
+uncapped CORE eval at the end (`--core-metric-every=999999 --core-metric-max-per-task=-1`) — no
+SFT, no chat_eval, no wandb (`--run=dummy`).
+
+**Infra**: same volume (`w6ndh50xcl`, US-GA-2), 2x H100 SXM 80GB again (4x reported stock but
+failed to order a second time — same pattern as Stages 3 and 4, no further probing). The volume's
+58 shards from the Stage 4 run weren't enough for this budget's 2.92B tokens (roughly 84-90 needed
+by this doc's own ≈35M-usable-tokens/shard estimate) — topped up to 91 via
+`python -m nanochat.dataset -n 90` before training (idempotent: only the missing shards downloaded).
+`device-batch-size=64` reused from Stage 4's probe rather than re-probed — same architecture, same
+per-step memory footprint, so a fresh probe would only have spent money confirming what was already
+known.
+
+| tokens trained | iterations | tokens:param | val bpb (= minimum) | CORE | tok/sec | peak mem | fp8 converted |
+|---|---|---|---|---|---|---|---|
+| 2,921,857,024 | 5,573 | 20.00 | 0.833913 | **0.1597** | 924,694 (median) | 69,870.63 MB | 74/74 |
+
+**Training was clean end to end**: val bpb decreased monotonically from step 0 (3.170390) to the
+final step (0.833913) with no rebound — confirmed by grepping every `Validation bpb` line in the
+log, not just trusting the final number. fp8 held up over the full ~53-minute training loop (vs.
+Stage 4's ~20 minutes) with peak memory essentially identical to Stage 4's shorter run (69.87GB
+both times) — no drift, no NaN, no crash.
+
+**Vs. Stage 4's arbitrary-FLOPs run**: val bpb improved 0.883870 → 0.833913 (~6% lower) on 3.1x
+more tokens (2.92B vs. 940M) at the proper ratio instead of a FLOPs budget picked for cheapness —
+exactly the direction you'd expect, and a useful confirmation that `--target-param-data-ratio`
+behaves sanely on this architecture.
+
+**Vs. this repo's own Stage 3 d12 contest** (`gpt` CORE 0.1553, `llama` 0.1109, `llama_kvshare_win`
+0.1359, all at a d12/~1e18-ish budget): 0.1597 is the best CORE recorded in this repo so far — but
+not a controlled ablation against those three, since this run differs in both depth (13 vs. 12) and
+training horizon (Chinchilla ratio vs. an arbitrary FLOPs cap).
+
+**Vs. upstream nanochat's own leaderboard** (`docs/upstream/README.md`): GPT-2's own CORE is
+0.2565, and nanochat's `d24`/`d26`-class leaderboard entries score 0.2578-0.2690 at ~730-918M
+scaling params and ~9-11B tokens over 13-24 GPU-hours on an 8xH100 node. This run's 0.1597 sits
+well below that threshold — expected, not a regression, given ~5x fewer scaling params (146.1M),
+~3-4x fewer tokens, and ~7-12x less compute (1.94 GPU-hours). The val-bpb comparison is the more
+meaningful one: this fork and nanochat's leaderboard runs #4-6 both train on NVIDIA ClimbMix (the
+README itself flags runs #1-3 as using a different, non-comparable dataset before that switch), so
+0.8339 vs. their 0.7180-0.7185 is a real same-data comparison — worse, exactly as scale predicts.
+The CORE methodology itself lines up cleanly (this run's log shows the same 22-task DCLM battery
+upstream describes), so 0.1597 is comparable in *kind*, just not in scale.
+
+**Cost**: pod ran 81.3 min on 2x H100 ($6.98/hr) ≈ **$9.45**, plus a negligible CPU-pod pull ≈
+**$9.50** total — the shard top-up, the longer training loop (52.61 min vs. Stage 4's ~20), and the
+full uncapped CORE eval (~7 min across 22 tasks, vs. Stage 4's `-1`/disabled) all add up relative
+to Stage 4's $6.20.
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now
