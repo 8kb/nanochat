@@ -268,7 +268,71 @@ minimal presentation-layer exception (a native gpt checkpoint's `num_scaling_par
 optimizer group count, both retired along with the `GPT` class itself). `tests/test_modelcore.py`
 and `tests/test_architectures.py` cross-check the same numbers directly through the new API.
 
-## Stage 8 — attention variants
+## Stage 8 — `modelcore` stands alone (done)
+
+Stage 7 made `modelcore/` a standalone *package* (zero `nanochat` imports); it was not yet a
+standalone *project* — its tests, docs, and packaging metadata all lived outside it. Stage 8 closes
+that gap and fixes three real defects the boundary review turned up along the way:
+
+- **`--fp8` was broken.** `nanochat/fp8.py`'s `Float8Linear` subclassed `torch.nn.Linear`, not
+  `modelcore.components.linear.Linear` — so after conversion, `collect_param_roles` raised
+  (`Float8Linear.weight has no declared role`) the moment `ModelManager.create_optimizer` tried to
+  build param groups. FP8 is now `modelcore/precision/fp8.py`, `Float8Linear` subclasses core's
+  `Linear`, and `ModelManager.enable_fp8`/`fp8_disabled` replace the ~75 lines of conversion/
+  eval-swap logic `scripts/base_train.py` used to carry inline (including the only production
+  import that reached past the `ModelManager` seam, `modelcore.components.linear.Linear`, which
+  existed solely for fp8's eval swap-back).
+- **Generation primitives moved into core.** `sample_next_token`/`generate_naive` were already
+  pure token-id math with no tokenizer dependency; `modelcore/generate.py` also gained `Decoder`
+  (a cached prefill+decode primitive, reached via `ModelManager.new_decoder`), so `nanochat.engine.
+  Engine` now drives a `Decoder` instead of allocating/cloning a `KVCache` inline, and modelcore
+  can prove its own KV cache against its own naive reference with no host application present.
+- **`ArtifactStore` became a real code path.** `modelcore/store.py`'s `FileSystemStore` and
+  `ModelManager.{load,save}_model`/`{load,save}_optimizer` had no production caller —
+  `checkpoint_manager` did raw `torch.save`/`torch.load` despite its own docstring's claim
+  otherwise. `save_checkpoint`/`load_checkpoint`/`build_model` now genuinely route through the
+  store; a new `LegacyCheckpointStore(FileSystemStore)` adapts an old checkpoint onto
+  `ModelManager.load_model` by migrating on first read (memoized) — `modelcore` never learns
+  legacy formats exist.
+
+`modelcore/runtime.py`'s env var is now `MODELCORE_DTYPE` (`NANOCHAT_DTYPE` kept as a back-compat
+alias), and every docstring inside `modelcore/` that named `nanochat` or a repo-root `docs/` path
+now describes the *role* instead ("the host application"), pointing at `modelcore/docs/`.
+
+`modelcore/tests/` is now a complete, self-contained suite (moved from `tests/test_modelcore*.py`/
+`test_optim.py`/`test_attention_fallback.py`, plus new `test_precision.py`/`test_generate.py`/
+`test_standalone.py` — the last AST-scans every file under `modelcore/` for a host-application
+import), with its own goldens (`tiny_composed_*`, `modelcore`'s own baseline) and a
+`modelcore/docs/architecture.md` carrying the core contract (the repo root's
+[architecture.md](architecture.md) now covers only the nanochat-app side: presets, legacy
+migration, checkpoint naming, and how the app consumes `ModelManager`). `modelcore/README.md` and
+`modelcore/pyproject.toml` (declaring `torch` as modelcore's only hard dependency, `kernels` as an
+optional extra for FA3) round out the package identity, without being wired into this repo's own
+`uv` workspace — nothing about how nanochat itself installs changed.
+
+Verified at every step: `python -m pytest -q` (237 passed, 14 skipped, one pre-existing unrelated
+macOS sandbox failure, throughout); real end-to-end runs (`scripts.base_train` with
+`--resume-from-step` exercising the optimizer save+load path through the store,
+`scripts.base_eval`/`scripts.chat_cli`/`scripts.model_info` against the real, genuinely
+pre-Stage-2 `d6` checkpoint through `LegacyCheckpointStore`). The actual proof this stage exists
+for: copying `modelcore/` to a fresh directory with nothing else alongside it and running its
+suite there — 97 passed, 14 skipped (CUDA-only), zero failures, no `nanochat` on the path at all.
+
+## Stage 9 — the repo split
+
+The actual extraction: `modelcore/` becomes its own git repository (a `git subtree split`
+preserving history), and this repo depends on it as a path or VCS dependency instead of a
+same-repo directory. What Stage 8 leaves for this stage specifically: deciding whether the one
+remaining cross-boundary test dependency (`tests/test_architectures.py` reading
+`modelcore/tests/goldens/tiny_composed_*` directly, to prove `nanochat.architectures.presets.expand`
+reproduces modelcore's own baseline) vendors a copy of those goldens or narrows to a
+config-tree-equality assertion that doesn't need modelcore's test data at all; wiring
+`modelcore`'s `pyproject.toml` into an actual installable dependency (a git URL or a local path
+override) rather than the aspirational, unwired file it is today; and re-verifying the standalone
+guard (`modelcore/tests/test_standalone.py`) still passes against the split repo's own history,
+not just a directory copy.
+
+## Stage 10 — attention variants
 
 Per-layer attention and position-encoding selection in the config (mixing local/global, or
 different attention types per layer). Position encoding becomes its own swappable component
@@ -281,7 +345,7 @@ MLA's compressed latent cache will likely still need it generalized further (a p
 object the layer itself allocates and manages, rather than a fixed `(n_slots, B, T, H, D)` k/v
 tensor pair).
 
-## Stage 9 — depth and residual topology
+## Stage 11 — depth and residual topology
 
 Weight tying across layers, looped/universal transformers, layer skipping, multi-token-prediction
 (MTP) heads — new composers under `modelcore/composers/` (`BackoutComposer`/`StackComposer` are
@@ -292,7 +356,7 @@ the role protocol makes this more tractable than before (a tied parameter is alr
 at the role-collection level, just not yet exercised by any real architecture), but the
 shape-based Muon stacking itself still assumes independent, per-layer-shaped matrices.
 
-## Stage 10 — experiment ergonomics
+## Stage 12 — experiment ergonomics
 
 Config files as an alternative to pure argparse CLI flags — `--model-config` is this for model
 architecture specifically; this stage is the rest of a run's configuration (data, optimizer,

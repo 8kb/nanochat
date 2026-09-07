@@ -1,10 +1,11 @@
 # AGENTS.md
 
 Repo map and non-obvious invariants for anyone (human or agent) working in this fork. Read
-[docs/architecture.md](docs/architecture.md) before touching `modelcore/` or
-`nanochat/architectures/`, and [docs/upstream-sync.md](docs/upstream-sync.md) before touching
-anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section
-for where its code lives today).
+[modelcore/docs/architecture.md](modelcore/docs/architecture.md) before touching anything under
+`modelcore/`, [docs/architecture.md](docs/architecture.md) before touching `nanochat/architectures/`
+or how the app consumes `ModelManager`, and [docs/upstream-sync.md](docs/upstream-sync.md) before
+touching anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7"
+section for where its code lives today).
 
 ## What this fork is
 
@@ -16,9 +17,11 @@ plan and current progress.
 ## Repo map
 
 ```
-modelcore/            standalone model subsystem (zero nanochat imports) — see docs/architecture.md
-├── manager.py           ModelManager: the one entrypoint (create/load/save model+optimizer, stats, validate)
+modelcore/            standalone model subsystem (zero nanochat imports) — see modelcore/docs/architecture.md
+├── manager.py           ModelManager: the one entrypoint (create/load/save model+optimizer, stats,
+│                         validate, precision, decoding)
 ├── model.py              Model: the one model class, built from a materialized config tree
+├── generate.py            sample_next_token, generate_naive, Decoder (cached prefill+decode)
 ├── config/                ComponentSpec, ModelConfig, AttentionLayerSpec; validate_config()
 ├── catalog.py             component registry: "#type" name -> (cls, needs, validate)
 ├── components/             linear, norm, rope, rotary, attention, mlp, block, embedding, unembedding
@@ -27,24 +30,28 @@ modelcore/            standalone model subsystem (zero nanochat imports) — see
 ├── stats.py                FLOPs/param/KV-bytes accounting, ModelStats
 ├── store.py                ArtifactStore protocol + FileSystemStore
 ├── runtime.py              Runtime: compute dtype + log sink (injected, not a global)
+├── precision/fp8.py         Float8Linear + convert_to_float8_training (ModelManager.enable_fp8)
 ├── optim/                  MuonAdamW (single combined optimizer, ZeRO-2 sharded)
 ├── kernels/                 unified FA3/SDPA attention interface
-└── cache.py                 KVCache
+├── cache.py                 KVCache
+└── tests/, docs/, README.md, pyproject.toml   modelcore's own suite, contract, and packaging
 nanochat/             everything that knows nanochat's own conventions
 ├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
 │                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
-├── engine.py             inference: Engine (KV-cached generate), generate_naive; KVCache re-exported
-├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; hands ModelManager a config
+├── engine.py             inference: Engine (calculator/tool-use, KV-cached generate) built on
+│                        modelcore.generate.Decoder; generate_naive/KVCache re-exported
+├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; LegacyCheckpointStore
+│                        adapts an old checkpoint onto ModelManager.load_model
 ├── optim.py, flash_attention.py   one-line re-export shims onto modelcore.optim/modelcore.kernels
 ├── tokenizer.py            BPE tokenizer wrapper
 ├── dataloader.py / dataset.py   pretraining data
 ├── core_eval.py / loss_eval.py   base-model evaluation (CORE benchmark, bits-per-byte)
 ├── execution.py            sandboxed Python execution (tool use)
-├── scaling.py               muP training-plan math (architecture-agnostic)
-└── fp8.py                    FP8 training (CUDA/Hopper only)
+└── scaling.py               muP training-plan math (architecture-agnostic)
 scripts/              entry points, run as `python -m scripts.<name>`
 tasks/                task/dataset definitions for eval (arc, mmlu, gsm8k, humaneval, smoltalk)
-tests/                pytest suite — see "What runs on this Mac" below
+tests/                nanochat's pytest suite — see "What runs on this Mac" below
+                        (modelcore/tests/ is modelcore's own, standalone suite)
 runs/                 shell scripts wiring scripts/ together (speedrun.sh, runcpu.sh, ...)
 docs/                 this fork's documentation; docs/upstream/ holds the original nanochat docs
 dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py
@@ -56,24 +63,29 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   not compute anything that depends on real tensor *values* — only shapes/dtypes. Real
   initialization goes in `init_weights()`, called after `model.to_empty(device=...)`.
   `ModelManager.create_model`/`load_model` own this dance; nothing else should repeat it. See
-  "The meta-device footgun" in [docs/architecture.md](docs/architecture.md).
+  "The meta-device footgun" in [modelcore/docs/architecture.md](modelcore/docs/architecture.md).
 - **No `torch.amp.autocast`.** Precision is `modelcore.runtime.Runtime.compute_dtype`, injected
   into any component declaring `needs=("runtime",)` — not a bare global read off an attribute.
-  `nanochat.common.COMPUTE_DTYPE` (override via `NANOCHAT_DTYPE` env var) re-exports the default
-  runtime's value for existing readers. Model weights stay fp32; `modelcore.components.linear.Linear`
-  casts to `COMPUTE_DTYPE` in `forward()`. Route every matmul-participating parameter through it.
+  `nanochat.common.COMPUTE_DTYPE` (override via `MODELCORE_DTYPE`, or the back-compat
+  `NANOCHAT_DTYPE`, env var) re-exports the default runtime's value for existing readers. Model
+  weights stay fp32; `modelcore.components.linear.Linear` casts to `COMPUTE_DTYPE` in `forward()`.
+  Route every matmul-participating parameter through it.
 - **`Linear` is the structural marker for "matmul params".**
   `modelcore.stats.num_matmul_params` finds every FLOPs-relevant parameter by scanning for
   `isinstance(m, Linear)`. A new matmul that uses a raw `nn.Linear` or bare `nn.Parameter`
   silently disappears from `ModelStats.flops_per_token`/`decode_flops`/`prefill_flops` and every
-  FLOPs/s or MFU number derived from them.
+  FLOPs/s or MFU number derived from them. This is also why
+  `modelcore.precision.fp8.Float8Linear` subclasses `Linear` rather than a bare `nn.Linear` — it
+  used to subclass `nn.Linear` directly (`nanochat/fp8.py`, pre-Stage-8), which meant an
+  fp8-converted model's `collect_param_roles` raised outright (`Float8Linear.weight has no
+  declared role`) the moment `ModelManager.create_optimizer` tried to build its param groups.
 - **Every parameter needs a declared role.** `modelcore.roles.collect_param_roles` walks the
   module tree and raises on any parameter it can't assign a role to (a `Linear.weight` defaults to
   `"matrix"`; anything else needs a `PARAM_ROLES` class attribute or a `param_roles()` override).
   `ModelManager.create_optimizer`/`ModelStats.params_by_role` are built on this, so a new
   `nn.Parameter` or submodule that forgets to declare a role raises at construction — far better
   than it silently defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping).
-  See [docs/architecture.md](docs/architecture.md#component-contracts).
+  See [modelcore/docs/architecture.md](modelcore/docs/architecture.md#component-contracts).
 - **A config tree carries only concrete, already-decided values, never a derivation rule.**
   `has_value_embed` is a plain bool per block, `window` a concrete int, `kv_slot`/`produces_kv`
   concrete per-block values — never a pattern string or a fraction a component would need to
@@ -82,6 +94,11 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   `nanochat/architectures/derive.py`, run once at tree-expansion time, outside `modelcore` entirely.
   A component asking "which layer am I" or "how many layers are there" to re-derive a policy is
   exactly the abstraction leak this fork's Stage 7 redesign eliminated — don't reintroduce it.
+- **`ArtifactStore` is a real code path, not aspirational.** `nanochat.checkpoint_manager.save_checkpoint`/
+  `load_checkpoint`/`build_model` route through `modelcore.store.FileSystemStore` (and, for an old
+  checkpoint, `LegacyCheckpointStore(FileSystemStore)`, which migrates on first read and memoizes) —
+  they don't call `torch.save`/`torch.load` directly. A new checkpoint-touching code path should go
+  through the store too, not add a third way to read/write the same files.
 - **`runs/scaling_laws.sh` and `runs/miniseries.sh` grep exact stdout text** out of
   `scripts/base_train.py`: `runs/scaling_laws.sh` greps six `^key ` lines
   (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`, `scalars`, `total`) from
@@ -122,7 +139,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state
   silently (no shape-mismatch error) rather than loudly. `ModelManager.create_optimizer`'s policy
   dict order is therefore part of the on-disk format, not just a style choice — see
-  [docs/architecture.md](docs/architecture.md#component-contracts). A change that does reorder or
+  [modelcore/docs/architecture.md](modelcore/docs/architecture.md#component-contracts). A change that does reorder or
   resplit needs a migration in `nanochat/architectures/legacy.py` (see `_patch_resid_x0_split`/
   `_split_backout_lambda_from_smear` for the pattern) or old optimizer shards fail to load —
   `scripts/base_train.py`'s `--resume-from-step` and `scripts/chat_sft.py`'s `--load-optimizer`
@@ -135,7 +152,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`
   allocation instead of getting its own. `KVCache`'s constructor kwarg and attribute are
   `num_kv_slots`/`n_slots`, and `get_slot_cache(slot)` returns that slot's view — see
-  "Cross-layer KV sharing" in [docs/architecture.md](docs/architecture.md) for the full mechanism,
+  "Cross-layer KV sharing" in [modelcore/docs/architecture.md](modelcore/docs/architecture.md) for the full mechanism,
   including a real FA3-vs-SDPA divergence in what `k=None` means to `flash_attn_with_kvcache` that
   a naive sharing implementation would hit.
 - **Checkpoint meta carries `tokenizer_fingerprint` and `core_metric`.**
@@ -168,13 +185,15 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   no registry to add it to — `modelcore` builds every tree through the same `Model` class,
   regardless of which preset produced it. See
   [docs/architecture.md](docs/architecture.md#nanochatarchitectures-presets-and-legacy-migration).
-- **`tests/goldens/*.json` is the regression net for anything touching `modelcore`,
-  `nanochat/architectures/`, `nanochat/checkpoint_manager.py`, or `nanochat/engine.py`.** Captured
-  once (`dev/capture_model_goldens.py`, now effectively frozen — it depends on code this refactor
-  deleted) before Stage 7's redesign, from every real checkpoint on this machine plus a seeded
-  synthetic model of every architecture/preset. `tests/test_goldens.py` replays it;
-  `tests/test_modelcore.py`/`tests/test_architectures.py` cross-check the same numbers through the
-  new API directly. Run all three after any change to those areas — see
+- **`tests/goldens/*.json` (plus `modelcore/tests/goldens/tiny_composed_*.json`) is the regression
+  net for anything touching `modelcore`, `nanochat/architectures/`,
+  `nanochat/checkpoint_manager.py`, or `nanochat/engine.py`.** Captured once
+  (`dev/capture_model_goldens.py`, now frozen — its `main()`/`capture_synthetic()` depend on code
+  this refactor deleted; the live digest helpers it used moved to `tests/golden_helpers.py`)
+  before Stage 7's redesign, from every real checkpoint on this machine plus a seeded synthetic
+  model of every architecture/preset. `tests/test_goldens.py` replays it;
+  `modelcore/tests/test_manager.py`/`tests/test_architectures.py` cross-check the same numbers
+  through the new API directly. Run all three after any change to those areas — see
   [docs/architecture.md](docs/architecture.md#verifying-a-change-is-behavior-preserving).
 
 ## What runs on this Mac
@@ -186,17 +205,19 @@ Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to
 uv sync --extra cpu --group dev && source .venv/bin/activate
 ```
 
-Runs fine locally: everything in `tests/` except `tests/test_optim.py` (module-level
-`skipif(not cuda_available)`) and the `TestFA3VsSDPA` class in
-`tests/test_attention_fallback.py` (needs an sm80/sm89/sm90 GPU for the real FA3 kernel — the
-SDPA fallback classes in that file run fine on CPU). `scripts/base_train.py` /
+Runs fine locally: everything in `tests/` and `modelcore/tests/` except
+`modelcore/tests/test_optim.py` (module-level `skipif(not cuda_available)`) and the
+`TestFA3VsSDPA` class in `modelcore/tests/test_kernels.py` (needs an sm80/sm89/sm90 GPU for the
+real FA3 kernel — the SDPA fallback classes in that file run fine on CPU). `scripts/base_train.py` /
 `scripts/chat_sft.py` run at small `--depth`/`--max-seq-len`/`--device-batch-size` (see
 `runs/runcpu.sh`). `scripts/infer_bench.py` hard-asserts CUDA and does not run here.
 
 Untested on this machine as a result: the `bfloat16` compute path, the real FA3 kernel path
-(vs. the SDPA fallback it's checked against), FP8 training (`nanochat/fp8.py`), and multi-GPU/DDP
-gradient reduction in `modelcore/optim/`. Keep changes to those paths conservative and prefer
-reasoning from the code plus the existing (CUDA-gated) tests over "I ran it and it worked."
+(vs. the SDPA fallback it's checked against), the real fp8 `_scaled_mm` numerics
+(`modelcore/precision/fp8.py` — the role/accounting bookkeeping around it is CPU-tested, see
+`modelcore/tests/test_precision.py`), and multi-GPU/DDP gradient reduction in `modelcore/optim/`.
+Keep changes to those paths conservative and prefer reasoning from the code plus the existing
+(CUDA-gated) tests over "I ran it and it worked."
 
 **Do not attempt large multi-hour training runs in this environment** (no GPU, thermal/power
 constraints of a laptop) — use tiny smoke configs (see

@@ -331,7 +331,7 @@ Everything above assumes the defaults. To change what's being compared:
   `--depth` significantly. The validation shard (always the last one, `shard_06542.parquet`) is
   identical across every row regardless of `NUM_SHARDS`, which is what makes the val-bpb numbers
   comparable to each other.
-- **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`nanochat/fp8.py`) — irrelevant
+- **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`modelcore/precision/fp8.py`) — irrelevant
   on A100s; if you move the contest to H100s, add `--fp8` to each row's args and expect a real
   speedup, but note it changes precision, so keep it on or off for every row equally.
 - **The SFT step has no iso-FLOPs budget of its own.** It's `--num-iterations=-1` (a full epoch of

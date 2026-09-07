@@ -242,17 +242,46 @@ registry key — same CLI surface (`--arch gpt`, `--arch-opt kv_share_frac=0.5`,
 `--arch` uniformly for every preset (Stage 6's special-cased `--arch composed` value doesn't exist
 any more — there's only one way to build a model).
 
+## Stage 8: `nanochat/fp8.py` deleted; fp8/generation logic moved into `modelcore/`
+
+Stage 7 left `modelcore/` import-clean but not yet self-contained, and its boundary review found
+`nanochat/fp8.py`'s `Float8Linear` subclassing `torch.nn.Linear` instead of `modelcore.components.
+linear.Linear` — silently breaking `collect_param_roles`/`num_matmul_params` the moment fp8 was
+enabled. Fixing that meant fp8 itself had to move, since the fix is "subclass core's `Linear`",
+which only makes sense from inside `modelcore`. `nanochat/engine.py`'s pure token-id generation
+functions moved for the same self-containment reason — see [roadmap.md](roadmap.md)'s Stage 8
+entry for the full rationale.
+
+| Where it was (through Stage 7) | Now lives in |
+|---|---|
+| `nanochat/fp8.py` (`Float8Linear`, `Float8LinearConfig`, `convert_to_float8_training`) | `modelcore/precision/fp8.py` — `Float8Linear` now subclasses `modelcore.components.linear.Linear`, not `nn.Linear`; the CUDA-dims-divisible-by-16 module filter is a reusable `default_module_filter` |
+| `scripts/base_train.py`'s inline fp8 conversion block + `disable_fp8` context manager | `ModelManager.enable_fp8`/`ModelManager.fp8_disabled` |
+| `nanochat/engine.py`'s `sample_next_token`, `generate_naive` | `modelcore/generate.py`, re-exported from `nanochat.engine` for existing `from nanochat.engine import ...` call sites |
+| `nanochat/engine.py`'s `Engine.generate`'s inline prefill/clone-KVCache/decode-loop | `modelcore/generate.py`'s `Decoder`, reached via `ModelManager.new_decoder` |
+| `nanochat/checkpoint_manager.py`'s raw `torch.save`/`torch.load` in `save_checkpoint`/`load_checkpoint`/`build_model` | `modelcore.store.FileSystemStore` (a new `LegacyCheckpointStore(FileSystemStore)` adapts an old checkpoint by migrating on first read) |
+
+`nanochat/fp8.py` is **deleted**, no compatibility shim (same policy as `nanochat/gpt.py` at Stage
+7) — an upstream diff to `nanochat/fp8.py` should be applied to `modelcore/precision/fp8.py`
+instead, keeping in mind the base-class change above (`Linear` not `nn.Linear`) and that
+`COMPUTE_DTYPE` now comes from an injected `Runtime`, not `nanochat.common`.
+
+`modelcore/runtime.py`'s environment variable is now `MODELCORE_DTYPE`; `NANOCHAT_DTYPE` is kept
+as a back-compat alias (both work, everywhere).
+
 ## Merge procedure for a new upstream commit
 
-1. `git fetch upstream && git log HEAD..upstream/master -- nanochat/gpt.py` to see what changed.
+1. `git fetch upstream && git log HEAD..upstream/master -- nanochat/gpt.py nanochat/fp8.py` to see
+   what changed.
 2. For a change inside one of the functions/classes in the first table above: find the new home
-   via *both* tables in order (Stage 1-6's, then Stage 7's — a symbol may have moved twice), apply
-   the diff there by hand (the code is verbatim through Stage 1-6, so upstream's diff context
-   should still line up almost exactly; Stage 7 renamed several things, listed in its own table).
+   via *all three* tables in order (Stage 1-6's, then Stage 7's, then Stage 8's — a symbol may have
+   moved more than once), apply the diff there by hand (the code is verbatim through Stage 1-6, so
+   upstream's diff context should still line up almost exactly; Stage 7/8 renamed several things,
+   listed in their own tables).
 3. For a change to `nanochat/checkpoint_manager.py`, `nanochat/engine.py`, or the training
    scripts: check "Other call sites that changed" above first — the surrounding code moved, so a
    textual patch may not apply, but the same edit intent almost always still makes sense.
 4. For a genuinely new file or a change elsewhere in the repo: apply directly, no mapping needed.
-5. After merging, re-run the golden-checkpoint regression check (see the model card in
-   [architecture.md](architecture.md#verifying-a-change-is-behavior-preserving)) before trusting
-   the result.
+5. After merging, re-run the golden-checkpoint regression check (see
+   [architecture.md](architecture.md#verifying-a-change-is-behavior-preserving), and
+   [modelcore/docs/architecture.md](../modelcore/docs/architecture.md#verifying-a-change-is-behavior-preserving)
+   for anything touching `modelcore` itself) before trusting the result.
