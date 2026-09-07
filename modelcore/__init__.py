@@ -17,16 +17,18 @@ import modelcore.composers  # noqa: F401 -- import for @register_component side 
 from modelcore.cache import KVCache
 from modelcore.config.spec import AttentionLayerSpec, ComponentSpec, ModelConfig
 from modelcore.errors import ConfigError, ValidationReport
-from modelcore.manager import ModelManager, OptimizerHparams
+from modelcore.generate import Decoder, generate_naive, sample_next_token
+from modelcore.manager import Fp8Report, ModelManager, OptimizerHparams
 from modelcore.model import Model
 from modelcore.runtime import DEFAULT_RUNTIME, Runtime
 from modelcore.stats import ModelStats
 from modelcore.store import ArtifactStore, FileSystemStore
 
 __all__ = [
-    "ModelManager", "OptimizerHparams",
+    "ModelManager", "OptimizerHparams", "Fp8Report",
     "ModelConfig", "ComponentSpec", "AttentionLayerSpec",
     "Model", "ModelStats", "KVCache",
+    "Decoder", "generate_naive", "sample_next_token",
     "ConfigError", "ValidationReport",
     "ArtifactStore", "FileSystemStore",
     "Runtime", "DEFAULT_RUNTIME",

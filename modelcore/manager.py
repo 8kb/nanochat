@@ -14,6 +14,7 @@ from modelcore.cache import KVCache
 from modelcore.config.spec import ModelConfig
 from modelcore.config.validate import validate_config as _validate_config
 from modelcore.errors import ValidationReport
+from modelcore.generate import Decoder
 from modelcore.model import Model
 from modelcore.optim import MuonAdamW
 from modelcore.roles import build_param_groups, collect_param_roles
@@ -171,6 +172,13 @@ class ModelManager:
             batch_size=batch_size, seq_len=seq_len, device=device or model.get_device(),
             dtype=self.runtime.compute_dtype, **spec,
         )
+
+    def new_decoder(self, model: Model, tokens: list, *, num_samples: int = 1,
+                     max_tokens: int | None = None, device=None) -> Decoder:
+        """Batch-1 prefill of tokens, replicated into an num_samples-row KV-cached decoder --
+        see modelcore.generate.Decoder. The generic (tokenizer-agnostic) half of a cached
+        autoregressive generation loop."""
+        return Decoder(model, self, tokens, num_samples=num_samples, max_tokens=max_tokens, device=device)
 
     # -- precision --
 

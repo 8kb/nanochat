@@ -12,15 +12,12 @@ The whole thing is made as efficient as possible.
 """
 
 import torch
-import torch.nn.functional as F
 import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
 from modelcore import ModelManager
-from modelcore.cache import KVCache
+from modelcore.generate import Decoder, generate_naive, sample_next_token  # noqa: F401 -- re-exported below
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -81,59 +78,11 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
-# KVCache now lives in modelcore.cache (Stage 7 -- see docs/roadmap.md); imported above so
-# existing `from nanochat.engine import KVCache` call sites keep working unchanged.
-# -----------------------------------------------------------------------------
-@torch.inference_mode()
-def sample_next_token(logits, rng, temperature=1.0, top_k=None):
-    """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
-    assert temperature >= 0.0, "temperature must be non-negative"
-    if temperature == 0.0:
-        return torch.argmax(logits, dim=-1, keepdim=True)
-    if top_k is not None and top_k > 0:
-        k = min(top_k, logits.size(-1))
-        vals, idx = torch.topk(logits, k, dim=-1)
-        vals = vals / temperature
-        probs = F.softmax(vals, dim=-1)
-        choice = torch.multinomial(probs, num_samples=1, generator=rng)
-        return idx.gather(1, choice)
-    else:
-        logits = logits / temperature
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1, generator=rng)
-
-# -----------------------------------------------------------------------------
-
-@torch.inference_mode()
-def generate_naive(model, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-    """
-    Naive autoregressive streaming inference (no KV cache): recomputes the full forward pass at
-    every step. Useful as a slow-but-simple reference to check the fast KV-cached Engine.generate
-    path against (see the __main__ block below). To keep this simple, assumes:
-    - batch size is 1
-    - ids and the yielded tokens are simple Python lists and ints
-
-    Note: sampling here goes through sample_next_token, which (for top_k > 0) draws from the
-    renormalized top-k distribution via torch.multinomial. This gives the same distribution as,
-    but not necessarily the same draw as, masking to -inf and sampling over the full vocab (the
-    scheme model.generate used before this was extracted) -- greedy (temperature=0) is unaffected
-    and remains bit-identical.
-    """
-    assert isinstance(tokens, list)
-    device = model.get_device()
-    rng = None
-    if temperature > 0:
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
-    ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-    for _ in range(max_tokens):
-        logits = model.forward(ids) # (B, T, vocab_size)
-        logits = logits[:, -1, :] # (B, vocab_size)
-        next_ids = sample_next_token(logits, rng, temperature, top_k)
-        ids = torch.cat((ids, next_ids), dim=1)
-        token = next_ids.item()
-        yield token
-
+# sample_next_token/generate_naive/Decoder now live in modelcore.generate -- pure token-id math
+# with no tokenizer or nanochat dependency (Stage 8, see docs/roadmap.md). Imported above and
+# re-exported here so `from nanochat.engine import ...` call sites keep working unchanged; KVCache
+# is imported only for that same reason -- Engine itself now only ever touches it through Decoder.
+from modelcore.cache import KVCache  # noqa: F401 -- re-exported for existing call sites
 # -----------------------------------------------------------------------------
 
 class RowState:
@@ -169,22 +118,15 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # 1) Run a batch 1 prefill of the prompt tokens
-        kv_cache_prefill = self.manager.new_kv_cache(self.model, batch_size=1, seq_len=len(tokens), device=device)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        # Prefill the prompt once, then decode from an num_samples-row KV cache -- both owned by
+        # modelcore.generate.Decoder (see ModelManager.new_decoder); this method only ever reads
+        # .logits and calls .step(), it never touches a KV cache directly.
+        decoder = self.manager.new_decoder(self.model, tokens, num_samples=num_samples, max_tokens=max_tokens, device=device)
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = self.manager.new_kv_cache(self.model, batch_size=num_samples, seq_len=kv_length_hint, device=device)
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
-
-        # 3) Initialize states for each sample
+        # Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
-        # 4) Main generation loop
+        # Main generation loop
         num_generated = 0
         while True:
             # Stop condition: we've reached max tokens
@@ -195,7 +137,7 @@ class Engine:
                 break
 
             # Sample the next token for each row
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+            next_ids = sample_next_token(decoder.logits, rng, temperature, top_k)  # (B, 1)
             sampled_tokens = next_ids[:, 0].tolist()
 
             # Process each row: choose the next token, update state, optional tool use
@@ -235,8 +177,7 @@ class Engine:
             num_generated += 1
 
             # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            decoder.step(token_column)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
@@ -269,6 +210,8 @@ if __name__ == "__main__":
     is equivalent to the faster Engine.generate function here.
     """
     import time
+    from nanochat.common import compute_init, autodetect_device_type
+    from nanochat.checkpoint_manager import load_model
     # init compute
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
