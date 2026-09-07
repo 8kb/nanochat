@@ -6,7 +6,7 @@ the Muon half is checked behaviorally (determinism + convergence).
 Requires a GPU (the fused kernels are compiled on first use, which
 dominates the runtime of this file).
 
-python -m pytest tests/test_optim.py -v
+python -m pytest modelcore/tests/test_optim.py -v
 """
 
 import pytest
@@ -16,7 +16,7 @@ cuda_available = torch.cuda.is_available()
 pytestmark = pytest.mark.skipif(not cuda_available, reason="optimizer tests require CUDA")
 
 if cuda_available:
-    from nanochat.optim import MuonAdamW
+    from modelcore.optim import MuonAdamW
 
 DEVICE = "cuda"
 

@@ -14,6 +14,7 @@ import torch
 
 from modelcore import ModelManager
 from modelcore.model import Model
+from modelcore.tests import GOLDENS_DIR as MODELCORE_GOLDENS_DIR, TINY_DIR as MODELCORE_TINY_DIR
 
 from nanochat.architectures import legacy, presets
 
@@ -26,6 +27,14 @@ def _tensor_hash(t):
 
 def _load_golden(name):
     with open(os.path.join(GOLDENS_DIR, f"{name}.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_composed_golden(preset):
+    """The tiny_composed_* goldens are modelcore's own baseline (moved into modelcore/tests/goldens
+    at Stage 8, see docs/roadmap.md) -- this is the one place nanochat's own tests read modelcore's
+    test data, since presets.expand's job is exactly to reproduce that same tree."""
+    with open(os.path.join(MODELCORE_GOLDENS_DIR, f"tiny_composed_{preset}.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -61,10 +70,10 @@ def test_expand_matches_pre_refactor_golden(manager, preset, kwargs):
     report = manager.validate_config(config)
     assert report.ok, report.errors
 
-    golden = _load_golden(f"tiny_composed_{preset}")
+    golden = _load_composed_golden(preset)
     _assert_matches_composed_golden(manager, config, golden)
 
-    state = torch.load(os.path.join(GOLDENS_DIR, "tiny", f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
+    state = torch.load(os.path.join(MODELCORE_TINY_DIR, f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
     with torch.device("meta"):
         model = Model(config)
     model.to_empty(device="cpu")
@@ -104,6 +113,39 @@ def test_expand_llama_kvshare_win_windows_match_compute_window_sizes():
     actual = [b.params["window"] for b in config.body.params["blocks"]]
     assert actual == expected
     assert actual[-1] == seq_len  # final layer always forced to full context
+
+
+# -----------------------------------------------------------------------------
+# derive.compute_window_sizes itself (moved from tests/test_modelcore_components.py at Stage 8 --
+# it's a depth-dial/window-pattern policy rule, not a modelcore component)
+
+def test_compute_window_sizes_full_context():
+    from nanochat.architectures.derive import compute_window_sizes
+    ws = compute_window_sizes("L", n_layer=4, sequence_len=512)
+    assert ws == [512] * 4
+
+
+def test_compute_window_sizes_last_layer_always_full_context():
+    from nanochat.architectures.derive import compute_window_sizes
+    # Every layer requests a short window, but the final layer is always forced to full context.
+    ws = compute_window_sizes("SS", n_layer=3, sequence_len=1024)
+    assert ws[0] < 1024 and ws[1] < 1024
+    assert ws[-1] == 1024
+
+
+def test_compute_window_sizes_tiles_pattern_across_layers():
+    from nanochat.architectures.derive import compute_window_sizes
+    ws = compute_window_sizes("SL", n_layer=4, sequence_len=2048)
+    assert ws[0] < 2048  # S
+    assert ws[1] == 2048  # L
+    assert ws[2] < 2048  # S (pattern repeats)
+    assert ws[3] == 2048  # L, also forced as the last layer
+
+
+def test_compute_window_sizes_invalid_chars_assert():
+    from nanochat.architectures.derive import compute_window_sizes
+    with pytest.raises(AssertionError):
+        compute_window_sizes("X", n_layer=2, sequence_len=128)
 
 
 def test_kv_sharing_strictly_shrinks_params_and_kv_bytes_vs_plain_llama(manager):

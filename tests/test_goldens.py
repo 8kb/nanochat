@@ -6,14 +6,15 @@ This is the regression net for the Stage 7 `modelcore/` extraction. Through step
 built out, nanochat/model/ still present and unchanged) every assertion here held byte-for-byte.
 At step 5, nanochat.checkpoint_manager itself was rewired to build modelcore.Model objects
 (via nanochat.architectures.legacy for anything predating modelcore) instead of the deleted
-nanochat.model.* classes -- accounting()/optimizer_layout() in dev/capture_model_goldens.py
-became dual-path to keep working against both. Exactly one presentation-layer detail changed for
+nanochat.model.* classes -- accounting()/optimizer_layout() (tests/golden_helpers.py) became
+dual-path to keep working against both. Exactly one presentation-layer detail changed for
 a native gpt-arch checkpoint as a result (see _is_native_gpt below); every other number, and every
 non-gpt architecture, is still asserted byte-for-byte exactly as it was at Step 0.
 
 Real-checkpoint cases skip automatically on a machine without ~/.cache/nanochat populated; the
-synthetic tiny_* cases (a committed state dict per architecture/preset under tests/goldens/tiny/)
-always run.
+synthetic tiny_* cases (a committed state dict per architecture/preset under tests/goldens/tiny/,
+except the four tiny_composed_* ones -- modelcore's own baseline, under
+modelcore/tests/goldens/tiny/, see _golden_dirs below) always run.
 
 python -m pytest tests/test_goldens.py -v
 """
@@ -28,11 +29,24 @@ from nanochat.checkpoint_manager import load_model_from_dir
 from nanochat.common import get_base_dir
 from nanochat.engine import Engine, generate_naive
 
-from dev.capture_model_goldens import (
+from modelcore.tests import GOLDENS_DIR as MODELCORE_GOLDENS_DIR, TINY_DIR as MODELCORE_TINY_DIR
+
+from tests.golden_helpers import (
     GOLDENS_DIR, TINY_DIR, DEVICE, GEN_TOKENS, PROMPT_TEXT,
     _FakeTokenizer, accounting, fixed_logits_hash, optimizer_digest_from_dir, optimizer_layout,
     state_dict_fingerprint,
 )
+
+# The four tiny_composed_* sources are modelcore's own baseline goldens (moved into
+# modelcore/tests/goldens at Stage 8, see docs/roadmap.md) -- both the JSON digest and the
+# checkpoint directory live there, not under tests/goldens/ with the rest of TINY_SOURCES.
+_COMPOSED_PREFIX = "tiny_composed_"
+
+
+def _golden_dirs(out_name):
+    if out_name.startswith(_COMPOSED_PREFIX):
+        return MODELCORE_GOLDENS_DIR, MODELCORE_TINY_DIR
+    return GOLDENS_DIR, TINY_DIR
 
 # out_name -> subdir under get_base_dir() ("base_checkpoints" / "chatsft_checkpoints"), tag
 REAL_SOURCES = {
@@ -53,7 +67,8 @@ TINY_SOURCES = [
 
 
 def _load_golden(name):
-    with open(os.path.join(GOLDENS_DIR, f"{name}.json"), encoding="utf-8") as f:
+    golden_dir, _ = _golden_dirs(name)
+    with open(os.path.join(golden_dir, f"{name}.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -166,15 +181,16 @@ def test_real_checkpoint_golden(out_name):
 @pytest.mark.parametrize("out_name", TINY_SOURCES)
 def test_tiny_synthetic_golden(out_name, monkeypatch):
     golden = _load_golden(out_name)
+    _, tiny_dir = _golden_dirs(out_name)
     vocab_size = golden["meta_model_config"]["vocab_size"]
     monkeypatch.setattr(checkpoint_manager, "get_tokenizer", lambda: _FakeTokenizer(vocab_size))
 
-    model, tokenizer, meta = load_model_from_dir(TINY_DIR, DEVICE, phase="eval", model_tag=out_name)
+    model, tokenizer, meta = load_model_from_dir(tiny_dir, DEVICE, phase="eval", model_tag=out_name)
     model.eval()
 
     prompt_tokens = [i % vocab_size for i in range(1, 5)]
     _assert_matches_golden(model, tokenizer, golden, prompt_tokens=prompt_tokens)
 
-    checkpoint_dir = os.path.join(TINY_DIR, out_name)
+    checkpoint_dir = os.path.join(tiny_dir, out_name)
     shard = optimizer_digest_from_dir(model, checkpoint_dir, raw_config_dict=meta["model_config"])
     _assert_matches_optimizer_shard(shard, golden["optimizer_shard"], golden)

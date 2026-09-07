@@ -1,7 +1,7 @@
 """
 Test Flash Attention unified interface - verify FA3 and SDPA produce identical results.
 
-Run: python -m pytest tests/test_attention_fallback.py -v -s
+Run: python -m pytest modelcore/tests/test_kernels.py -v -s
 
 Note on test structure:
     Tests are split into two classes due to dtype/device constraints:
@@ -17,7 +17,7 @@ import torch
 import pytest
 import modelcore.kernels.flash_attn as fa_module
 from modelcore.kernels.flash_attn import flash_attn, HAS_FA3
-from nanochat.engine import KVCache
+from modelcore.cache import KVCache
 
 
 def set_impl(impl):

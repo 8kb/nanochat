@@ -1,14 +1,14 @@
 """
-Test the reusable building blocks under modelcore/components/, plus the window-pattern
-derivation rule (now outside modelcore -- see nanochat/architectures/derive.py). CPU-only, no
-real model needed -- these operate directly on small tensors.
+Test the reusable building blocks under modelcore/components/. CPU-only, no real model needed --
+these operate directly on small tensors. (The window-pattern derivation rule this file used to
+also cover lives outside modelcore -- see tests/test_architectures.py's
+test_compute_window_sizes_* -- since it's a depth-dial policy, not a component.)
 
-python -m pytest tests/test_modelcore_components.py -v
+python -m pytest modelcore/tests/test_components.py -v
 """
 
 import torch
 import torch.nn.functional as F
-import pytest
 
 from modelcore.components.rope import apply_rotary_emb, precompute_rotary_embeddings
 from modelcore.components.norm import norm
@@ -17,7 +17,6 @@ from modelcore.components.mlp import SwiGLUMLP
 from modelcore.components.embedding import Smear
 from modelcore.components.unembedding import LMHead
 from modelcore.components.rotary import RotaryEmbedding
-from nanochat.architectures.derive import compute_window_sizes
 
 
 # -----------------------------------------------------------------------------
@@ -85,34 +84,6 @@ def test_swiglu_mlp_shape_and_finite():
     y = mlp(x)
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
-
-
-# -----------------------------------------------------------------------------
-# window-pattern derivation (nanochat.architectures.derive.compute_window_sizes)
-
-def test_compute_window_sizes_full_context():
-    ws = compute_window_sizes("L", n_layer=4, sequence_len=512)
-    assert ws == [512] * 4
-
-
-def test_compute_window_sizes_last_layer_always_full_context():
-    # Every layer requests a short window, but the final layer is always forced to full context.
-    ws = compute_window_sizes("SS", n_layer=3, sequence_len=1024)
-    assert ws[0] < 1024 and ws[1] < 1024
-    assert ws[-1] == 1024
-
-
-def test_compute_window_sizes_tiles_pattern_across_layers():
-    ws = compute_window_sizes("SL", n_layer=4, sequence_len=2048)
-    assert ws[0] < 2048  # S
-    assert ws[1] == 2048  # L
-    assert ws[2] < 2048  # S (pattern repeats)
-    assert ws[3] == 2048  # L, also forced as the last layer
-
-
-def test_compute_window_sizes_invalid_chars_assert():
-    with pytest.raises(AssertionError):
-        compute_window_sizes("X", n_layer=2, sequence_len=128)
 
 
 # -----------------------------------------------------------------------------

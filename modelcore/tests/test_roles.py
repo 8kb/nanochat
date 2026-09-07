@@ -2,7 +2,7 @@
 Test the parameter-role protocol (modelcore/roles.py) in isolation, with small hand-built
 nn.Module trees -- no real model needed.
 
-python -m pytest tests/test_modelcore_roles.py -v
+python -m pytest modelcore/tests/test_roles.py -v
 """
 
 import pytest
