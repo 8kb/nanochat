@@ -1,7 +1,7 @@
 """
 Model: the one model class every modelcore.ModelConfig builds, driven entirely by the config
-tree instead of hardcoded per-architecture assembly -- see docs/architecture.md's "Composed
-architectures" section, the design this generalizes into the whole of modelcore.
+tree instead of hardcoded per-architecture assembly -- see modelcore/docs/architecture.md's
+"The materialized config tree" section.
 
 Model deliberately carries no accounting or optimizer methods (estimate_flops, kv_cache_spec,
 setup_optimizer, ...): those need a model only to determine shapes/roles, which
@@ -18,7 +18,8 @@ from modelcore.runtime import DEFAULT_RUNTIME
 
 class Model(nn.Module):
     def __init__(self, config, runtime=None):
-        """NOTE: may run under torch.device("meta") -- see docs/architecture.md."""
+        """NOTE: may run under torch.device("meta") -- see modelcore/docs/architecture.md's
+        "The meta-device footgun"."""
         super().__init__()
         self.config = config
         self.runtime = runtime or DEFAULT_RUNTIME

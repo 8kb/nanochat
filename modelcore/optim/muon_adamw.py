@@ -201,8 +201,8 @@ class MuonAdamW(torch.optim.Optimizer):
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
 
     The same class covers single GPU and distributed training. In the distributed setting
-    (a multi-rank process group is initialized), gradients are synchronized here in the
-    optimizer (nanochat does not use DDP) and optimizer states are sharded across ranks
+    (a multi-rank process group is initialized), gradients are synchronized here in the optimizer
+    (no DDP wrapper is assumed or required) and optimizer states are sharded across ranks
     (ZeRO-2 style). On a single rank, all communication is skipped and the rank owns all
     parameters, so the sharded code paths degenerate to plain full-tensor updates.
 

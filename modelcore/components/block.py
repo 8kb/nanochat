@@ -47,12 +47,11 @@ def _validate_plain_block(params, ctx):
 @register_component("gpt_block", needs=("n_embd", "padded_vocab_size", "rope", "runtime"), validate=_validate_gpt_block)
 class Block(BaseBlock):
     """CausalSelfAttention + MLP, plus the per-layer resid/x0-lambda residual mixing (inspired by
-    modded-nanogpt; see docs/upstream/LOG.md's 2026-01 entries on why these help):
-    resid_lambda scales the residual stream at this layer (init ~1.0 = neutral), x0_lambda blends
-    the initial embedding back in (init ~0.0 = disabled). has_value_embed and the resid/x0-lambda
-    init values are already-decided, concrete choices made once outside modelcore when a config
-    tree is materialized (see nanochat.architectures.derive) -- this module has no policy of its
-    own about which layers get which; it only applies whatever it's given."""
+    modded-nanogpt): resid_lambda scales the residual stream at this layer (init ~1.0 = neutral),
+    x0_lambda blends the initial embedding back in (init ~0.0 = disabled). has_value_embed and the
+    resid/x0-lambda init values are already-decided, concrete choices made once outside modelcore
+    when a config tree is materialized -- this module has no policy of its own about which layers
+    get which; it only applies whatever it's given."""
     PARAM_ROLES = {"resid_lambda": "resid_scalar", "x0_lambda": "x0_scalar"}
 
     def __init__(self, n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size,

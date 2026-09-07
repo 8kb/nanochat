@@ -1,10 +1,10 @@
 """
 ArtifactStore: what ModelManager reads/writes model and optimizer artifacts through. Core owns
 the artifact *format* (what a model/optimizer state looks like); a store just knows where bytes
-live. FileSystemStore is the default, and matches nanochat's existing on-disk checkpoint layout
-exactly (model_{step:06d}.pt / meta_{step:06d}.json's "model_config" key / optim_{step:06d}_
-rank{N}.pt) so nanochat.checkpoint_manager's directory structure doesn't change -- it just hands
-ModelManager a FileSystemStore instead of doing the torch.load/torch.save itself.
+live. FileSystemStore is a directory+step convention (model_{step:06d}.pt / meta_{step:06d}.json's
+"model_config" key / optim_{step:06d}_rank{N}.pt) any host application can point at its own
+checkpoint directory -- it hands ModelManager a FileSystemStore instead of doing the
+torch.load/torch.save itself.
 
 A store is deliberately narrow: read/write a model state dict, read/write an optimizer state dict
 per rank, read/write the config dict. Anything else about a checkpoint (which tag, which step,
@@ -44,7 +44,7 @@ class ArtifactStore:
 
 class FileSystemStore(ArtifactStore):
     """One checkpoint directory + step. write_config merges into meta_{step:06d}.json's
-    "model_config" key rather than overwriting the file, since nanochat.checkpoint_manager writes
+    "model_config" key rather than overwriting the file, since a host application typically writes
     its own sibling keys (val_bpb, user_config, tokenizer_fingerprint, ...) into the same file --
     each side only ever touches the key(s) it owns."""
 

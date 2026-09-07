@@ -14,8 +14,8 @@ class CausalSelfAttention(nn.Module):
     explicit dims rather than a config object so it can be reused by a block with different config
     field names. has_value_embed is a plain, already-decided boolean here -- which layers get a
     value embedding is an architecture-level policy decision made once, outside modelcore, when a
-    config tree is materialized (see nanochat.architectures.derive.has_value_embed_pattern); this
-    module has no opinion about how that policy is chosen.
+    config tree is materialized (the host application's depth-dial layer decides this, e.g. via a
+    has_value_embed-parity rule); this module has no opinion about how that policy is chosen.
 
     Cross-layer KV sharing: a layer built with produces_kv=False has no c_k/c_v at all and, at
     forward time, reads an earlier layer's already-RoPE'd/normed/scaled K/V out of kv_bus instead
@@ -24,9 +24,9 @@ class CausalSelfAttention(nn.Module):
     their layer_idx (today's one-slot-per-layer behavior), and a consumer layer is given the
     producer's kv_slot explicitly by whatever built the tree. Passing the producer's own k/v
     tensors back into flash_attn_with_kvcache for the consumer (rather than k=None) sidesteps a
-    real FA3-vs-SDPA divergence in what k=None means (see docs/architecture.md) -- the write is a
-    no-op since the producer already wrote those exact tensors to that slot earlier in the same
-    forward pass."""
+    real FA3-vs-SDPA divergence in what k=None means (see modelcore/docs/architecture.md's
+    "Cross-layer KV sharing") -- the write is a no-op since the producer already wrote those exact
+    tensors to that slot earlier in the same forward pass."""
     PARAM_ROLES = {"value_embed": "value_embedding"}
 
     def __init__(self, n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size, has_value_embed,

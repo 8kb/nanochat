@@ -2,8 +2,8 @@
 Generic (tokenizer-agnostic) autoregressive generation primitives: sampling, a naive
 recompute-every-step reference implementation, and Decoder -- a cached prefill+decode primitive
 built on ModelManager.new_kv_cache. None of this knows about tokenizers, special tokens, or tool
-use; nanochat.engine.Engine layers those concerns (RowState, the calculator, chat special tokens)
-on top, using Decoder for the actual model-stepping.
+use; a host application layers those concerns on top (in this repo, nanochat.engine.Engine adds
+RowState, the calculator, and chat special tokens), using Decoder for the actual model-stepping.
 """
 import torch
 import torch.nn.functional as F

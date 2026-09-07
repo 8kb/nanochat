@@ -100,7 +100,7 @@ def kv_cache_spec(layer_specs) -> dict:
     num_kv_slots is the number of *distinct* KV caches, which can be fewer than len(layer_specs)
     when layers share a slot (see AttentionLayerSpec.kv_slot). Requires uniform n_kv_head/head_dim
     across layers -- a genuinely heterogeneous-KV architecture would need KVCache itself
-    generalized (see docs/roadmap.md's Stage 7/8 notes), not just this function."""
+    generalized, not just this function."""
     assert layer_specs, "layer_specs is empty"
     n_kv_heads = {s.n_kv_head for s in layer_specs}
     head_dims = {s.head_dim for s in layer_specs}

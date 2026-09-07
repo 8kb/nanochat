@@ -1,8 +1,7 @@
 """
 The materialized-tree config every modelcore.Model is built from -- the ONE format core
-understands. See docs/architecture.md's "Composed architectures" section for the design this
-continues (Stage 6 called it ComposedConfig; Stage 7 makes it the only format, so it drops the
-qualifier).
+understands. See modelcore/docs/architecture.md's "The materialized config tree" section for the
+design this continues.
 
 Every component (embedding, block, unembedding, composer, shared component like RoPE) is one
 ComponentSpec: its type under a "#type" key, its already-concrete constructor kwargs as siblings.
@@ -19,7 +18,7 @@ from dataclasses import dataclass, field
 
 TYPE_KEY = "#type"
 FORMAT = "modelcore.v1"  # stamped by to_dict(); a dict with no "format" key predates modelcore
-                          # entirely and needs nanochat.architectures.legacy to migrate first.
+                          # entirely and needs the host application's own legacy migration first.
 
 
 @dataclass
@@ -93,7 +92,7 @@ def _count_blocks(spec) -> int:
 class ModelConfig:
     """A materialized architecture tree -- the only shape modelcore knows how to build. `reference`
     optionally records how this config was produced (`{"preset": name, "kwargs": {...}}`, stamped
-    by whatever built it outside core -- see nanochat.architectures.presets) so a muP scaling-law
+    by whatever depth-dial layer built it outside core) so a muP scaling-law
     reference model can be re-derived at a different depth without re-deriving the whole tree by
     hand, and so a display/tag name is available without core knowing about architecture names at
     all; a config with no `reference` (e.g. a from-scratch hand-written tree) has neither.
