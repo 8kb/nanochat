@@ -1,4 +1,4 @@
-"""Minimal FP8 training for nanochat — tensorwise dynamic scaling only.
+"""Minimal FP8 training for modelcore — tensorwise dynamic scaling only.
 
 Drop-in replacement for torchao's Float8Linear (~2000 lines) with ~150 lines.
 We only need the "tensorwise" recipe (one scalar scale per tensor), not the full
@@ -67,12 +67,19 @@ compared to the matmul. In practice this means our version is slightly faster
 (less compilation overhead, no tensor subclass dispatch cost) but can produce
 subtly different floating-point rounding paths under torch.compile, since Inductor
 generates a different graph. Numerics are bitwise identical in eager mode.
+
+Float8Linear subclasses modelcore.components.linear.Linear (not a bare nn.Linear):
+modelcore's parameter-role protocol (modelcore.roles.collect_param_roles) and its FLOPs/param
+accounting (modelcore.stats.num_matmul_params) both key on isinstance(module, Linear) as the
+structural marker for "this is a matmul weight" -- a Float8Linear that skipped that base class
+would silently fall out of both (collect_param_roles would raise "no declared role", and
+num_matmul_params would undercount).
 """
 
 import torch
 import torch.nn as nn
 
-from nanochat.common import COMPUTE_DTYPE
+from modelcore.components.linear import Linear
 
 # Avoid division by zero when computing scale from an all-zeros tensor
 EPS = 1e-12
@@ -192,17 +199,24 @@ class _Float8Matmul(torch.autograd.Function):
         return grad_input, grad_weight
 
 
-class Float8Linear(nn.Linear):
-    """Drop-in nn.Linear replacement that does FP8 compute.
+class Float8Linear(Linear):
+    """Drop-in modelcore.components.linear.Linear replacement that does FP8 compute.
 
     Weights and biases remain in their original precision (e.g. fp32/bf16).
     Only the matmul is performed in FP8 via the _Float8Matmul autograd function.
+    Subclassing Linear (not nn.Linear) is what keeps this a "matrix"-role parameter to
+    collect_param_roles and a counted parameter to num_matmul_params -- see the module docstring.
     """
 
+    def __init__(self, in_features, out_features, bias=True, *, runtime=None, **kwargs):
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        from modelcore.runtime import DEFAULT_RUNTIME
+        self._runtime = runtime or DEFAULT_RUNTIME
+
     def forward(self, input):
-        # Cast input to COMPUTE_DTYPE (typically bf16) since _scaled_mm expects
+        # Cast input to the runtime's compute dtype (typically bf16) since _scaled_mm expects
         # reduced precision input, and we no longer rely on autocast to do this.
-        input = input.to(COMPUTE_DTYPE)
+        input = input.to(self._runtime.compute_dtype)
         # _scaled_mm only works on 2D tensors, so flatten batch dimensions
         orig_shape = input.shape
         input_2d = input.reshape(-1, orig_shape[-1])
@@ -213,15 +227,15 @@ class Float8Linear(nn.Linear):
         return output
 
     @classmethod
-    def from_float(cls, mod):
-        """Create Float8Linear from nn.Linear, sharing the same weight and bias.
+    def from_float(cls, mod, *, runtime=None):
+        """Create Float8Linear from a Linear, sharing the same weight and bias.
 
         Uses meta device to avoid allocating a temporary weight tensor — we
         create the module shell on meta (shapes/dtypes only, no memory), then
         point .weight and .bias to the original module's parameters.
         """
         with torch.device("meta"):
-            new_mod = cls(mod.in_features, mod.out_features, bias=False)
+            new_mod = cls(mod.in_features, mod.out_features, bias=False, runtime=runtime)
         new_mod.weight = mod.weight
         new_mod.bias = mod.bias
         return new_mod
@@ -240,27 +254,59 @@ class Float8LinearConfig:
         return Float8LinearConfig()
 
 
-def convert_to_float8_training(module, *, config=None, module_filter_fn=None):
-    """Replace nn.Linear layers with Float8Linear throughout a module.
+def default_module_filter(mod: nn.Module, fqn: str, *, align: int = 16, min_dim: int = 128) -> bool:
+    """Default eligibility filter for convert_to_float8_training: dims must be divisible by
+    `align` (FP8 hardware requirement) and large enough that quantization overhead doesn't
+    dominate a tiny matmul."""
+    if not isinstance(mod, nn.Linear):
+        return False
+    if mod.in_features % align != 0 or mod.out_features % align != 0:
+        return False
+    if min(mod.in_features, mod.out_features) < min_dim:
+        return False
+    return True
+
+
+def convert_to_float8_training(module, *, config=None, module_filter_fn=None, runtime=None):
+    """Replace modelcore Linear layers with Float8Linear throughout a module.
 
     Walks the module tree in post-order (children before parents) and swaps
-    each nn.Linear that passes the optional filter. The new Float8Linear shares
+    each Linear that passes the optional filter. The new Float8Linear shares
     the original weight and bias tensors — no copies, no extra memory.
 
     Args:
         module: Root module to convert.
         config: Float8LinearConfig (accepted for API compat, only tensorwise supported).
         module_filter_fn: Optional filter(module, fqn) -> bool. Only matching Linears
-            are converted. Common use: skip layers with dims not divisible by 16
-            (hardware requirement for FP8 matmuls on H100).
+            are converted. Defaults to default_module_filter.
+        runtime: Runtime whose compute_dtype governs Float8Linear's input cast; defaults to
+            DEFAULT_RUNTIME.
     """
+    filter_fn = module_filter_fn or default_module_filter
+
     def _convert(mod, prefix=""):
         for name, child in mod.named_children():
             fqn = f"{prefix}.{name}" if prefix else name
             _convert(child, fqn)
             if isinstance(child, nn.Linear) and not isinstance(child, Float8Linear):
-                if module_filter_fn is None or module_filter_fn(child, fqn):
-                    setattr(mod, name, Float8Linear.from_float(child))
+                if filter_fn(child, fqn):
+                    setattr(mod, name, Float8Linear.from_float(child, runtime=runtime))
 
     _convert(module)
     return module
+
+
+def find_fp8_locations(model):
+    """Return the list of (parent, attr_name, Float8Linear) locations currently converted in
+    model, for ModelManager.fp8_disabled's swap-out/restore -- kept here as a plain function so
+    it's directly testable without going through the manager."""
+    locations = []
+    for name, module in model.named_modules():
+        if isinstance(module, Float8Linear):
+            if "." in name:
+                parent_name, attr_name = name.rsplit(".", 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent, attr_name = model, name
+            locations.append((parent, attr_name, module))
+    return locations

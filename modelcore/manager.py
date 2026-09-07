@@ -1,10 +1,11 @@
 """
 ModelManager: the one entrypoint modelcore exposes. Everything a caller needs to create, load,
 save, or validate a model or its optimizer, or measure a config's cost, goes through here.
-Nothing else in modelcore (components, composers, catalog, roles, stats' free functions) is meant
-to be used directly from outside the package -- see the module docstrings for why each exists,
-but ModelManager is the seam.
+Nothing else in modelcore (components, composers, catalog, roles, stats' free functions,
+modelcore.precision.fp8) is meant to be used directly from outside the package -- see the module
+docstrings for why each exists, but ModelManager is the seam.
 """
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -21,6 +22,14 @@ from modelcore.stats import (
     ModelStats, estimate_flops, has_sliding_window as _has_sliding_window, kv_cache_spec as _kv_cache_spec,
     num_matmul_params as _num_matmul_params, shape_summary as _shape_summary,
 )
+
+
+@dataclass(frozen=True)
+class Fp8Report:
+    """What enable_fp8 did, for the caller's log line -- see ModelManager.enable_fp8."""
+    num_linear: int
+    num_converted: int
+    num_skipped: int
 
 
 @dataclass
@@ -162,3 +171,50 @@ class ModelManager:
             batch_size=batch_size, seq_len=seq_len, device=device or model.get_device(),
             dtype=self.runtime.compute_dtype, **spec,
         )
+
+    # -- precision --
+
+    def enable_fp8(self, model: Model, *, recipe: str = "tensorwise", align: int = 16, min_dim: int = 128) -> Fp8Report:
+        """Converts every eligible modelcore.components.linear.Linear in model to
+        modelcore.precision.fp8.Float8Linear in place. Eligible = dims divisible by `align`
+        (hardware requirement) and at least `min_dim` (below that, quantization overhead
+        dominates the matmul it's supposed to speed up). Safe to call on a model whose optimizer
+        hasn't been built yet -- create_optimizer/collect_param_roles see Float8Linear as an
+        ordinary "matrix"-role Linear subclass, since that's what it is."""
+        from modelcore.components.linear import Linear
+        from modelcore.precision.fp8 import (
+            Float8Linear, Float8LinearConfig, convert_to_float8_training, default_module_filter,
+        )
+        Float8LinearConfig.from_recipe_name(recipe)  # validates recipe; only "tensorwise" today
+        num_linear = sum(1 for m in model.modules() if isinstance(m, Linear))
+        module_filter_fn = lambda mod, fqn: default_module_filter(mod, fqn, align=align, min_dim=min_dim)
+        convert_to_float8_training(model, module_filter_fn=module_filter_fn, runtime=self.runtime)
+        num_converted = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
+        return Fp8Report(num_linear=num_linear, num_converted=num_converted, num_skipped=num_linear - num_converted)
+
+    @contextmanager
+    def fp8_disabled(self, model: Model):
+        """Temporarily swaps every Float8Linear in model back to a plain Linear sharing the same
+        weight/bias, for full-precision eval -- and restores them on exit. A no-op (still a valid
+        context manager) when model has no Float8Linear at all."""
+        from modelcore.components.linear import Linear
+        from modelcore.precision.fp8 import find_fp8_locations
+        locations = find_fp8_locations(model)
+        if not locations:
+            yield
+            return
+        for parent, attr_name, fp8_module in locations:
+            # meta device: avoid a real allocation for a shell that's about to share weight/bias
+            linear = Linear(
+                fp8_module.in_features, fp8_module.out_features,
+                bias=fp8_module.bias is not None, device="meta", dtype=fp8_module.weight.dtype,
+            )
+            linear.weight = fp8_module.weight
+            if fp8_module.bias is not None:
+                linear.bias = fp8_module.bias
+            setattr(parent, attr_name, linear)
+        try:
+            yield
+        finally:
+            for parent, attr_name, fp8_module in locations:
+                setattr(parent, attr_name, fp8_module)
