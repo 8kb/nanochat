@@ -171,6 +171,13 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   [modelcore/docs/architecture.md](modelcore/docs/architecture.md#intra-document-masking) for why
   (a real, measured recompile cost otherwise) and why positions are deliberately not reset per
   document (RoPE + QK-norm make it a no-op).
+- **`build_doc_args`'s `max_docs` default is a dataset-tuned guess, not a safe worst case.** It
+  sizes the FA3 varlen kernel's backward-pass scratch allocation directly — defaulting it to
+  `batch_size * sequence_len` (every token its own document) OOM'd a real 2x H100 run trying to
+  allocate 28GB of scratch for a declared batch of 131,072 sequences when the real batch had ~270
+  documents. `DEFAULT_MAX_DOCS_PER_ROW=64` is tuned against ClimbMix's measured ~4.2 documents/row
+  at `sequence_len=2048`; `--doc-masking-max-docs-per-row` overrides it for a different
+  dataset/sequence-length combination.
 - **`AttentionLayerSpec.kv_slot` decouples layer index from KV-cache slot.**
   `ModelStats.kv_cache_spec["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
   at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`

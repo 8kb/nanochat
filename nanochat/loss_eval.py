@@ -8,7 +8,7 @@ import torch.distributed as dist
 from modelcore.kernels.flash_attn import build_doc_args
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None):
+def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None, doc_masking_max_docs_per_row=None):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -29,7 +29,9 @@ def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None):
     bos_token_id: when given, restricts attention to within each packed row's own document (see
     modelcore.kernels.flash_attn.build_doc_args) -- matches whatever masking training used, so
     val bpb stays comparable to the training loss it's evaluating. None (default) is unmasked, as
-    before.
+    before. doc_masking_max_docs_per_row: forwarded to build_doc_args's max_docs (as a per-row
+    count, scaled by x's actual batch size) -- see build_doc_args's docstring for why its default
+    is dataset-dependent, not a safe worst case.
     """
     # record the losses
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -37,7 +39,10 @@ def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, *_ = next(batch_iter)  # datacore.reader.batches yields a 3rd element (resume state)
-        doc_args = build_doc_args(x, bos_token_id) if bos_token_id is not None else None
+        doc_args = None
+        if bos_token_id is not None:
+            max_docs = doc_masking_max_docs_per_row * x.size(0) if doc_masking_max_docs_per_row is not None else None
+            doc_args = build_doc_args(x, bos_token_id, max_docs=max_docs)
         loss2d = model(x, y, loss_reduction='none', doc_args=doc_args) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten

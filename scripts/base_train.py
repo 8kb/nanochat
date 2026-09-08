@@ -85,6 +85,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--dataset", type=str, default=None, help="prepared dataset name (see scripts/data_prep.py --kind=base); default: derived from --max-seq-len and the tokenizer fingerprint")
 parser.add_argument("--ignore-dataloader-state", action="store_true", help="on --resume-from-step, restart the data stream from the beginning instead of refusing a pre-datacore checkpoint's dataloader state (model/optimizer weights load either way)")
 parser.add_argument("--doc-masking", action="store_true", help="restrict attention to within each packed row's own document (BOS-delimited), instead of allowing attention across document boundaries within a row -- see modelcore.kernels.flash_attn.build_doc_args")
+parser.add_argument("--doc-masking-max-docs-per-row", type=int, default=None, help="override build_doc_args's default per-row document budget (DEFAULT_MAX_DOCS_PER_ROW=64) used to size the FA3 varlen kernel's cu_seqlens; raise this if a run hits build_doc_args's 'exceeds max_docs' assertion for a dataset/sequence-length combination that packs unusually many documents per row")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -131,6 +132,17 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 tokenizer_fingerprint = tokenizer.fingerprint()
 bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
+
+def make_doc_args(x):
+    """None when --doc-masking is off; otherwise build_doc_args on x's actual batch size, honoring
+    --doc-masking-max-docs-per-row if given (its own default, DEFAULT_MAX_DOCS_PER_ROW, is sized
+    for ClimbMix at sequence_len=2048 -- see build_doc_args's docstring for why a wrong default
+    here is a real memory bug, not just a style choice)."""
+    if not args.doc_masking:
+        return None
+    max_docs = args.doc_masking_max_docs_per_row * x.size(0) if args.doc_masking_max_docs_per_row is not None else None
+    return build_doc_args(x, bos_token_id, max_docs=max_docs)
+
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -449,7 +461,8 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id)
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                    doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -539,7 +552,7 @@ while True:
         # doc_args is built here, outside the compiled model, and passed in as plain data --
         # deriving it from idx inside a torch.compile'd forward hits the recompile limit (see
         # modelcore.kernels.flash_attn.build_doc_args's docstring).
-        doc_args = build_doc_args(x, bos_token_id) if args.doc_masking else None
+        doc_args = make_doc_args(x)
         loss = model(x, y, doc_args=doc_args)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here

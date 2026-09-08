@@ -356,6 +356,16 @@ graph, and `flash_attn_varlen_func`'s `cu_seqlens` is padded to a fixed shape so
 model's input shapes never change step to step (a real, measured cost otherwise — see
 `docs/upstream/LOG.md`'s "Varlen Attention" entry: 25s/iter from a variable-shape `cu_seqlens`).
 
+That fixed shape is `DEFAULT_MAX_DOCS_PER_ROW * batch_size` documents, **not** the true worst case
+(every token its own document). This is load-bearing, not a style choice: the FA3 varlen kernel
+sizes its backward-pass scratch off `cu_seqlens`'s declared length regardless of how many segments
+are actually non-empty, so defaulting to the worst case (`batch_size * sequence_len`) made a real
+2x H100 run's backward pass try to allocate 28GB of scratch for a declared batch of 131,072
+sequences when the real batch had ~270 documents — an OOM against a model that otherwise fit in
+70GB. `DEFAULT_MAX_DOCS_PER_ROW=64` is sized against ClimbMix's measured ~4.2 documents/row at
+`sequence_len=2048`; `scripts/base_train.py --doc-masking-max-docs-per-row` overrides it for a
+dataset/sequence-length combination that packs more.
+
 Positions are **not** reset per document. RoPE attention scores depend only on the relative offset
 `i − j` between two positions (see `modelcore/components/rope.py`'s note on this), and QK-norm
 commutes with RoPE because a rotation preserves vector norm. With intra-document masking, every

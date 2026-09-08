@@ -467,13 +467,27 @@ class TestBuildDocArgs:
             [BOS, 5, BOS, BOS, 6, 7], # doc starts at row-local 0, 2 (BOS,BOS run collapses) -> flat 6, 8
         ])
         args = build_doc_args(idx, BOS)
+        default_cap = fa_module.DEFAULT_MAX_DOCS_PER_ROW * B
         assert args.max_seqlen == T
         assert args.cu_seqlens.dtype == torch.int32
-        assert args.cu_seqlens.shape == (B * T + 1,)  # default cap: worst case, never overflows
+        assert args.cu_seqlens.shape == (default_cap + 1,)  # default cap: DEFAULT_MAX_DOCS_PER_ROW
+                                                              # * B, NOT the B*T worst case -- see
+                                                              # build_doc_args's docstring for why
+                                                              # that worst case OOM'd a real H100 run
         num_docs = 4  # row0: [0,3]; row1: [6,8] (9 collapses into 8's run)
         assert args.cu_seqlens[:num_docs].tolist() == [0, 3, 6, 8]
         assert args.cu_seqlens[num_docs].item() == B * T
         assert (args.cu_seqlens[num_docs:] == B * T).all()  # zero-length trailing segments
+
+    def test_default_cap_is_not_worst_case(self):
+        """Regression test for the bug that OOM'd a real H100 run: the default cu_seqlens cap
+        must scale with a small per-row document budget, not with B*T (every token its own
+        document) -- that worst case made the FA3 varlen kernel allocate backward-pass scratch for
+        a declared batch of 131,072 sequences when the real batch had ~270 documents."""
+        B, T = 8, 2048
+        default_cap = fa_module.DEFAULT_MAX_DOCS_PER_ROW * B
+        assert default_cap < B * T
+        assert default_cap == 512
 
     def test_max_docs_overflow_raises(self, monkeypatch):
         monkeypatch.setattr(fa_module, "USE_FA3", True)

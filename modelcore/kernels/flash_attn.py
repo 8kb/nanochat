@@ -107,6 +107,14 @@ class DocArgs(NamedTuple):
     max_seqlen: Optional[int] = None
 
 
+DEFAULT_MAX_DOCS_PER_ROW = 64
+"""Default cap on documents-per-row for build_doc_args's cu_seqlens (see there). ClimbMix at
+sequence_len=2048 averages ~4.2 documents/row (3,727,360 documents / 893,729 sequences, measured
+against a real prepared dataset) -- 64 is a >15x safety margin over that average, not a measured
+per-row maximum. Pass max_docs explicitly for a dataset/sequence-length combination where that
+margin doesn't hold (very short documents relative to sequence_len)."""
+
+
 def build_doc_args(idx, bos_token_id, max_docs=None):
     """Derive document boundaries from BOS positions in idx, (B, T) token ids.
 
@@ -116,6 +124,14 @@ def build_doc_args(idx, bos_token_id, max_docs=None):
     upstream's own measurement -- see docs/upstream/LOG.md's "Varlen Attention" entry). Both are
     avoided here: doc_ids is a plain cumsum (no data-dependent shape), and cu_seqlens is padded to
     a fixed `max_docs` so its shape is constant regardless of how many documents actually occur.
+
+    max_docs directly sizes the FA3 varlen kernel's backward-pass scratch allocation -- it is NOT
+    just cu_seqlens's own (negligible) tensor size. The kernel treats cu_seqlens as declaring that
+    many sequences regardless of how many are actually non-empty, and allocates workspace
+    accordingly: defaulting this to the worst case (every token its own document, B*T) OOM'd a
+    real H100 run trying to allocate 28GB of backward scratch for a declared batch of 131,072
+    sequences when the real batch had ~270 documents. Default is `DEFAULT_MAX_DOCS_PER_ROW * B` --
+    tune it down for less memory, up if a dataset genuinely packs more documents per row.
 
     A run of consecutive BOS ids (BestFitPadPacker's pad tail, datacore/packing.py) collapses into
     one document rather than one document per pad token -- `is_start` only fires on the first BOS
@@ -140,12 +156,11 @@ def build_doc_args(idx, bos_token_id, max_docs=None):
     # NOTE: nonzero() above is fine here -- build_doc_args always runs outside torch.compile.
     num_docs = starts_flat.numel()
     total = B * T
-    # Default cap is the true worst case (every token its own document) so this can never
-    # overflow; since B and T are fixed for a whole training run, cu_seqlens's shape below is
-    # constant across steps either way -- a smaller explicit max_docs just trims its (negligible)
-    # size.
-    cap = max_docs if max_docs is not None else total
-    assert num_docs <= cap, f"{num_docs} document segments exceeds max_docs={cap}; pass a larger max_docs"
+    cap = max_docs if max_docs is not None else DEFAULT_MAX_DOCS_PER_ROW * B
+    assert num_docs <= cap, (
+        f"{num_docs} document segments exceeds max_docs={cap} ({'explicit' if max_docs is not None else f'default: {DEFAULT_MAX_DOCS_PER_ROW} * batch_size={B}'}) "
+        f"-- this batch packs more documents/row than the default margin assumes; pass a larger max_docs to build_doc_args"
+    )
     cu_seqlens = torch.full((cap + 1,), total, dtype=torch.int32, device=idx.device)
     cu_seqlens[:num_docs] = starts_flat
     cu_seqlens[num_docs] = total
