@@ -672,6 +672,69 @@ This run is the unmasked baseline for the intra-document attention masking work
 (`modelcore/kernels/flash_attn.py`'s `build_doc_args`/varlen path) — see that section's own
 results, appended below once run.
 
+## Stage 7 results: intra-document attention masking (`--doc-masking`), same shape as Stage 6
+
+Byte-identical command to Stage 6 plus `--doc-masking`, on the same volume/dataset, so Stage 6 is
+the direct baseline:
+
+```
+torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
+  --arch=llama_kvshare_win --depth=13 --window-pattern=LLLLSSLSSLSSL \
+  --arch-opt kv_share_frac=0.6923 --target-param-data-ratio=10 --fp8 --doc-masking \
+  --device-batch-size=64 --core-metric-every=-1 \
+  --model-tag=kvshare4win_d13_ratio10_docmask --run=dummy
+```
+
+**First attempt OOM'd** — `flash_attn_varlen_func`'s backward pass tried to allocate 28.44GB of
+scratch and crashed on the very first training step, against a model that otherwise fit in ~70GB.
+Root cause: `build_doc_args`'s `max_docs` (which sizes the kernel's declared segment count, and
+therefore its backward-scratch allocation, not just `cu_seqlens`'s own tensor size) defaulted to
+the true worst case (`batch_size * sequence_len` = 131,072 possible documents) instead of a
+realistic one. Fixed by defaulting to `DEFAULT_MAX_DOCS_PER_ROW=64 * batch_size` (a >15x margin
+over ClimbMix's measured ~4.2 documents/row at this sequence length, from this same prepared
+dataset's manifest: 3,727,360 documents / 893,729 sequences) — see the commit fixing
+`modelcore/kernels/flash_attn.py` for the full account. Terminated the crashed pod immediately,
+fixed and tested locally, then retried on a fresh pod; the retry ran clean end to end.
+
+| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | wall time | fp8 converted |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 175,472,640 | 146,112,512 | 2,786 | 524,288 | 10.00 | **0.872063** | ~832,000-840,000 | ~44.8% | 69.87 GB | 29.17 min | 74/74 |
+
+**Same tokens (1.46B, same 2,786 steps), masking vs. Stage 6's unmasked baseline**: val bpb
+0.872063 vs. 0.874398 — masking **0.27% lower** (better). Final step was again the minimum for
+both runs. Peak memory is essentially unchanged (69.87GB both), confirming the `max_docs` fix
+eliminated the OOM without materially changing the model's own memory footprint — the extra cost
+is all in the varlen kernel's own (now-bounded) scratch.
+
+**Same wall-clock budget**: doc-masking is measurably slower — 29.17min vs. 26.52min for the same
+2,786 steps, a **9.99% throughput cost** (830-840k tok/sec vs. baseline's 915-920k, 44.8% vs. 49%
+bf16 MFU), consistent almost exactly with the wall-time ratio (29.17/26.52 = 1.0999). Interpolating
+the baseline's own logged checkpoints (every 250 steps) against the wall-clock-equivalent baseline
+step for each masked checkpoint (`masked_step * 1.0999`) shows masking trailing by roughly 0.5-0.9%
+through most of training, narrowing back to roughly even by the last ~300 steps — so the small
+final-step edge is not simply "masking is better," it's masking spending ~10% more wall-clock time
+to land in the same place, plus a small extra edge that shows up late. Neither framing is dramatic:
+this is the same "essentially identical, noise-level" territory `docs/upstream/LOG.md`'s own varlen
+attempt found at d16, now reproduced on this fork's kv-sharing + sliding-window architecture, with
+the added, measured cost of the varlen kernel itself.
+
+One asymmetry worth flagging for anyone re-reading these two numbers later: this run's val bpb is
+computed *with* the same intra-document masking as training (`nanochat/loss_eval.py`'s
+`evaluate_bpb` takes `bos_token_id`/`doc_masking_max_docs_per_row` and masks val batches
+identically) — deliberate, so val bpb stays comparable to the training loss it's evaluating, but it
+means the two runs' val bpb aren't measuring exactly the same quantity (unmasked vs. masked
+attention over the same held-out tokens), only the same *procedure* each run actually trained
+under.
+
+**Not run**: applying `doc_args` only to the architecture's full-context (`window: 2048`) layers
+and leaving the six `window: 512` layers on the cheaper fixed-window kernel — a real design
+question this result raises (cross-document leakage is largest exactly in the full-context layers,
+where a token can otherwise see all the way back to row start; a short-window layer's 512-token
+reach already limits how much of it is even reachable), left for a follow-up rather than this run.
+
+**Cost**: pod ran 29.17 min training (plus setup/sync) on 2x H100 ($6.98/hr) ≈ **$3.40** for this
+run; the crashed first attempt added ~2 min (~$0.23) before being caught and terminated.
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now
