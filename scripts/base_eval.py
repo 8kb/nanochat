@@ -28,13 +28,15 @@ import tempfile
 import argparse
 import torch
 
+from datacore import DataManager, FileSystemDatasetStore
+
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from scripts.data_prep import default_dataset_name, prepared_dir
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -135,6 +137,7 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--dataset', type=str, default=None, help='prepared dataset name for --eval bpb (default: derived from the checkpoint\'s sequence_len and the tokenizer fingerprint)')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -209,8 +212,26 @@ def main():
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
 
+        dataset_name = args.dataset or default_dataset_name("base", sequence_len, tokenizer)
+        data_store = FileSystemDatasetStore(prepared_dir(dataset_name))
+        data_manager = DataManager()
+        try:
+            dataset = data_manager.open(data_store)
+        except FileNotFoundError:
+            raise SystemExit(
+                f"No prepared dataset found for {dataset_name!r}. Run:\n"
+                f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={sequence_len}"
+            )
+        if dataset.info.sequence_len != sequence_len:
+            raise SystemExit(
+                f"Dataset {dataset_name!r} has sequence_len={dataset.info.sequence_len}, but this "
+                f"checkpoint's model was trained at sequence_len={sequence_len}. Re-prepare it:\n"
+                f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={sequence_len}"
+            )
+
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            loader = data_manager.batches(dataset, split_name, args.device_batch_size, device=device,
+                                          rank=ddp_rank, world_size=ddp_world_size, infinite=True)
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")

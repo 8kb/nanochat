@@ -1,20 +1,21 @@
 """
-Mechanical guard for modelcore's standalone-ness: AST-scans every .py file under modelcore/
+Mechanical guard for datacore's standalone-ness: AST-scans every .py file under datacore/
 (package and its own tests) and asserts none of them import anything from the host application
-(nanochat, scripts, tasks) or its dev/ tooling. This is what makes `cp -r modelcore /somewhere/else`
-a real, testable claim rather than an aspiration -- see docs/roadmap.md's Stage 8.
+(nanochat, scripts, tasks, dev) or modelcore (a sibling standalone component, not a dependency).
+This is what makes `cp -r datacore /somewhere/else` a real, testable claim rather than an
+aspiration -- mirrors modelcore/tests/test_standalone.py.
 
-A docstring or comment mentioning "nanochat" is fine (and common -- see e.g. modelcore/store.py's
-own module docstring); only actual import statements are checked.
+A docstring or comment mentioning "nanochat" is fine (and common); only actual import statements
+are checked.
 
-python -m pytest modelcore/tests/test_standalone.py -v
+python -m pytest datacore/tests/test_standalone.py -v
 """
 import ast
 import os
 
-FORBIDDEN_TOP_LEVEL_PACKAGES = {"nanochat", "scripts", "tasks", "dev", "datacore"}
+FORBIDDEN_TOP_LEVEL_PACKAGES = {"nanochat", "scripts", "tasks", "dev", "modelcore"}
 
-MODELCORE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATACORE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _iter_python_files(root):
@@ -39,12 +40,12 @@ def _imported_top_level_packages(file_path):
     return found
 
 
-def test_no_python_file_under_modelcore_imports_the_host_application():
+def test_no_python_file_under_datacore_imports_the_host_application():
     violations = {}
-    for file_path in _iter_python_files(MODELCORE_ROOT):
+    for file_path in _iter_python_files(DATACORE_ROOT):
         found = _imported_top_level_packages(file_path) & FORBIDDEN_TOP_LEVEL_PACKAGES
         if found:
-            violations[os.path.relpath(file_path, MODELCORE_ROOT)] = sorted(found)
+            violations[os.path.relpath(file_path, DATACORE_ROOT)] = sorted(found)
     assert not violations, (
-        f"modelcore/ must have zero imports from its host application, but found: {violations}"
+        f"datacore/ must have zero imports from its host application or modelcore, but found: {violations}"
     )

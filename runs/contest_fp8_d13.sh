@@ -104,6 +104,17 @@ if [ -z "${SKIP_SETUP:-}" ]; then
             python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
         fi
     fi
+    # Prepare the pretokenized, packed base dataset once (CPU-only) -- no SFT prep here, this
+    # script is base-training-only (see docs/roadmap.md's Stage 8 step 6 note). Skipped if already
+    # prepared, so a resumed/rerun invocation doesn't redo this every time.
+    dataset_name=$(python -c "
+from nanochat.tokenizer import get_tokenizer
+from scripts.data_prep import default_dataset_name
+print(default_dataset_name('base', 2048, get_tokenizer()))
+")
+    if ! python -m scripts.data_prep --describe --dataset="$dataset_name" > /dev/null 2>&1; then
+        python -m scripts.data_prep --kind=base --sequence-len=2048
+    fi
 else
     source .venv/bin/activate
 fi

@@ -18,6 +18,20 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 source .venv/bin/activate
 
+# This script assumes pretraining data is already present (unlike speedrun.sh/runcpu.sh/
+# miniseries.sh, it doesn't download anything) -- so check for a prepared dataset up front rather
+# than let every torchrun below fail the same way.
+DATASET_NAME=$(python -c "
+from nanochat.tokenizer import get_tokenizer
+from scripts.data_prep import default_dataset_name
+print(default_dataset_name('base', 2048, get_tokenizer()))
+")
+if ! python -m scripts.data_prep --describe --dataset="$DATASET_NAME" > /dev/null 2>&1; then
+    echo "ERROR: no prepared dataset '$DATASET_NAME' found. Run this first (CPU-only):"
+    echo "  python -m scripts.data_prep --kind=base --sequence-len=2048"
+    exit 1
+fi
+
 RESULTS_DIR="$NANOCHAT_BASE_DIR/scaling_laws_results_${LABEL}"
 mkdir -p "$RESULTS_DIR"
 RESULTS_FILE="$RESULTS_DIR/results.csv"

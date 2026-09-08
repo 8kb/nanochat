@@ -24,10 +24,10 @@ import wandb
 import torch
 import torch.distributed as dist
 
+from datacore import DataManager, FileSystemDatasetStore
 from modelcore import Model, ModelManager, OptimizerHparams
 from nanochat.architectures import presets
 from nanochat.scaling import derive_training_plan, B_REF
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -80,6 +80,9 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Data
+parser.add_argument("--dataset", type=str, default=None, help="prepared dataset name (see scripts/data_prep.py --kind=base); default: derived from --max-seq-len and the tokenizer fingerprint")
+parser.add_argument("--ignore-dataloader-state", action="store_true", help="on --resume-from-step, restart the data stream from the beginning instead of refusing a pre-datacore checkpoint's dataloader state (model/optimizer weights load either way)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -125,6 +128,41 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 tokenizer_fingerprint = tokenizer.fingerprint()
 print0(f"Vocab size: {vocab_size:,}")
+
+# -----------------------------------------------------------------------------
+# Open the prepared dataset (see scripts/data_prep.py -- tokenization/packing happens once,
+# offline, CPU-only; training just reads rows). --max-seq-len must match the dataset's own
+# sequence_len, and its tokenizer_fingerprint must match this run's tokenizer exactly -- both are
+# hard errors, not warnings, since either mismatch produces silent garbage.
+from scripts.data_prep import default_dataset_name, prepared_dir
+dataset_name = args.dataset or default_dataset_name("base", args.max_seq_len, tokenizer)
+dataset_dir = prepared_dir(dataset_name)
+data_manager = DataManager()
+data_store = FileSystemDatasetStore(dataset_dir)
+try:
+    dataset = data_manager.open(data_store)
+except FileNotFoundError:
+    raise SystemExit(
+        f"No prepared dataset found at {dataset_dir}.\nPrepare one first (CPU-only -- do this "
+        f"before starting a GPU run):\n"
+        f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+if dataset.info.sequence_len != args.max_seq_len:
+    raise SystemExit(
+        f"Dataset {dataset_name!r} was prepared with sequence_len={dataset.info.sequence_len}, "
+        f"but --max-seq-len={args.max_seq_len}. Re-prepare it at the matching length:\n"
+        f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+if dataset.info.tokenizer_fingerprint != tokenizer_fingerprint:
+    raise SystemExit(
+        f"Dataset {dataset_name!r} was prepared against tokenizer fingerprint "
+        f"{dataset.info.tokenizer_fingerprint}, but the local tokenizer's fingerprint is "
+        f"{tokenizer_fingerprint} -- training on it would silently learn the wrong token "
+        f"meanings. Re-prepare against the current tokenizer:\n"
+        f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
+      f"{dataset.num_sequences('val'):,} val sequences)")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -288,6 +326,10 @@ elif plan.horizon_source == "target_param_data_ratio":
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 total_tokens = plan.total_tokens
 print0(f"Total number of training tokens: {total_tokens:,}")
+train_dataset_tokens = dataset.info.splits["train"]["num_tokens"]
+print0(f"Training horizon is {total_tokens / train_dataset_tokens:.2f} epochs of the "
+      f"{dataset_name!r} dataset ({dataset.num_sequences('train'):,} sequences) -- cycling past "
+      f"1.0 is legal, just no longer invisible.")
 print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {plan.total_flops:e}")
 
@@ -314,8 +356,22 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+if dataloader_resume_state_dict is not None and dataloader_resume_state_dict.get("format") != "datacore.v1":
+    if not args.ignore_dataloader_state:
+        raise SystemExit(
+            f"{checkpoint_dir} step {args.resume_from_step} carries a pre-datacore dataloader "
+            f"state ({sorted(dataloader_resume_state_dict)}); there is no faithful translation "
+            f"into a prepared-dataset cursor. Model and optimizer weights load fine -- only the "
+            f"data-stream position is affected. Pass --ignore-dataloader-state to restart the "
+            f"data stream from the beginning."
+        )
+    print0("WARNING: ignoring a pre-datacore dataloader state -- restarting the data stream from cursor 0")
+    dataloader_resume_state_dict = None
+train_loader = data_manager.batches(dataset, "train", args.device_batch_size, device=device,
+                                     rank=ddp_rank, world_size=ddp_world_size,
+                                     resume=dataloader_resume_state_dict, infinite=True)
+build_val_loader = lambda: data_manager.batches(dataset, "val", args.device_batch_size, device=device,
+                                                 rank=ddp_rank, world_size=ddp_world_size, infinite=True)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -531,7 +587,8 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    frac_epoch = dataloader_state_dict["cursor"] / dataset.num_sequences("train")
+    epoch = f"{frac_epoch:.2f} | cursor: {dataloader_state_dict['cursor']:,}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {

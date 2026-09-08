@@ -2,10 +2,11 @@
 
 Repo map and non-obvious invariants for anyone (human or agent) working in this fork. Read
 [modelcore/docs/architecture.md](modelcore/docs/architecture.md) before touching anything under
-`modelcore/`, [docs/architecture.md](docs/architecture.md) before touching `nanochat/architectures/`
-or how the app consumes `ModelManager`, and [docs/upstream-sync.md](docs/upstream-sync.md) before
-touching anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7"
-section for where its code lives today).
+`modelcore/`, [datacore/docs/architecture.md](datacore/docs/architecture.md) before touching
+anything under `datacore/`, [docs/architecture.md](docs/architecture.md) before touching
+`nanochat/architectures/` or how the app consumes `ModelManager`, and
+[docs/upstream-sync.md](docs/upstream-sync.md) before touching anything that used to live in
+`nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section for where its code lives today).
 
 ## What this fork is
 
@@ -35,6 +36,17 @@ modelcore/            standalone model subsystem (zero nanochat imports) — see
 ├── kernels/                 unified FA3/SDPA attention interface
 ├── cache.py                 KVCache
 └── tests/, docs/, README.md, pyproject.toml   modelcore's own suite, contract, and packaging
+datacore/             standalone data subsystem (zero nanochat imports) — see datacore/docs/architecture.md
+├── manager.py           DataManager: the one entrypoint (prepare a dataset, open one, read batches)
+├── store.py              DatasetStore protocol + FileSystemDatasetStore + the manifest schema
+├── packing.py             Packer protocol; BestFitCropPacker, BestFitPadPacker
+├── writer.py              rolls PackedRow into volumes, flushed at a cap or a source boundary
+├── reader.py              memmap volumes + the cursor-based, DDP-sharded, resumable batch iterator
+│                        (the only module that imports torch, lazily)
+├── sources.py             TextSource/TokenSource protocols; ParquetDirectorySource
+├── download.py            generic resumable HTTP shard downloader
+├── tokenizer.py            Tokenizer protocol + CharTokenizer (dependency-free test double)
+└── tests/, docs/, README.md, pyproject.toml   datacore's own suite, contract, and packaging
 nanochat/             everything that knows nanochat's own conventions
 ├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
 │                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
@@ -43,18 +55,23 @@ nanochat/             everything that knows nanochat's own conventions
 ├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; LegacyCheckpointStore
 │                        adapts an old checkpoint onto ModelManager.load_model
 ├── optim.py, flash_attention.py   one-line re-export shims onto modelcore.optim/modelcore.kernels
-├── tokenizer.py            BPE tokenizer wrapper
-├── dataloader.py / dataset.py   pretraining data
+├── tokenizer.py            BPE tokenizer wrapper (satisfies datacore.Tokenizer unmodified)
+├── dataset.py               ClimbMix identity (URL, shard count, local dir) -- download/parquet
+│                        mechanism lives in datacore.download/datacore.sources
 ├── core_eval.py / loss_eval.py   base-model evaluation (CORE benchmark, bits-per-byte)
 ├── execution.py            sandboxed Python execution (tool use)
 └── scaling.py               muP training-plan math (architecture-agnostic)
 scripts/              entry points, run as `python -m scripts.<name>`
+├── data_prep.py            prepares a datacore dataset (--kind=base|sft); CPU-only, run before
+│                        base_train.py/chat_sft.py, never on a billed GPU pod
+└── ...
 tasks/                task/dataset definitions for eval (arc, mmlu, gsm8k, humaneval, smoltalk)
 tests/                nanochat's pytest suite — see "What runs on this Mac" below
-                        (modelcore/tests/ is modelcore's own, standalone suite)
+                        (modelcore/tests/, datacore/tests/ are each component's own standalone suite)
 runs/                 shell scripts wiring scripts/ together (speedrun.sh, runcpu.sh, ...)
 docs/                 this fork's documentation; docs/upstream/ holds the original nanochat docs
-dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py
+dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py,
+                        dev/capture_data_goldens.py (frozen pre-datacore packing-algorithm reference)
 ```
 
 ## Invariants that will bite you
@@ -165,6 +182,25 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   happily load a checkpoint trained against a *different* tokenizer of the same size and produce
   silent garbage, which is exactly the failure mode a multi-machine architecture comparison
   (`runs/contest.sh`, see [docs/contest.md](docs/contest.md)) would otherwise hit undetected.
+- **A prepared dataset's `sequence_len` and tokenizer fingerprint are fixed, and must match, or
+  training raises.** `scripts/base_train.py`/`scripts/chat_sft.py` open their `datacore.Dataset`
+  via `--dataset` (default: derived from `--max-seq-len`/tokenizer fingerprint,
+  `scripts/data_prep.py:default_dataset_name`) and hard-error -- not warn -- if `--max-seq-len`
+  doesn't equal `dataset.info.sequence_len` or the local tokenizer's fingerprint doesn't match
+  `dataset.info.tokenizer_fingerprint`. Unlike the checkpoint fingerprint check above, this one
+  raises: there is no scenario where training on a mismatched tokenization was intended, and it
+  produces silent garbage. Batch size, world size, rank, and split are the only things free at
+  read time -- see [datacore/docs/architecture.md](datacore/docs/architecture.md).
+- **The dataloader state in checkpoint meta is an exact global sequence cursor, not an
+  approximation.** `meta["dataloader_state_dict"]` is now `{"format": "datacore.v1", "cursor",
+  "epoch", "num_sequences", "batch_size", "world_size"}` -- `cursor` is the count of sequences
+  consumed by all ranks so far, world-size-independent by construction (resuming at a different
+  `--nproc_per_node` than the run that saved it still produces a gap-free, duplicate-free
+  continuation). A pre-datacore checkpoint's `{pq_idx, rg_idx, epoch}` state (detected by the
+  absent `"format"` key) is **refused**, not translated -- `scripts/base_train.py` raises with an
+  actionable message unless `--ignore-dataloader-state` is passed, since there is no faithful
+  mapping into a sequence cursor. Model and optimizer weights still load fine either way; only the
+  data-stream position is affected.
 - **`nanochat/default_tokenizer/` is a committed, portable default tokenizer** (532KB:
   `tokenizer.pkl` + `token_bytes.pt`) -- content-derived, so a checked-in copy is exactly as valid
   as a freshly-trained one. `runs/contest.sh`/`runs/contest_d12.sh` copy it into
@@ -205,12 +241,21 @@ Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to
 uv sync --extra cpu --group dev && source .venv/bin/activate
 ```
 
-Runs fine locally: everything in `tests/` and `modelcore/tests/` except
+Runs fine locally: everything in `tests/`, `modelcore/tests/`, and `datacore/tests/` except
 `modelcore/tests/test_optim.py` (module-level `skipif(not cuda_available)`) and the
 `TestFA3VsSDPA` class in `modelcore/tests/test_kernels.py` (needs an sm80/sm89/sm90 GPU for the
 real FA3 kernel — the SDPA fallback classes in that file run fine on CPU). `scripts/base_train.py` /
 `scripts/chat_sft.py` run at small `--depth`/`--max-seq-len`/`--device-batch-size` (see
-`runs/runcpu.sh`). `scripts/infer_bench.py` hard-asserts CUDA and does not run here.
+`runs/runcpu.sh`) against a `scripts/data_prep.py`-prepared dataset at the same `--max-seq-len` (or
+`--sequence-len` for SFT). `scripts/infer_bench.py` hard-asserts CUDA and does not run here.
+
+**MPS's first real op after `torch.compile` can genuinely take minutes**, not seconds — a cold
+Metal shader cache means the very first training run in a fresh shell can look hung (CPU busy in
+`waitUntilCompleted`/`MPSStream::synchronize`, no new stdout) for several minutes before proceeding
+normally; a second run against the same shapes is fast. Real behavior, not a bug — don't mistake it
+for a hang while testing a change on this machine. Redirecting stdout to a file also fully
+block-buffers Python's `print()` (line-buffering is TTY-only), which compounds the appearance of a
+hang — use `python -u`/`PYTHONUNBUFFERED=1` when diagnosing one for real.
 
 Untested on this machine as a result: the `bfloat16` compute path, the real FA3 kernel path
 (vs. the SDPA fallback it's checked against), the real fp8 `_scaled_mm` numerics

@@ -63,6 +63,10 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
+# Prepare the pretokenized, packed dataset once (CPU-only work -- see AGENTS.md; it's here rather
+# than on a separate cheap pod purely to keep this single-script speedrun self-contained).
+python -m scripts.data_prep --kind=base --sequence-len=2048
+
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
@@ -70,6 +74,9 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
+
+# Prepare the SFT conversation dataset once (also CPU-only)
+python -m scripts.data_prep --kind=sft --sequence-len=2048
 
 # run SFT and eval the model
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN

@@ -6,8 +6,9 @@ standalone package that knows only a materialized config tree and nothing about 
 `--depth` dial or an old checkpoint into a tree for `modelcore` to build. Stage 8 made `modelcore`
 self-contained (its own tests, docs, and packaging metadata — see
 [modelcore/docs/architecture.md](../modelcore/docs/architecture.md) for the core contract itself);
-this document covers the nanochat side: how the app consumes `ModelManager`, how an old checkpoint
-gets there, and how to verify a change is behavior-preserving.
+this document covers the nanochat side: how the app consumes `ModelManager` and (Stage 9)
+`datacore.DataManager`, how an old checkpoint gets there, and how to verify a change is
+behavior-preserving.
 
 ```
 modelcore/                standalone model subsystem -- see modelcore/docs/architecture.md
@@ -50,6 +51,40 @@ directly as a low-level utility class (a leaf `nn.Module`, not an implementation
 was previously also needed for fp8's eval swap-back, which now goes through
 `manager.enable_fp8`/`manager.fp8_disabled` instead (see
 [modelcore/docs/architecture.md](../modelcore/docs/architecture.md#fp8-precision)).
+
+## Consuming `DataManager`
+
+Training and eval scripts read data through one `datacore.DataManager` instance, exactly the same
+pattern as `ModelManager` — see [datacore/docs/architecture.md](../datacore/docs/architecture.md)
+for the full contract. `nanochat`'s job is producing the dataset (once, offline, via
+`scripts/data_prep.py`) and naming it; `DataManager` knows nothing about ClimbMix, SmolTalk, or
+this fork's checkpoint conventions:
+
+```python
+from datacore import DataManager, FileSystemDatasetStore
+manager = DataManager()
+dataset = manager.open(FileSystemDatasetStore(dataset_dir))   # raises FileNotFoundError if unprepared
+
+assert dataset.info.sequence_len == args.max_seq_len            # hard error otherwise, not a warning
+assert dataset.info.tokenizer_fingerprint == tokenizer.fingerprint()
+
+for inputs, targets, state in manager.batches(dataset, "train", args.device_batch_size,
+                                               device=device, rank=ddp_rank, world_size=ddp_world_size,
+                                               resume=dataloader_resume_state_dict, infinite=True):
+    ...
+```
+
+`scripts/data_prep.py` is the preparation entrypoint (`--kind=base` for the pretraining corpus via
+`nanochat.dataset`'s ClimbMix identity, `--kind=sft` for the `tasks/` mixture rendered through
+`RustBPETokenizer.render_conversation`) — see its own docstring and
+[datacore/docs/architecture.md](../datacore/docs/architecture.md) for the on-disk format, the
+cursor-based resumable read order, and why `sequence_len`/tokenizer fingerprint mismatches raise
+rather than warn. `nanochat/dataset.py` keeps only the corpus *identity* (`BASE_URL`, `MAX_SHARD`,
+the local directory, the legacy `base_data` fallback) — the download mechanism is
+`datacore.download`, and `parquets_iter_batched` (used by `scripts/tok_train.py`/`tok_eval.py`,
+which run before any tokenizer — and therefore any `DataManager` — exists) stays put rather than
+folding into a `datacore` source, since its row-group-level DDP striding is a different granularity
+than `datacore.sources.ParquetDirectorySource`'s one-batch-per-file boundary.
 
 ## `nanochat.checkpoint_manager`: naming policy + the `ArtifactStore` adapter
 
@@ -197,19 +232,27 @@ a checkpoint at all (meta-device only) — a faster first check when a change is
 accounting, not weights.
 
 For an end-to-end smoke test of the training path on CPU/MPS (any preset; `--arch-opt
-kv_share_frac=...` to vary the KV-sharing fraction):
+kv_share_frac=...` to vary the KV-sharing fraction), prepare a tiny dataset first (Stage 9 —
+training reads a prepared dataset, not raw parquet, so this step is required now):
 
 ```bash
+python -m scripts.data_prep --kind=base --dataset=smoke --sequence-len=128 --max-shards=2
 python -m scripts.base_train --depth=2 --head-dim=32 --window-pattern=L --max-seq-len=128 \
-  --device-batch-size=1 --total-batch-size=256 --num-iterations=3 \
+  --device-batch-size=1 --total-batch-size=256 --num-iterations=3 --dataset=smoke \
   --eval-every=-1 --core-metric-every=-1 --sample-every=-1 --model-tag=smoke --run=dummy
 ```
 
-Delete `~/.cache/nanochat/base_checkpoints/smoke` afterward — it's a throwaway. `--resume-from-step`
-(pointing at that run's final step) exercises optimizer save+load through `ModelManager` (and
-`FileSystemStore`) end to end.
+Delete `~/.cache/nanochat/base_checkpoints/smoke` and `~/.cache/nanochat/prepared/smoke` afterward
+— both are throwaway. `--resume-from-step` (pointing at that run's final step) exercises optimizer
+save+load through `ModelManager` (and `FileSystemStore`) *and* the exact-cursor dataloader resume
+through `DataManager` end to end.
 
 For a change purely inside `modelcore/` itself (a new component, a new precision scheme, ...), see
 [modelcore/docs/architecture.md](../modelcore/docs/architecture.md#verifying-a-change-is-behavior-preserving) —
 its own suite runs standalone (`python -m pytest modelcore/tests -v`) and includes a mechanical
-check (`test_standalone.py`) that it never grows a dependency back on this repo.
+check (`test_standalone.py`) that it never grows a dependency back on this repo. For a change
+purely inside `datacore/` (a new packer, a format change, ...), see
+[datacore/docs/architecture.md](../datacore/docs/architecture.md#verifying-a-change-is-behavior-preserving)
+— same shape (`python -m pytest datacore/tests -v`, its own `test_standalone.py`), plus
+`tests/test_data_packing_parity.py` in this repo to cross-check the packing algorithms against
+`dev/capture_data_goldens.py`'s frozen pre-datacore reference.

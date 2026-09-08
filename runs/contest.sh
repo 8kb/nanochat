@@ -113,6 +113,19 @@ if [ -z "${SKIP_SETUP:-}" ]; then
             python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
         fi
     fi
+    # Prepare the pretokenized, packed base + SFT datasets once (CPU-only), shared by every row --
+    # same "one artifact, built once, structural not promised" reasoning as the tokenizer above.
+    # Skipped if already prepared, so a resumed/rerun invocation doesn't redo this every time.
+    for kind in "base" "sft"; do
+        dataset_name=$(python -c "
+from nanochat.tokenizer import get_tokenizer
+from scripts.data_prep import default_dataset_name
+print(default_dataset_name('$kind', 2048, get_tokenizer()))
+")
+        if ! python -m scripts.data_prep --describe --dataset="$dataset_name" > /dev/null 2>&1; then
+            python -m scripts.data_prep --kind="$kind" --sequence-len=2048
+        fi
+    done
 else
     source .venv/bin/activate
 fi

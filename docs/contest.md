@@ -324,13 +324,15 @@ Everything above assumes the defaults. To change what's being compared:
   `--target-param-data-ratio` in both the preflight and the row's args if you want each model
   individually compute-optimal instead of budget-matched.
 - **Data**: `NUM_SHARDS` (default 100). At `TARGET_FLOPS=5e18`, gpt's row (the most token-hungry
-  of the rows) needs ≈3.16B tokens; this tokenizer's vocab averages ≈4.7 characters/token on this
-  dataset, and the BOS-aligned dataloader keeps ≈65% of tokens after cropping (see
-  `nanochat/dataloader.py`), so each ~253M-character shard yields ≈35M usable training tokens —
-  ≈91 shards needed, 100 leaves a ~10% margin. Raise `NUM_SHARDS` if you raise `TARGET_FLOPS` or
-  `--depth` significantly. The validation shard (always the last one, `shard_06542.parquet`) is
-  identical across every row regardless of `NUM_SHARDS`, which is what makes the val-bpb numbers
-  comparable to each other.
+  of the rows) needs ≈3.16B tokens. Tokenization/packing now happens once, offline
+  (`scripts/data_prep.py`, replacing the old realtime BOS-aligned dataloader), and the retention
+  ratio it actually achieved is a *measured* number, not an estimate — `python -m
+  scripts.data_prep --describe --dataset=<name>` reports it per split, and the prep run's own
+  stdout does too (previously this was a hand-estimated ≈65% at T=2048; measure your own corpus's
+  real number instead of assuming it). Raise `NUM_SHARDS` (and re-run `scripts.data_prep`) if you
+  raise `TARGET_FLOPS` or `--depth` significantly. The validation shard (always the last one,
+  `shard_06542.parquet`) is identical across every row regardless of `NUM_SHARDS`, which is what
+  makes the val-bpb numbers comparable to each other.
 - **`--fp8`** is not wired into `runs/contest.sh` and is H100-only (`modelcore/precision/fp8.py`) — irrelevant
   on A100s; if you move the contest to H100s, add `--fp8` to each row's args, but keep it on or off
   for every row equally (it changes precision). Confirmed working on real H100 hardware for the
@@ -350,9 +352,15 @@ stage was verified — no A100 was rented to write the original version of this 
 extension below was likewise verified as a full CPU/MPS rehearsal before ever running on a pod):
 
 ```bash
+# SKIP_SETUP=1 skips runs/contest.sh's own data_prep step too, so prepare small toy datasets
+# first, at the same --max-seq-len the rehearsal below uses (--mmlu-epochs/--gsm8k-epochs live on
+# data_prep now, not on chat_sft.py -- see scripts/data_prep.py --kind=sft):
+python -m scripts.data_prep --kind=base --sequence-len=128 --max-shards=2
+python -m scripts.data_prep --kind=sft --sequence-len=128 --mmlu-epochs=0 --gsm8k-epochs=0 --max-conversations=500
+
 NPROC_PER_NODE=1 DEVICE_BATCH_SIZE=2 SKIP_SETUP=1 WANDB_RUN=dummy \
 EXTRA_TRAIN_ARGS="--depth=2 --num-iterations=3 --max-seq-len=128 --total-batch-size=256 --core-metric-every=-1 --eval-tokens=2048" \
-EXTRA_SFT_ARGS="--num-iterations=3 --max-seq-len=128 --eval-every=-1 --chatcore-every=200 --mmlu-epochs=0 --gsm8k-epochs=0" \
+EXTRA_SFT_ARGS="--num-iterations=3 --max-seq-len=128 --eval-every=-1 --chatcore-every=200" \
 EXTRA_CHATEVAL_ARGS="--max-problems=2 --task-name=ARC-Easy" \
 bash runs/contest.sh rehearsal
 ```

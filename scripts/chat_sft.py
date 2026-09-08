@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+from datacore import DataManager, FileSystemDatasetStore
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, arch_of
@@ -26,11 +27,7 @@ from nanochat.engine import Engine
 from nanochat.architectures import legacy
 from modelcore import ModelManager, OptimizerHparams
 from scripts.chat_eval import run_chat_eval
-
-from tasks.common import TaskMixture
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
+from scripts.data_prep import default_dataset_name, prepared_dir
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -64,9 +61,8 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
-# Data mixture
-parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
-parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+# Data
+parser.add_argument("--dataset", type=str, default=None, help="prepared SFT dataset name (see scripts/data_prep.py --kind=sft, which also owns --mmlu-epochs/--gsm8k-epochs now); default: derived from --max-seq-len and the tokenizer fingerprint")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -165,152 +161,58 @@ for group in optimizer.param_groups:
     group["lr"] = group["lr"] * args.init_lr_frac
     group["initial_lr"] = group["lr"]
 
-# SFT data mixture and DataLoader
-train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
-    *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
-    *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-]
-train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
-# DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
-# A big problem is that we don't know the final num_iterations in advance. So we create
-# these two global variables and update them from within the data generator.
-last_step = False # we will toggle this to True when we reach the end of the training dataset
-approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
-current_epoch = 1 # track epoch for logging
-def sft_data_generator_bos_bestfit(split, buffer_size=100):
-    """
-    BOS-aligned dataloader for SFT with bestfit-pad packing.
+# Prepared SFT dataset (see scripts/data_prep.py --kind=sft -- tokenization/packing/masking
+# happens once, offline, CPU-only; training just reads rows). Unlike the old inline generator,
+# the dataset's size is known up front, so num_iterations and the LR schedule's progress no
+# longer need generator-mutated globals or a per-step cross-rank all-reduce to agree on when to
+# stop -- every rank derives the same num_iterations from the same manifest.
+dataset_name = args.dataset or default_dataset_name("sft", args.max_seq_len, tokenizer)
+data_store = FileSystemDatasetStore(prepared_dir(dataset_name))
+data_manager = DataManager()
+try:
+    dataset = data_manager.open(data_store)
+except FileNotFoundError:
+    raise SystemExit(
+        f"No prepared SFT dataset found for {dataset_name!r}.\nPrepare one first (CPU-only):\n"
+        f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+if dataset.info.sequence_len != args.max_seq_len:
+    raise SystemExit(
+        f"Dataset {dataset_name!r} was prepared with sequence_len={dataset.info.sequence_len}, "
+        f"but --max-seq-len={args.max_seq_len}. Re-prepare it:\n"
+        f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+if dataset.info.tokenizer_fingerprint != tokenizer.fingerprint():
+    raise SystemExit(
+        f"Dataset {dataset_name!r} was prepared against tokenizer fingerprint "
+        f"{dataset.info.tokenizer_fingerprint}, but the local tokenizer's fingerprint is "
+        f"{tokenizer.fingerprint()}. Re-prepare against the current tokenizer:\n"
+        f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+    )
+print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
+      f"{dataset.num_sequences('val'):,} val sequences)")
 
-    Each row in the batch starts with BOS (beginning of a conversation).
-    Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
-    Padding positions have targets masked with -1 (ignore_index for cross-entropy).
-    """
-    global last_step, approx_progress, current_epoch
-    assert split in {"train", "val"}, "split must be 'train' or 'val'"
-    dataset = train_dataset if split == "train" else val_dataset
-    dataset_size = len(dataset)
-    assert dataset_size > 0
-    row_capacity = args.max_seq_len + 1  # +1 for target at last position
-    bos_token = tokenizer.get_bos_token_id()
+# --num-iterations now means optimizer STEPS (matching scripts/base_train.py), not micro-batches
+# -- the old inline generator's `it` counted individual next() calls, i.e. micro-batches, which
+# meant the same flag meant something different in every training script. A caller relying on the
+# old micro-batch count should divide it by grad_accum_steps.
+sequences_per_optimizer_step = args.device_batch_size * ddp_world_size * grad_accum_steps
+if args.num_iterations > 0:
+    num_iterations = args.num_iterations
+else:
+    num_iterations = max(1, dataset.num_sequences("train") // sequences_per_optimizer_step)
+print0(f"Training horizon: {num_iterations:,} optimizer steps "
+      f"({num_iterations * sequences_per_optimizer_step / dataset.num_sequences('train'):.2f} epochs "
+      f"of {dataset.num_sequences('train'):,} sequences)")
 
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
-    conv_buffer = []
-    cursor = ddp_rank  # Each rank processes different conversations (for fetching)
-    consumed = ddp_rank  # Track actual consumption separately from buffering
-    epoch = 1
-    it = 0  # iteration counter
+train_loader = data_manager.batches(dataset, "train", args.device_batch_size, device=device,
+                                    rank=ddp_rank, world_size=ddp_world_size, infinite=True)
+build_val_loader = lambda: data_manager.batches(dataset, "val", args.device_batch_size, device=device,
+                                                rank=ddp_rank, world_size=ddp_world_size, infinite=True)
 
-    def refill_buffer():
-        nonlocal cursor, epoch
-        while len(conv_buffer) < buffer_size:
-            conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
-            cursor += ddp_world_size
-            if cursor >= dataset_size:
-                cursor = cursor % dataset_size
-                epoch += 1
-                # Note: last_step is now triggered based on consumption, not fetching
-
-    while True:
-        rows = []
-        mask_rows = []
-        row_lengths = []  # Track actual content length (excluding padding) for each row
-        for _ in range(args.device_batch_size):
-            row = []
-            mask_row = []
-            padded = False
-            while len(row) < row_capacity:
-                # Ensure buffer has conversations
-                while len(conv_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - len(row)
-
-                # Find largest conversation that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
-                    conv_len = len(conv)
-                    if conv_len <= remaining and conv_len > best_len:
-                        best_idx = i
-                        best_len = conv_len
-
-                if best_idx >= 0:
-                    # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
-                    row.extend(conv)
-                    mask_row.extend(conv_mask)
-                    consumed += ddp_world_size  # Track actual consumption
-                else:
-                    # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
-                    content_len = len(row)
-                    row.extend([bos_token] * remaining)  # Pad with BOS tokens
-                    mask_row.extend([0] * remaining)
-                    padded = True
-                    break  # Row is now full (with padding)
-
-            # Track content length: full row if no padding, otherwise the length before padding
-            if padded:
-                row_lengths.append(content_len)
-            else:
-                row_lengths.append(row_capacity)
-            rows.append(row[:row_capacity])
-            mask_rows.append(mask_row[:row_capacity])
-
-        # Stopping condition to respect num_iterations, if given
-        it += 1
-        if 0 < args.num_iterations <= it and split == "train":
-            last_step = True
-
-        # Update progress tracking (based on consumed, not cursor, to account for buffering)
-        if split == "train":
-            current_epoch = epoch
-            if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
-            else:
-                approx_progress = consumed / dataset_size
-            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
-            if consumed >= dataset_size:
-                last_step = True
-
-        # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
-
-        # Apply the loss mask from render_conversation (mask=1 for assistant completions,
-        # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
-        # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
-        mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
-        mask_targets = mask_tensor[:, 1:].to(device=device)
-        targets[mask_targets == 0] = -1
-
-        # Mask out padding positions in targets (set to -1 = ignore_index)
-        # For each row, positions >= (content_length - 1) in targets should be masked
-        for i, content_len in enumerate(row_lengths):
-            if content_len < row_capacity:
-                targets[i, content_len-1:] = -1
-
-        yield inputs, targets
-
-train_loader = sft_data_generator_bos_bestfit("train")
-build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
-progress = 0 # will go from 0 to 1 over the course of the epoch
-
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-# Same shape as base_train but uses progress (0→1) instead of absolute step counts,
-# because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
+# Learning rate schedule (linear warmup, constant, linear warmdown), driven by step/num_iterations
+# -- exact now that num_iterations is known up front, rather than an approximation lagging behind
+# a data-consumption buffer (SFT loss curves will not be bit-identical to before this change).
 def get_lr_multiplier(progress):
     if progress < args.warmup_ratio:
         return (progress + 1e-8) / args.warmup_ratio
@@ -328,7 +230,7 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y, dataloader_state_dict = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -336,12 +238,7 @@ total_training_time = 0 # total wall-clock time of training
 step = 0
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
-
-    # Synchronize last_step across all ranks to avoid hangs in the distributed setting
-    if ddp:
-        last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
-        dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
-        last_step = bool(last_step_tensor.item())
+    last_step = step == num_iterations  # every rank derives this identically -- no all_reduce needed
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
@@ -439,10 +336,9 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
-    lrm = get_lr_multiplier(progress)
+    lrm = get_lr_multiplier(step / num_iterations)
     muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
@@ -469,13 +365,14 @@ while True:
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * progress
+    pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    frac_epoch = dataloader_state_dict["cursor"] / dataset.num_sequences("train")
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {frac_epoch:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,
@@ -486,7 +383,7 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-            "train/epoch": current_epoch,
+            "train/epoch": frac_epoch,
         })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.

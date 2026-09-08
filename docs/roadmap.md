@@ -342,21 +342,97 @@ pre-Stage-2 `d6` checkpoint through `LegacyCheckpointStore`). The actual proof t
 for: copying `modelcore/` to a fresh directory with nothing else alongside it and running its
 suite there — 97 passed, 14 skipped (CUDA-only), zero failures, no `nanochat` on the path at all.
 
-## Stage 9 — the repo split
+## Stage 9 — `datacore/`: pretokenized, packed, multipart datasets (done)
 
-The actual extraction: `modelcore/` becomes its own git repository (a `git subtree split`
-preserving history), and this repo depends on it as a path or VCS dependency instead of a
-same-repo directory. What Stage 8 leaves for this stage specifically: deciding whether the one
-remaining cross-boundary test dependency (`tests/test_architectures.py` reading
+The data-side counterpart to Stage 7/8's model-side extraction. Training used to tokenize on the
+hot path: `nanochat/dataloader.py` opened parquet shards and ran `tokenizer.encode(...)` plus a
+Python best-fit packing loop on *every step, every rank, every epoch* — real, repeated cost on
+billed GPUs, an approximate resume (`dataloader.py`'s row-group resume deliberately skips ahead to
+avoid repeats, and silently repeats or skips data if world size changes between save and resume),
+and a second, near-duplicate packer inline in `scripts/chat_sft.py` for SFT. Tokenization and
+packing are now a one-time, CPU-only preparation step (`scripts/data_prep.py`) producing a
+multipart, fixed-sequence-length, memory-mappable dataset; training just reads rows. The machinery
+lives in a new standalone component `datacore/`, mirroring `modelcore/`'s contract exactly: zero
+host-application imports, one Manager entrypoint (`DataManager`), its own tests/docs/packaging, an
+AST guard proving standalone-ness.
+
+**Format.** A prepared dataset is a directory: `manifest.json` (stamped `"format": "datacore.v1"`,
+the same convention `ModelConfig.to_dict()` uses) plus plain `.npy` volumes per split — no
+hand-rolled binary header, since `np.load(mmap_mode="r")` already gives a self-describing,
+memory-mappable array. `sequence_len` and the packer are fixed at prep time; batch size, world
+size, rank, and split are free at read time. `sequences_per_volume` acts as a *cap*, not an exact
+count — a volume also flushes at every source-file boundary, which is what makes preparation
+incremental (topping up a corpus with new shards appends volumes instead of rebuilding),
+parallelizable per source file with byte-identical output regardless of worker count, and keeps a
+split's earlier volumes bit-identical across re-preps.
+
+**Packers.** `BestFitCropPacker` and `BestFitPadPacker` reproduce `nanochat/dataloader.py`'s and
+`scripts/chat_sft.py`'s original algorithms exactly — verified against
+`dev/capture_data_goldens.py`, a frozen, standalone snapshot of both pre-datacore algorithms
+captured *before* either was touched, replayed by `tests/test_data_packing_parity.py`. One real
+bug found and fixed along the way, not just extracted: `BestFitPadPacker`'s original algorithm
+left an oversized document (longer than `row_capacity`) stuck in its lookback buffer forever once
+padding never crops it — a silent, permanent buffer-slot leak in the always-live-data-stream
+original, but a genuine infinite empty-padded-row generator once the packer runs against a finite
+per-source-file stream (this extraction's `pack()` contract). Fixed by dropping such a document at
+refill time and counting it (`num_documents_dropped`/`num_tokens_dropped`, now visible in the
+manifest — previously invisible entirely).
+
+**Read order, DDP, resume.** The entire iterator state is one integer, `cursor` — sequences
+consumed by all ranks across all epochs. `cursor` is world-size-independent by construction:
+resuming at a different `--nproc_per_node` than the run that saved the state still produces a
+gap-free, duplicate-free continuation of the global stream, fixing a real correctness gap the old
+row-group-based resume had no way to detect, let alone recover from. A pre-datacore checkpoint's
+`{pq_idx, rg_idx, epoch}` dataloader state is refused, not translated, on `--resume-from-step`
+(`--ignore-dataloader-state` opts into restarting the stream) — there is no faithful mapping into
+a sequence cursor, and model/optimizer weights load fine regardless.
+
+**A real bug found on this machine, not just in review**: MPS (this Mac's backend) rejects a
+pinned-CPU-storage tensor moved `non_blocking=True` — `pin_memory()`/`non_blocking` is a
+CUDA-specific optimization the original dataloader already gated on `device == "cuda"`
+(`nanochat/dataloader.py`'s `use_cuda` check); the first version of `datacore.reader.batches`
+missed that gate and crashed immediately on a real end-to-end run here. Fixed and regression-tested
+(`datacore/tests/test_reader.py::test_device_transfer_works_on_mps`, skipped where MPS isn't
+available).
+
+**SFT conversion.** `scripts/chat_sft.py`'s inline `sft_data_generator_bos_bestfit` — and the three
+generator-mutated globals (`last_step`/`approx_progress`/`current_epoch`) and per-step
+cross-rank `all_reduce` it needed purely because the row count was only discoverable by consuming
+the data — are gone. A prepared SFT dataset's size is known up front, so `num_iterations` is
+derived once, identically on every rank, and the LR schedule's `progress` is now exact rather than
+lagging a data-consumption buffer. `--mmlu-epochs`/`--gsm8k-epochs` moved to
+`scripts/data_prep.py --kind=sft`, which owns building the task mixture now.
+**`--num-iterations` now means optimizer steps** (matching `scripts/base_train.py`), not
+micro-batches — the old generator's `it` counted individual `next()` calls; a caller relying on the
+old micro-batch count should divide by `grad_accum_steps`.
+
+**Verified**: `python -m pytest -q` (296 passed, 14 skipped, the one pre-existing unrelated macOS
+sandbox failure — unchanged from Stage 8); `datacore/tests` (56 tests) standalone-copied to an
+empty directory with nothing else on the path, same proof Stage 8 used for `modelcore`; a full
+local CPU/MPS rehearsal — prep a tiny base + SFT dataset, `base_train` end to end including an
+exact-cursor `--resume-from-step`, `base_eval --eval=bpb`, `chat_sft` end to end including a real
+checkpoint save — all against real local ClimbMix/SmolTalk data, not synthetic fixtures. One
+real-machine lesson worth recording separately: `docs/architecture.md`'s canonical smoke recipe
+overrides `--eval-tokens`; a run that doesn't (this stage's first ad hoc smoke test) hits
+`evaluate_bpb`'s per-step `(y.int() < 0).any()` check tens of thousands of times, each one an
+MPS-synchronizing op — slow enough on this backend to look exactly like a hang. Not a datacore
+bug, but the kind of thing worth overriding explicitly in any small local run.
+
+## Stage 10 — the repo split
+
+The actual extraction: `modelcore/` and `datacore/` each become their own git repository (a
+`git subtree split` preserving history), and this repo depends on both as path or VCS dependencies
+instead of same-repo directories. What Stages 8/9 leave for this stage specifically: deciding
+whether the one remaining cross-boundary test dependency (`tests/test_architectures.py` reading
 `modelcore/tests/goldens/tiny_composed_*` directly, to prove `nanochat.architectures.presets.expand`
 reproduces modelcore's own baseline) vendors a copy of those goldens or narrows to a
-config-tree-equality assertion that doesn't need modelcore's test data at all; wiring
-`modelcore`'s `pyproject.toml` into an actual installable dependency (a git URL or a local path
-override) rather than the aspirational, unwired file it is today; and re-verifying the standalone
-guard (`modelcore/tests/test_standalone.py`) still passes against the split repo's own history,
-not just a directory copy.
+config-tree-equality assertion that doesn't need modelcore's test data at all; wiring both
+`pyproject.toml` files into actual installable dependencies (a git URL or a local path override)
+rather than the aspirational, unwired files they are today; and re-verifying each standalone guard
+(`modelcore/tests/test_standalone.py`, `datacore/tests/test_standalone.py`) still passes against
+the split repos' own history, not just a directory copy.
 
-## Stage 10 — attention variants
+## Stage 11 — attention variants
 
 Per-layer attention and position-encoding selection in the config (mixing local/global, or
 different attention types per layer). Position encoding becomes its own swappable component
@@ -369,7 +445,7 @@ MLA's compressed latent cache will likely still need it generalized further (a p
 object the layer itself allocates and manages, rather than a fixed `(n_slots, B, T, H, D)` k/v
 tensor pair).
 
-## Stage 11 — depth and residual topology
+## Stage 12 — depth and residual topology
 
 Weight tying across layers, looped/universal transformers, layer skipping, multi-token-prediction
 (MTP) heads — new composers under `modelcore/composers/` (`BackoutComposer`/`StackComposer` are
@@ -380,7 +456,7 @@ the role protocol makes this more tractable than before (a tied parameter is alr
 at the role-collection level, just not yet exercised by any real architecture), but the
 shape-based Muon stacking itself still assumes independent, per-layer-shaped matrices.
 
-## Stage 12 — experiment ergonomics
+## Stage 13 — experiment ergonomics
 
 Config files as an alternative to pure argparse CLI flags — `--model-config` is this for model
 architecture specifically; this stage is the rest of a run's configuration (data, optimizer,
@@ -389,6 +465,8 @@ ablations specifically — Stage 5's contest is this stage's first real entry.
 
 ## Explicitly deferred, not scheduled
 
-- `jinja2` / `pyyaml` / `requests` are imported (`nanochat/core_eval.py`, `scripts/base_eval.py`,
-  `nanochat/dataset.py`) but undeclared in `pyproject.toml`, resolving only transitively through
-  `torch`/`wandb`. Worth a standalone dependency-hygiene commit whenever convenient.
+- `jinja2` / `pyyaml` are imported (`nanochat/core_eval.py`, `scripts/base_eval.py`) but
+  undeclared in `pyproject.toml`, resolving only transitively through `torch`/`wandb`. Worth a
+  standalone dependency-hygiene commit whenever convenient. (`nanochat/dataset.py`'s `requests`
+  import, previously in this same bullet, is gone as of Stage 9 — the downloader moved to
+  `datacore.download`, built on stdlib `urllib.request` instead.)

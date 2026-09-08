@@ -21,6 +21,10 @@ if [ -z "$SKIP_SETUP" ]; then
     # (probably this can be reduced but it's tricky to determine the exact right number, TODO).
     python -m nanochat.dataset -n 1000
     python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
+    # Prepare the pretokenized, packed dataset once (CPU-only). At 1000 shards this needs ~170GB
+    # of disk (source parquet + prepared volumes both present) -- if that's tight, prepare in
+    # smaller shard batches and delete consumed source shards between them.
+    python -m scripts.data_prep --kind=base --sequence-len=2048
 else
     source .venv/bin/activate
 fi

@@ -26,6 +26,10 @@ python -m nanochat.dataset -n 8
 python -m scripts.tok_train --max-chars=2000000000
 python -m scripts.tok_eval
 
+# Prepare the pretokenized, packed dataset once (CPU-only -- tokenization/packing no longer
+# happens on every training step). --sequence-len must match base_train's --max-seq-len below.
+python -m scripts.data_prep --kind=base --sequence-len=512
+
 # train a small 6 layer model
 # I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
 # To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
@@ -44,7 +48,12 @@ python -m scripts.base_train \
     --run=$WANDB_RUN
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 
+# Prepare the SFT dataset at the same sequence length chat_sft will inherit from the base checkpoint
+python -m scripts.data_prep --kind=sft --sequence-len=512
+
 # SFT (~10 minutes on my MacBook Pro M3 Max)
+# --num-iterations is optimizer steps now (it used to count micro-batches before datacore --
+# 1500 micro-batches / grad_accum_steps=1 here == 1500 steps, so this value is unchanged)
 python -m scripts.chat_sft \
     --eval-every=200 \
     --eval-tokens=524288 \
