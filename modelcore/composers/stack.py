@@ -22,8 +22,8 @@ class StackComposer(BaseComposer):
     def layer_specs(self):
         return [b.layer_spec() for b in self.blocks]
 
-    def forward(self, x, idx, kv_cache):
+    def forward(self, x, idx, kv_cache, doc_args=None):
         kv_bus = {}
         for block in self.blocks:
-            x = block(x, None, idx, kv_cache, kv_bus)
+            x = block(x, None, idx, kv_cache, kv_bus, doc_args)
         return x

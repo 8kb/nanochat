@@ -34,6 +34,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
+from modelcore.kernels.flash_attn import build_doc_args
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -83,6 +84,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Data
 parser.add_argument("--dataset", type=str, default=None, help="prepared dataset name (see scripts/data_prep.py --kind=base); default: derived from --max-seq-len and the tokenizer fingerprint")
 parser.add_argument("--ignore-dataloader-state", action="store_true", help="on --resume-from-step, restart the data stream from the beginning instead of refusing a pre-datacore checkpoint's dataloader state (model/optimizer weights load either way)")
+parser.add_argument("--doc-masking", action="store_true", help="restrict attention to within each packed row's own document (BOS-delimited), instead of allowing attention across document boundaries within a row -- see modelcore.kernels.flash_attn.build_doc_args")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -120,6 +122,7 @@ else:
         print0(f"WARNING: Flash Attention 3 not available ({FA3_LOAD_ERROR}), using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
     print0("!" * 80)
+print0(f"Intra-document masking: {'ON' if args.doc_masking else 'off'}")
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -127,6 +130,7 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 tokenizer_fingerprint = tokenizer.fingerprint()
+bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -445,7 +449,7 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -532,7 +536,11 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        # doc_args is built here, outside the compiled model, and passed in as plain data --
+        # deriving it from idx inside a torch.compile'd forward hits the recompile limit (see
+        # modelcore.kernels.flash_attn.build_doc_args's docstring).
+        doc_args = build_doc_args(x, bos_token_id) if args.doc_masking else None
+        loss = model(x, y, doc_args=doc_args)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

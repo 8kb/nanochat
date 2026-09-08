@@ -12,7 +12,13 @@ Usage (drop-in replacement for FA3):
 
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
+
+    # Training with intra-document masking (no cross-document attention within a packed row)
+    doc_args = build_doc_args(idx, bos_token_id)  # outside any torch.compile region -- see below
+    y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, doc_args=doc_args)
 """
+from typing import NamedTuple, Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -81,9 +87,77 @@ USE_FA3 = _resolve_use_fa3()
 
 
 # =============================================================================
+# Intra-document masking: derive per-row document boundaries from BOS positions
+# =============================================================================
+class DocArgs(NamedTuple):
+    """Per-batch document-boundary info for intra-document attention masking. Built once outside
+    the compiled model region (see build_doc_args) and threaded through as opaque data -- nothing
+    downstream re-derives it from idx, matching the kv_bus threading pattern in
+    modelcore.components.attention.
+
+    doc_ids: (B, T) int32, 0-based, incrementing at every document start within a row -- used by
+        the SDPA fallback to build an explicit intra-document mask.
+    cu_seqlens: (max_docs+1,) int32 cumulative sequence lengths over the flattened (B*T,) stream,
+        fixed-shape (padded with the trailing total) so its shape never changes across steps --
+        used by the FA3 varlen path. None when FA3 isn't the active backend (SDPA doesn't need it).
+    max_seqlen: static python int, the padded length used to build cu_seqlens's fixed shape.
+    """
+    doc_ids: torch.Tensor
+    cu_seqlens: Optional[torch.Tensor] = None
+    max_seqlen: Optional[int] = None
+
+
+def build_doc_args(idx, bos_token_id, max_docs=None):
+    """Derive document boundaries from BOS positions in idx, (B, T) token ids.
+
+    Call this OUTSIDE any torch.compile region and pass its result in as plain data:
+    `nonzero()`-driven boundary detection inside a compiled model hits torch.compile's recompile
+    limit, and a variable-shape cu_seqlens recompiles the graph on every step (25s/iter in
+    upstream's own measurement -- see docs/upstream/LOG.md's "Varlen Attention" entry). Both are
+    avoided here: doc_ids is a plain cumsum (no data-dependent shape), and cu_seqlens is padded to
+    a fixed `max_docs` so its shape is constant regardless of how many documents actually occur.
+
+    A run of consecutive BOS ids (BestFitPadPacker's pad tail, datacore/packing.py) collapses into
+    one document rather than one document per pad token -- `is_start` only fires on the first BOS
+    of a run.
+    """
+    B, T = idx.shape
+    is_bos = idx == bos_token_id
+    is_start = is_bos.clone()
+    is_start[:, 1:] &= ~is_bos[:, :-1]  # only the first BOS of a run starts a new document
+    doc_ids = is_start.to(torch.int32).cumsum(dim=1) - 1  # 0-based within each row
+    doc_ids = doc_ids.clamp(min=0)  # a row that starts mid-document (shouldn't happen -- every
+                                     # row is BOS-aligned -- but stay defined rather than negative)
+
+    if not USE_FA3:
+        return DocArgs(doc_ids=doc_ids)
+
+    # Segment starts over the flattened (B*T,) stream: every row start is a document start too
+    # (every row is BOS-aligned), plus every in-row document start already marked by is_start.
+    row_starts = torch.zeros_like(is_start)
+    row_starts[:, 0] = True
+    starts_flat = torch.nonzero((is_start | row_starts).view(-1), as_tuple=True)[0].to(torch.int32)
+    # NOTE: nonzero() above is fine here -- build_doc_args always runs outside torch.compile.
+    num_docs = starts_flat.numel()
+    total = B * T
+    # Default cap is the true worst case (every token its own document) so this can never
+    # overflow; since B and T are fixed for a whole training run, cu_seqlens's shape below is
+    # constant across steps either way -- a smaller explicit max_docs just trims its (negligible)
+    # size.
+    cap = max_docs if max_docs is not None else total
+    assert num_docs <= cap, f"{num_docs} document segments exceeds max_docs={cap}; pass a larger max_docs"
+    cu_seqlens = torch.full((cap + 1,), total, dtype=torch.int32, device=idx.device)
+    cu_seqlens[:num_docs] = starts_flat
+    cu_seqlens[num_docs] = total
+    # everything past num_docs is already `total` -- zero-length trailing segments, which FA3
+    # accepts (same trick modded-nanogpt uses for its own fixed-shape cu_seqlens).
+    return DocArgs(doc_ids=doc_ids, cu_seqlens=cu_seqlens, max_seqlen=T)
+
+
+# =============================================================================
 # SDPA helpers
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, doc_ids=None):
     """
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
@@ -92,20 +166,21 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     Tk = k.size(2)
     window = window_size[0]
 
-    # Full context, same length
-    if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    # Full context, same length, no document masking requested: the fused fast path
+    if doc_ids is None:
+        if (window < 0 or window >= Tq) and Tq == Tk:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
-    # Single token generation
-    if Tq == 1:
-        if window >= 0 and window < Tk:
-            # window is "left" tokens we need to include (window + 1) keys total
-            start = max(0, Tk - (window + 1))
-            k = k[:, :, start:, :]
-            v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        # Single token generation
+        if Tq == 1:
+            if window >= 0 and window < Tk:
+                # window is "left" tokens we need to include (window + 1) keys total
+                start = max(0, Tk - (window + 1))
+                k = k[:, :, start:, :]
+                v = v[:, :, start:, :]
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
-    # Need explicit mask for sliding window/chunk inference
+    # Need an explicit mask: sliding window/chunk inference, or intra-document masking
     device = q.device
     # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
     row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
@@ -116,12 +191,19 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
 
+    if doc_ids is not None:
+        # doc_ids is (B, T); training-only path (Tq == Tk == T, no KV cache), so this aligns
+        # directly with row_idx/col_idx without needing kv-cache-position bookkeeping.
+        doc_mask = doc_ids[:, :, None] == doc_ids[:, None, :]  # (B, Tq, Tk)
+        mask = mask.unsqueeze(0) & doc_mask
+        mask = mask.unsqueeze(1)  # (B, 1, Tq, Tk) -- broadcasts across heads
+
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), doc_args=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -129,11 +211,22 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        doc_args: optional DocArgs (see build_doc_args) restricting attention to within each
+            packed row's own document. None (default) is exactly today's behavior.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
     if USE_FA3:
+        if doc_args is not None:
+            B, T, H, D = q.shape
+            out = _fa3.flash_attn_varlen_func(
+                q.reshape(B * T, H, D), k.reshape(B * T, H, D), v.reshape(B * T, H, D),
+                cu_seqlens_q=doc_args.cu_seqlens, cu_seqlens_k=doc_args.cu_seqlens,
+                max_seqlen_q=doc_args.max_seqlen, max_seqlen_k=doc_args.max_seqlen,
+                causal=causal, window_size=window_size,
+            )
+            return out.view(B, T, H, D)
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -141,7 +234,8 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    doc_ids = doc_args.doc_ids if doc_args is not None else None
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa, doc_ids=doc_ids)
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 

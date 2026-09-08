@@ -631,6 +631,47 @@ upstream describes), so 0.1597 is comparable in *kind*, just not in scale.
 full uncapped CORE eval (~7 min across 22 tasks, vs. Stage 4's `-1`/disabled) all add up relative
 to Stage 4's $6.20.
 
+## Stage 6 results: `kvshare4_win` d13 at tokens:param ratio 10, on the `datacore` pipeline
+
+Same architecture as Stages 4-5 (`llama_kvshare_win`, depth 13, `--window-pattern=LLLLSSLSSLSSL
+--arch-opt kv_share_frac=0.6923`), `--fp8`, but at a cheaper horizon
+(`--target-param-data-ratio=10`, half of Stage 5's Chinchilla ratio) and, more importantly, the
+first real base-training run to go through the Stage 9 `datacore` pipeline end to end: a
+`scripts.data_prep`-prepared dataset (`climbmix_t2048_e348819205de14ab`) read via `DataManager`,
+not raw parquet. CORE disabled (`--core-metric-every=-1`) — val bpb is the axis this stage cares
+about, not a leaderboard number. A full SFT pass followed (1 epoch on the matching
+`sft_t2048_e348819205de14ab` dataset) as a second, independent exercise of the pipeline; its number
+is recorded here but isn't part of the base-training ablation below.
+
+```
+torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
+  --arch=llama_kvshare_win --depth=13 --window-pattern=LLLLSSLSSLSSL \
+  --arch-opt kv_share_frac=0.6923 --target-param-data-ratio=10 --fp8 \
+  --device-batch-size=64 --core-metric-every=-1 \
+  --model-tag=kvshare4win_d13_ratio10 --run=dummy
+```
+
+**Infra**: same volume (`w6ndh50xcl`, US-GA-2), 2x H100 SXM 80GB. Shard prep (`nanochat.dataset`
++ `scripts.data_prep --kind=base --sequence-len=2048 --max-shards=45`, then `--kind=sft`) ran on a
+separate CPU pod against the same volume, terminated before the GPU pod started — the CPU-work
+discipline this repo's AGENTS.md calls for.
+
+| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | wall time |
+|---|---|---|---|---|---|---|---|---|---|
+| 175,472,640 | 146,112,512 | 2,786 | 524,288 | 10.00 | **0.874398** | ~915,000 | ~49% | 69.87 GB | 26.52 min |
+
+Final step was also the minimum (no rebound). **Vs. Stage 5** (same architecture, ratio 20, 2.92B
+tokens): val bpb 0.874398 vs. 0.833913 — worse, exactly as expected for half the tokens:param
+ratio (~1.46B tokens here).
+
+SFT (1 epoch, `sft_t2048_e348819205de14ab`, off the `kvshare4win_d13_ratio10` base checkpoint):
+val bpb **0.3805**, 9.44 min, peak mem 60.02 GB. Not compared against anything — no prior SFT run
+at this depth/ratio exists — recorded for the checkpoint's own provenance.
+
+This run is the unmasked baseline for the intra-document attention masking work
+(`modelcore/kernels/flash_attn.py`'s `build_doc_args`/varlen path) — see that section's own
+results, appended below once run.
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now

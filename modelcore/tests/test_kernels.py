@@ -14,9 +14,10 @@ Note on test structure:
        on any device (CUDA, CPU, MPS) with the appropriate dtype for that device.
 """
 import torch
+import torch.nn.functional as F
 import pytest
 import modelcore.kernels.flash_attn as fa_module
-from modelcore.kernels.flash_attn import flash_attn, HAS_FA3
+from modelcore.kernels.flash_attn import flash_attn, build_doc_args, HAS_FA3
 from modelcore.cache import KVCache
 
 
@@ -276,6 +277,56 @@ class TestFA3VsSDPA:
         max_diff, mean_diff = assert_close(v_grad_fa3, v_grad_sdpa, "v_grad", atol=0.05, rtol=0.05)
         print(f"v_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
+    def test_doc_masking(self):
+        """FA3 varlen vs. the SDPA doc-mask fallback, on a batch with several documents per row.
+        doc_args is rebuilt per backend (rather than reused across run_both_impls) because
+        build_doc_args's cu_seqlens/max_seqlen depend on the module-level USE_FA3 flag at the time
+        it's called."""
+        B, T, H, D = 2, 64, 4, 32
+        bos = 999
+        idx = torch.zeros(B, T, dtype=torch.long, device=self.DEVICE)
+        idx[:, 0] = bos
+        idx[:, 20] = bos
+        idx[:, 45] = bos
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        set_impl('fa3')
+        doc_args_fa3 = build_doc_args(idx, bos)
+        y_fa3 = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0), doc_args=doc_args_fa3)
+        set_impl('sdpa')
+        doc_args_sdpa = build_doc_args(idx, bos)
+        y_sdpa = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0), doc_args=doc_args_sdpa)
+        set_impl(None)
+
+        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "doc_masking")
+        print(f"doc_masking: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_doc_masking_with_window(self):
+        """Same, with a sliding window narrower than the documents."""
+        B, T, H, D = 2, 64, 4, 32
+        window = 12
+        bos = 999
+        idx = torch.zeros(B, T, dtype=torch.long, device=self.DEVICE)
+        idx[:, 0] = bos
+        idx[:, 20] = bos
+        idx[:, 45] = bos
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        set_impl('fa3')
+        doc_args_fa3 = build_doc_args(idx, bos)
+        y_fa3 = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0), doc_args=doc_args_fa3)
+        set_impl('sdpa')
+        doc_args_sdpa = build_doc_args(idx, bos)
+        y_sdpa = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0), doc_args=doc_args_sdpa)
+        set_impl(None)
+
+        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "doc_masking_with_window")
+        print(f"doc_masking_with_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
 
 # =============================================================================
 # SDPA-only tests (run on any device)
@@ -361,6 +412,175 @@ class TestSDPAOnly:
         assert y_single.shape == (B, 1, H, D)
         assert cache.get_pos() == T_prefill + 1
         set_impl(None)
+
+
+# =============================================================================
+# build_doc_args: BOS-boundary segmentation (device/backend independent)
+# =============================================================================
+BOS = 999
+
+
+class TestBuildDocArgs:
+    """build_doc_args's segmentation logic is pure tensor arithmetic over idx -- no attention
+    kernel involved, so these run identically everywhere."""
+
+    def test_multi_doc_row(self):
+        idx = torch.tensor([[BOS, 1, 2, BOS, 3, 4, 5]])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1, 1]]
+
+    def test_bos_run_collapses_to_one_document(self):
+        """A run of consecutive BOS ids (BestFitPadPacker's pad tail) is one document, not one
+        per pad token."""
+        idx = torch.tensor([[BOS, 1, 2, BOS, BOS, BOS]])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1]]
+
+    def test_no_bos_is_one_document(self):
+        idx = torch.tensor([[1, 2, 3, 4]])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 0]]
+
+    def test_rows_are_independent(self):
+        idx = torch.tensor([
+            [BOS, 1, BOS, 2],
+            [BOS, 3, 4, 5],
+        ])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 1, 1], [0, 0, 0, 0]]
+
+    def test_none_when_fa3_inactive(self):
+        set_impl('sdpa')
+        idx = torch.tensor([[BOS, 1, 2, BOS, 3]])
+        args = build_doc_args(idx, BOS)
+        set_impl(None)
+        assert args.cu_seqlens is None
+        assert args.max_seqlen is None
+
+    def test_cu_seqlens_when_fa3_active(self, monkeypatch):
+        """cu_seqlens/max_seqlen are only populated for the varlen (FA3) path -- force the flag
+        directly rather than via set_impl, since set_impl('fa3') requires a real FA3 kernel."""
+        monkeypatch.setattr(fa_module, "USE_FA3", True)
+        B, T = 2, 6
+        idx = torch.tensor([
+            [BOS, 1, 2, BOS, 3, 4],   # doc starts at row-local 0, 3 -> flat 0, 3
+            [BOS, 5, BOS, BOS, 6, 7], # doc starts at row-local 0, 2 (BOS,BOS run collapses) -> flat 6, 8
+        ])
+        args = build_doc_args(idx, BOS)
+        assert args.max_seqlen == T
+        assert args.cu_seqlens.dtype == torch.int32
+        assert args.cu_seqlens.shape == (B * T + 1,)  # default cap: worst case, never overflows
+        num_docs = 4  # row0: [0,3]; row1: [6,8] (9 collapses into 8's run)
+        assert args.cu_seqlens[:num_docs].tolist() == [0, 3, 6, 8]
+        assert args.cu_seqlens[num_docs].item() == B * T
+        assert (args.cu_seqlens[num_docs:] == B * T).all()  # zero-length trailing segments
+
+    def test_max_docs_overflow_raises(self, monkeypatch):
+        monkeypatch.setattr(fa_module, "USE_FA3", True)
+        idx = torch.tensor([[BOS, 1, BOS, 2, BOS, 3]])  # 3 documents
+        with pytest.raises(AssertionError):
+            build_doc_args(idx, BOS, max_docs=2)
+
+
+# =============================================================================
+# Intra-document masking correctness (SDPA fallback vs. a naive per-document reference)
+# =============================================================================
+class TestDocMaskingSDPA:
+    """Verify the SDPA doc-masked path against a reference that runs each document through
+    ordinary attention separately -- the ground truth intra-document masking is supposed to match."""
+
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    def _naive_reference(self, q, k, v, doc_ids, window):
+        """q, k, v: (B, T, H, D). Splits each row into its contiguous documents (doc_ids is
+        monotonically non-decreasing within a row by construction) and runs plain causal
+        (optionally windowed) attention within each, independently."""
+        B, T, H, D = q.shape
+        out = torch.zeros_like(q)
+        for b in range(B):
+            ids = doc_ids[b]
+            for d in ids.unique().tolist():
+                positions = (ids == d).nonzero(as_tuple=True)[0]
+                start, end = positions[0].item(), positions[-1].item() + 1
+                qi = q[b:b+1, start:end].transpose(1, 2)  # (1, H, t, D)
+                ki = k[b:b+1, start:end].transpose(1, 2)
+                vi = v[b:b+1, start:end].transpose(1, 2)
+                enable_gqa = qi.size(1) != ki.size(1)
+                t = qi.size(2)
+                if window is not None and window >= 0 and window < t:
+                    row_idx = torch.arange(t, device=qi.device).unsqueeze(1)
+                    col_idx = torch.arange(t, device=qi.device).unsqueeze(0)
+                    mask = (col_idx <= row_idx) & ((row_idx - col_idx) <= window)
+                    yi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=mask, enable_gqa=enable_gqa)
+                else:
+                    yi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=True, enable_gqa=enable_gqa)
+                out[b:b+1, start:end] = yi.transpose(1, 2)
+        return out
+
+    def _row_with_docs(self, B, T, boundaries):
+        idx = torch.zeros(B, T, dtype=torch.long, device=self.DEVICE)
+        for pos in boundaries:
+            idx[:, pos] = BOS
+        return idx
+
+    def test_matches_naive_reference_full_context(self):
+        set_impl('sdpa')
+        B, T, H, D = 2, 24, 2, 16
+        idx = self._row_with_docs(B, T, [0, 7, 15])
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        doc_args = build_doc_args(idx, BOS)
+
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1), doc_args=doc_args)
+        y_ref = self._naive_reference(q, k, v, doc_args.doc_ids, window=None)
+        set_impl(None)
+        assert_close(y, y_ref, "doc_masking_full_context")
+
+    def test_matches_naive_reference_with_window(self):
+        set_impl('sdpa')
+        B, T, H, D = 2, 24, 2, 16
+        window = 4
+        idx = self._row_with_docs(B, T, [0, 7, 15])
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        doc_args = build_doc_args(idx, BOS)
+
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0), doc_args=doc_args)
+        y_ref = self._naive_reference(q, k, v, doc_args.doc_ids, window=window)
+        set_impl(None)
+        assert_close(y, y_ref, "doc_masking_with_window")
+
+    def test_matches_naive_reference_with_gqa(self):
+        set_impl('sdpa')
+        B, T, D = 2, 24, 16
+        n_heads, n_kv_heads = 4, 2
+        idx = self._row_with_docs(B, T, [0, 10])
+        q = torch.randn(B, T, n_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        doc_args = build_doc_args(idx, BOS)
+
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1), doc_args=doc_args)
+        y_ref = self._naive_reference(q, k, v, doc_args.doc_ids, window=None)
+        set_impl(None)
+        assert_close(y, y_ref, "doc_masking_gqa")
+
+    def test_none_doc_args_is_bit_identical_to_current_behavior(self):
+        """doc_args=None must be exactly today's code path -- the main guard on the signature
+        churn this feature added everywhere doc_args was threaded through."""
+        set_impl('sdpa')
+        B, T, H, D = 2, 16, 2, 8
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        y_implicit = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+        y_explicit_none = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0), doc_args=None)
+        set_impl(None)
+        assert torch.equal(y_implicit, y_explicit_none)
 
 
 # =============================================================================

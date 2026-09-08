@@ -61,9 +61,12 @@ class Model(nn.Module):
     def get_device(self):
         return next(self.parameters()).device
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', doc_args=None):
+        """doc_args: optional modelcore.kernels.flash_attn.DocArgs restricting attention to within
+        each packed row's own document (see build_doc_args) -- training only; always None during
+        inference (kv_cache is not None), since one KV-cache row is one document at decode time."""
         x = self.embedding(idx, kv_cache)
-        x = self.body(x, idx, kv_cache)
+        x = self.body(x, idx, kv_cache, doc_args)
         if kv_cache is not None:
             kv_cache.advance(idx.size(1))
         return self.unembedding(x, targets, loss_reduction)

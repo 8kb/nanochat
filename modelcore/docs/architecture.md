@@ -341,6 +341,34 @@ token count for a consumer if it relied on `k=None` too.
 runs — not to any one attention layer (a same-layer-count assumption breaks the moment a model has
 fewer KV slots than layers).
 
+## Intra-document masking
+
+`doc_args` (a `modelcore.kernels.flash_attn.DocArgs`, built by `build_doc_args(idx, bos_token_id)`)
+restricts attention to within each packed training row's own document, threaded through
+`Model.forward` → the active composer → `BaseBlock.forward` → `CausalSelfAttention.forward`
+alongside `kv_bus`, defaulting to `None` (today's behavior: attention sees the whole row) at every
+hop. Training only — always `None` when `kv_cache is not None`, since one KV-cache row is one
+document at decode time.
+
+`build_doc_args` must be called **outside** any `torch.compile` region and its result passed in as
+plain data: it derives boundaries via `nonzero()`, which recompiles every call inside a compiled
+graph, and `flash_attn_varlen_func`'s `cu_seqlens` is padded to a fixed shape so the compiled
+model's input shapes never change step to step (a real, measured cost otherwise — see
+`docs/upstream/LOG.md`'s "Varlen Attention" entry: 25s/iter from a variable-shape `cu_seqlens`).
+
+Positions are **not** reset per document. RoPE attention scores depend only on the relative offset
+`i − j` between two positions (see `modelcore/components/rope.py`'s note on this), and QK-norm
+commutes with RoPE because a rotation preserves vector norm. With intra-document masking, every
+surviving `(i, j)` pair already lies inside one document, so every relative offset a reset would
+produce is identical to what the row's own absolute positions already give — resetting is a
+bit-identical no-op that would trade a free `cos[:, T0:T0+T]` slice for a per-token gather, on
+every layer, for nothing.
+
+`Smear` (`modelcore/components/embedding.py`) is a known, deliberate gap: it blends each token's
+embedding with its predecessor's across the whole row, upstream of q/k/v, where no attention mask
+can reach — one token of leak per document boundary, in the `gpt` preset only (`llama*` presets
+disable it).
+
 ## FP8 precision
 
 `modelcore/precision/fp8.py` is a from-scratch, ~150-line tensorwise-dynamic-scaling FP8 training

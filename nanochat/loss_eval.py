@@ -5,8 +5,10 @@ import math
 import torch
 import torch.distributed as dist
 
+from modelcore.kernels.flash_attn import build_doc_args
+
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -23,6 +25,11 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     In addition to evaluate_loss, we need the token_bytes tensor:
     It is a 1D tensor of shape (vocab_size,), indicating the number of bytes for
     each token id, or 0 if the token is to not be counted (e.g. special tokens).
+
+    bos_token_id: when given, restricts attention to within each packed row's own document (see
+    modelcore.kernels.flash_attn.build_doc_args) -- matches whatever masking training used, so
+    val bpb stays comparable to the training loss it's evaluating. None (default) is unmasked, as
+    before.
     """
     # record the losses
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -30,7 +37,8 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, *_ = next(batch_iter)  # datacore.reader.batches yields a 3rd element (resume state)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        doc_args = build_doc_args(x, bos_token_id) if bos_token_id is not None else None
+        loss2d = model(x, y, loss_reduction='none', doc_args=doc_args) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

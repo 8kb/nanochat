@@ -11,7 +11,7 @@ class BaseComposer(nn.Module):
     def init_weights(self):
         raise NotImplementedError
 
-    def forward(self, x, idx, kv_cache):
+    def forward(self, x, idx, kv_cache, doc_args=None):
         raise NotImplementedError
 
     def layer_specs(self):

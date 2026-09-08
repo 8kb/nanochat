@@ -26,7 +26,14 @@ class CausalSelfAttention(nn.Module):
     tensors back into flash_attn_with_kvcache for the consumer (rather than k=None) sidesteps a
     real FA3-vs-SDPA divergence in what k=None means (see modelcore/docs/architecture.md's
     "Cross-layer KV sharing") -- the write is a no-op since the producer already wrote those exact
-    tensors to that slot earlier in the same forward pass."""
+    tensors to that slot earlier in the same forward pass.
+
+    Intra-document masking: doc_args (see modelcore.kernels.flash_attn.build_doc_args), when given,
+    restricts attention to within each packed row's own document -- forwarded to
+    flash_attn.flash_attn_func unchanged, training only (always None when kv_cache is not None;
+    see Model.forward). This module doesn't derive it from idx itself: doc_args is per-batch
+    runtime data built once outside torch.compile and threaded through like kv_bus, not a
+    per-layer policy."""
     PARAM_ROLES = {"value_embed": "value_embedding"}
 
     def __init__(self, n_embd, n_head, n_kv_head, layer_idx, window, rope, padded_vocab_size, has_value_embed,
@@ -74,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         return AttentionLayerSpec(n_head=self.n_head, n_kv_head=self.n_kv_head, head_dim=self.head_dim,
                                    window=self.window, kv_slot=self.kv_slot)
 
-    def forward(self, x, idx, kv_cache, kv_bus=None):
+    def forward(self, x, idx, kv_cache, kv_bus=None, doc_args=None):
         B, T, C = x.size()
 
         # Project the input to get queries. Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -110,8 +117,8 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         window_size = (self.window, 0)
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal attention with optional sliding window and intra-document masking
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, doc_args=doc_args)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_slot_cache(self.kv_slot)

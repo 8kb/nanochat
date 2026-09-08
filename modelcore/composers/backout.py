@@ -29,11 +29,11 @@ class BackoutComposer(BaseComposer):
     def layer_specs(self):
         return [b.layer_spec() for b in self.blocks]
 
-    def forward(self, x, idx, kv_cache):
+    def forward(self, x, idx, kv_cache, doc_args=None):
         x0 = x  # save initial (post-embedding) activations for the x0 residual
         x_backout = None
         for i, block in enumerate(self.blocks):
-            x = block(x, x0, idx, kv_cache)
+            x = block(x, x0, idx, kv_cache, doc_args=doc_args)
             if i == self.backout_layer:
                 x_backout = x
         if x_backout is not None:

@@ -27,7 +27,7 @@ class BaseBlock(nn.Module):
     def init_weights(self):
         raise NotImplementedError
 
-    def forward(self, x, x0, idx, kv_cache, kv_bus=None):
+    def forward(self, x, x0, idx, kv_cache, kv_bus=None, doc_args=None):
         raise NotImplementedError
 
     def layer_spec(self):

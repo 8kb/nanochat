@@ -75,9 +75,9 @@ class Block(BaseBlock):
     def layer_spec(self):
         return self.attn.layer_spec()
 
-    def forward(self, x, x0, idx, kv_cache, kv_bus=None):
+    def forward(self, x, x0, idx, kv_cache, kv_bus=None, doc_args=None):
         x = self.resid_lambda * x + self.x0_lambda * x0
-        x = x + self.attn(norm(x), idx, kv_cache, kv_bus)
+        x = x + self.attn(norm(x), idx, kv_cache, kv_bus, doc_args)
         x = x + self.mlp(norm(x))
         return x
 
@@ -110,9 +110,9 @@ class PlainBlock(BaseBlock):
     def layer_spec(self):
         return self.attn.layer_spec()
 
-    def forward(self, x, x0, idx, kv_cache, kv_bus=None):
+    def forward(self, x, x0, idx, kv_cache, kv_bus=None, doc_args=None):
         # x0 is part of the BaseBlock contract (see modelcore/components/contracts.py) but unused
         # here -- this topology has no x0 residual.
-        x = x + self.attn(norm(x), idx, kv_cache, kv_bus)
+        x = x + self.attn(norm(x), idx, kv_cache, kv_bus, doc_args)
         x = x + self.mlp(norm(x))
         return x

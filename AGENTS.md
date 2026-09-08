@@ -164,6 +164,13 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
 - **`kv_cache.advance()` belongs to `Model.forward`, not the last attention layer.** It fires once,
   after the whole block/composer loop runs — broken the moment a model has fewer KV slots than
   layers (cross-layer KV sharing), since no layer's index then equals the slot count.
+- **Intra-document masking's `doc_args` must be built outside `torch.compile`.**
+  `modelcore.kernels.flash_attn.build_doc_args(idx, bos_token_id)` derives per-row document
+  boundaries via `nonzero()`, and `scripts/base_train.py --doc-masking` calls it in the training
+  loop, before `model(x, y, doc_args=...)` — never inside the compiled model itself. See
+  [modelcore/docs/architecture.md](modelcore/docs/architecture.md#intra-document-masking) for why
+  (a real, measured recompile cost otherwise) and why positions are deliberately not reset per
+  document (RoPE + QK-norm make it a no-op).
 - **`AttentionLayerSpec.kv_slot` decouples layer index from KV-cache slot.**
   `ModelStats.kv_cache_spec["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
   at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`
