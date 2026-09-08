@@ -735,6 +735,82 @@ reach already limits how much of it is even reachable), left for a follow-up rat
 **Cost**: pod ran 29.17 min training (plus setup/sync) on 2x H100 ($6.98/hr) ≈ **$3.40** for this
 run; the crashed first attempt added ~2 min (~$0.23) before being caught and terminated.
 
+## Stage 8 results: `padding_id` end to end — a fresh SFT dataset, SFT off the doc-masked base
+
+First real use of the `padding_id` plumbing (Stage 7's own follow-up commit): a new SFT dataset
+prepared with a real, non-`bos_token_id` pad filler, then a full SFT pass off Stage 7's doc-masked
+base checkpoint. `chat_sft.py` itself has no `--doc-masking` wiring yet — this exercises the new
+dataset and the masked base checkpoint's SFT-time behavior, not SFT-time masking.
+
+```
+# CPU pod (cpu3m: 4 vcpu, 32GB -- cpu3c's default 4GB OOM'd mid-import; see "Lessons" below)
+python -m scripts.data_prep --kind=sft --dataset=sft_t2048_padid_e348819205de14ab \
+  --sequence-len=2048 --sft-padding-id=32767   # <|output_end|> -- see the padding_id commit's
+                                                # note on why no id in this tokenizer is truly free
+
+# GPU pod (2x H100)
+torchrun --standalone --nproc_per_node=2 -m scripts.chat_sft -- \
+  --model-tag=kvshare4win_d13_ratio10_docmask --dataset=sft_t2048_padid_e348819205de14ab \
+  --chatcore-every=-1 --run=dummy
+```
+
+**Verified the new dataset changes nothing but the padding byte**: compared the new dataset
+against Stage 6's original `sft_t2048_e348819205de14ab` directly (same document stream, same
+`buffer_size` — packing *decisions* don't depend on the fill value). Same train sequence count
+(237,453 both). Diffed a full volume byte-for-byte: 274/603 rows differ, every differing position
+has `mask=0` in both datasets (pure padding, never touching the loss), and everywhere else is
+byte-identical. So this run's training data is, for `chat_sft.py`'s purposes, identical to Stage
+6's — the only real variable between the two SFT runs is the base checkpoint (Stage 7's doc-masked
+one here vs. Stage 6's unmasked one).
+
+| params | scaling params | steps (1 epoch) | tok/sec | mfu | peak mem | wall time | **val bpb** |
+|---|---|---|---|---|---|---|---|
+| 175,472,640 | 146,112,512 | 927 | ~840,000-865,000 | ~45-46.5% | 60,024.01 MiB | 9.41 min | **0.3796** |
+
+**Vs. Stage 6's SFT** (identical training data, unmasked base checkpoint): steps, tok/sec, mfu,
+and peak memory are all indistinguishable (60,024.01 MiB peak mem to the byte in both runs) — as
+expected, since neither run applies doc-masking at SFT time, so both do the exact same computation
+shape. Val bpb tracked within noise at every logged checkpoint and pulled slightly ahead by the
+end:
+
+| step | Stage 6 (unmasked base) | Stage 8 (doc-masked base) |
+|---|---|---|
+| 0 | 0.6325 | 0.6384 |
+| 200 | 0.4548 | 0.4549 |
+| 400 | 0.4414 | 0.4411 |
+| 600 | 0.4170 | 0.4163 |
+| 800 | 0.3902 | 0.3894 |
+| 927 (final) | 0.3805 | **0.3796** |
+
+0.24% lower (better) at the final step, the same "consistent but small" pattern Stage 7's own base
+comparison showed on a wall-time-adjusted basis. Since the SFT data and procedure are proven
+identical between the two runs, this is the cleanest signal yet that Stage 7's doc-masked base
+checkpoint carries a small, real (if practically negligible) edge into SFT — not proof either way
+on whether SFT-time doc-masking itself would help, which needs `chat_sft.py` wiring this stage
+didn't build.
+
+**Lessons**:
+- **Neither the MCP `create-pod` tool nor `runpodctl`'s `pod create`/`create pod` expose CPU
+  flavor or vCPU count.** Both always land on the smallest flavor (`cpu3c`, 2 vcpu, 4GB, enforced
+  as a hard cgroup limit despite the host reporting far more RAM) with no override flag. `scripts.
+  data_prep --kind=sft` OOM'd on it before printing anything (`SmolTalk`/`MMLU`/`GSM8K` load their
+  full source datasets into memory before any `--max-conversations` cap applies) — exit 137, silent
+  otherwise. Worked around by calling the REST v2 API directly (`POST /v2/pods` with `cpu: {id,
+  vcpuCount}`, per `GET /v2/catalog/cpus`'s `cpu3m`/`cpu5g`/etc. — the flavor ids these tools
+  themselves can't select), using the same API key `runpodctl` already had configured. `cpu5g`/`8
+  vcpu` had no stock in US-GA-2 at request time; `cpu3g`/`4 vcpu` (16GB) and `cpu3m`/`4 vcpu` (32GB,
+  matching the Stage 6 prep's own `cpu5g`/`8 vcpu` memory budget) both did — used `cpu3m`.
+- **There is no free token id for `padding_id` in the current tokenizer without adding a real
+  special token.** `vocab_size=32768` is already an exact multiple of `pad_vocab_size_to` (64), so
+  there's no spare embedding-table slot either. `<|user_start|>` (`bos_token_id+1`) was tried first
+  and rejected on inspection of the actual packed rows — it appears in every real conversation, so
+  reusing it as filler just relocates the semantic overload rather than removing it. `<|output_end|>`
+  only appears in GSM8K's calculator-tool conversations (`tasks/gsm8k.py`'s `python`/`python_output`
+  message parts, rendered via `RustBPETokenizer.render_conversation`) — a small slice of the full
+  mixture, SmolTalk-dominated by volume — so it's the pragmatic choice without a tokenizer change,
+  not a truly free id. A genuinely clean pad token needs a new tokenizer, out of scope here and
+  already on the roadmap for future real experiments.
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now
