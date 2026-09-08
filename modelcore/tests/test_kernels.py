@@ -429,11 +429,44 @@ class TestBuildDocArgs:
         doc_ids = build_doc_args(idx, BOS).doc_ids
         assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1, 1]]
 
-    def test_bos_run_collapses_to_one_document(self):
-        """A run of consecutive BOS ids (BestFitPadPacker's pad tail) is one document, not one
-        per pad token."""
+    def test_trailing_bos_run_folds_into_previous_document_by_default(self):
+        """padding_id defaults to None: a document made ENTIRELY of BOS (BestFitPadPacker's pad
+        tail, written with bos_token_id as filler since it has no distinct padding_id) is folded
+        into the preceding document rather than counted as its own -- a real document always has
+        non-BOS content after its own leading BOS, so an all-BOS document can only be padding."""
         idx = torch.tensor([[BOS, 1, 2, BOS, BOS, BOS]])
         doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 0, 0, 0]]
+
+    def test_bos_run_with_trailing_content_is_not_folded(self):
+        """The fold only applies to a document with NO non-BOS content at all. A BOS run followed
+        by more real content (not at the row's tail) is a real document boundary, not padding."""
+        idx = torch.tensor([[BOS, 1, 2, BOS, BOS, 3, 4]])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1, 1]]
+
+    def test_all_padding_row_is_not_folded(self):
+        """A row that is 100% padding (source ran dry with no real content at all) has nothing to
+        fold into -- left as a single degenerate document rather than going negative."""
+        idx = torch.tensor([[BOS, BOS, BOS, BOS]])
+        doc_ids = build_doc_args(idx, BOS).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 0]]
+
+    def test_explicit_padding_id_needs_no_folding(self):
+        """A packer using a distinct padding_id (not bos_token_id) never produces an all-BOS
+        pad tail in the first place -- the padded positions simply never trigger is_start, so they
+        already inherit the preceding document's id from the cumsum with no special-casing."""
+        PAD = 12345
+        idx = torch.tensor([[BOS, 1, 2, PAD, PAD, PAD]])
+        doc_ids = build_doc_args(idx, BOS, padding_id=PAD).doc_ids
+        assert doc_ids.tolist() == [[0, 0, 0, 0, 0, 0]]
+
+    def test_explicit_padding_id_does_not_fold_a_real_trailing_bos_document(self):
+        """With padding_id given, the None-only fallback heuristic must not run at all -- a
+        genuine short final document (not padding) stays its own document, not folded away."""
+        PAD = 12345
+        idx = torch.tensor([[BOS, 1, 2, BOS, PAD, PAD]])  # second doc is real (len 1: token BOS) + pad tail
+        doc_ids = build_doc_args(idx, BOS, padding_id=PAD).doc_ids
         assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1]]
 
     def test_no_bos_is_one_document(self):

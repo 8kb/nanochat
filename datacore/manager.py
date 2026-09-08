@@ -34,6 +34,14 @@ class DataManager:
             named_batches = named_document_batches(source, tokenizer, num_threads=num_threads)
             totals = write_split(store, split, packer, sequence_len, sequences_per_volume, vocab_size, named_batches)
             manifest_splits[split] = _split_totals_to_dict(totals)
+        packer_params = {"buffer_size": packer.buffer_size}
+        # padding_id is duck-typed (only BestFitPadPacker has it) -- record its resolved value
+        # (never None: the packer itself resolves a None constructor arg to bos_token_id) so a
+        # manifest fully documents what a prepared dataset's pad tail actually contains, whether
+        # defaulted or explicit.
+        packer_padding_id = getattr(packer, "padding_id", None)
+        if packer_padding_id is not None:
+            packer_params["padding_id"] = packer_padding_id
         manifest = {
             "format": FORMAT,
             "sequence_len": sequence_len,
@@ -43,7 +51,7 @@ class DataManager:
             "vocab_size": vocab_size,
             "bos_token_id": bos_id,
             "tokenizer_fingerprint": tokenizer.fingerprint(),
-            "packer": {"name": packer.name, "params": {"buffer_size": packer.buffer_size}},
+            "packer": {"name": packer.name, "params": packer_params},
             "sequences_per_volume": sequences_per_volume,
             "splits": manifest_splits,
         }

@@ -156,7 +156,7 @@ def prepare_sft(args, tokenizer):
         "train": TaskMixtureTokenSource(train_mixture, tokenizer, "train", max_tokens=args.max_tokens_per_conversation),
         "val": TaskMixtureTokenSource(val_mixture, tokenizer, "val", max_tokens=args.max_tokens_per_conversation),
     }
-    packer = BestFitPadPacker(bos_token_id=bos_id, buffer_size=args.buffer_size)
+    packer = BestFitPadPacker(bos_token_id=bos_id, padding_id=args.sft_padding_id, buffer_size=args.buffer_size)
     t0 = time.time()
     manifest = manager.prepare(
         store, sources=sources, tokenizer=tokenizer,
@@ -210,6 +210,7 @@ def main():
     parser.add_argument("--mmlu-epochs", type=int, default=3, help="--kind=sft: MMLU auxiliary_train epochs in the training mixture (matches scripts/chat_sft.py's pre-datacore default)")
     parser.add_argument("--gsm8k-epochs", type=int, default=4, help="--kind=sft: GSM8K train epochs in the training mixture (matches scripts/chat_sft.py's pre-datacore default)")
     parser.add_argument("--max-tokens-per-conversation", type=int, default=2048, help="--kind=sft: truncate a rendered conversation to this many tokens (matches RustBPETokenizer.render_conversation's own default)")
+    parser.add_argument("--sft-padding-id", type=int, default=None, help="--kind=sft: token id BestFitPadPacker uses to fill unused row capacity (default: None, which resolves to bos_token_id -- this packer's original behavior). A distinct id avoids the pad tail looking like a document to BOS-based document-boundary logic; see modelcore.kernels.flash_attn.build_doc_args's matching padding_id parameter")
     parser.add_argument("--describe", action="store_true", help="print an existing prepared dataset's info and exit (needs --dataset)")
     args = parser.parse_args()
 

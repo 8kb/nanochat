@@ -113,15 +113,27 @@ class BestFitCropPacker:
 
 
 class BestFitPadPacker:
-    """Same best-fit search as BestFitCropPacker, but pads the tail with `bos_token_id` (mask=0)
+    """Same best-fit search as BestFitCropPacker, but pads the tail with `padding_id` (mask=0)
     instead of cropping when nothing fits -- no token is ever discarded. Used for SFT, where
-    dropping half a conversation would be worse than a little padding."""
+    dropping half a conversation would be worse than a little padding.
+
+    padding_id defaults to None, which resolves to `bos_token_id` -- this packer's original,
+    only-ever behavior before this parameter existed, and what every already-prepared dataset on
+    disk was built with. Passing a distinct value (any valid token id other than bos_token_id) is
+    for a future consumer that wants an unambiguous pad tail: with bos_token_id reused as filler,
+    the tail looks like a document (BOS-started) to BOS-based document-boundary logic, even though
+    it's pure padding; modelcore.kernels.flash_attn.build_doc_args has a matching padding_id
+    parameter that knows how to handle either choice -- its own None default applies a fallback
+    heuristic (a document made entirely of bos_token_id can only be this pad tail, since a real
+    document always has non-BOS content after its own leading BOS) so an already-prepared
+    bos_token_id-padded dataset still gets correct document boundaries without re-preparing."""
 
     name = "bestfit_pad"
     emits_mask = True
 
-    def __init__(self, bos_token_id: int, buffer_size: int = 1000):
+    def __init__(self, bos_token_id: int, padding_id: int | None = None, buffer_size: int = 1000):
         self.bos_token_id = bos_token_id
+        self.padding_id = padding_id if padding_id is not None else bos_token_id
         self.buffer_size = buffer_size
         # Reset at the start of every pack() call -- see the oversized-conversation note there.
         self.num_documents_dropped = 0
@@ -172,7 +184,7 @@ class BestFitPadPacker:
                     mask_row.extend(mask)
                 else:
                     # nothing fits -- either genuinely too big, or the source ran dry: pad either way
-                    row.extend([self.bos_token_id] * remaining)
+                    row.extend([self.padding_id] * remaining)
                     mask_row.extend([0] * remaining)
                     break
             yield PackedRow(ids=row[:row_capacity], mask=mask_row[:row_capacity])

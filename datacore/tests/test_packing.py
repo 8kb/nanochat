@@ -51,6 +51,23 @@ def test_pad_never_crops_and_masks_padding():
     assert row.mask == [0, 1, 1, 0, 0, 0]
 
 
+def test_pad_padding_id_defaults_to_bos_token_id():
+    """padding_id defaults to None, which resolves to bos_token_id -- this packer's original,
+    only-ever behavior before the parameter existed."""
+    bos = 99
+    packer = BestFitPadPacker(bos_token_id=bos, buffer_size=4)
+    assert packer.padding_id == bos
+
+
+def test_pad_explicit_padding_id_fills_the_tail_instead_of_bos():
+    bos, pad = 99, 7
+    packer = BestFitPadPacker(bos_token_id=bos, padding_id=pad, buffer_size=4)
+    docs = [EncodedDoc(ids=[bos, 1, 2], mask=[0, 1, 1])]
+    rows = list(packer.pack(iter(docs), row_capacity=6))
+    assert rows[0].ids == [bos, 1, 2, pad, pad, pad]
+    assert rows[0].mask == [0, 1, 1, 0, 0, 0]  # masking is unaffected by which id fills the tail
+
+
 def test_pad_docs_without_mask_default_to_fully_supervised():
     bos = 99
     packer = BestFitPadPacker(bos_token_id=bos, buffer_size=4)

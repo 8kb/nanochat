@@ -115,7 +115,7 @@ per-row maximum. Pass max_docs explicitly for a dataset/sequence-length combinat
 margin doesn't hold (very short documents relative to sequence_len)."""
 
 
-def build_doc_args(idx, bos_token_id, max_docs=None):
+def build_doc_args(idx, bos_token_id, padding_id=None, max_docs=None):
     """Derive document boundaries from BOS positions in idx, (B, T) token ids.
 
     Call this OUTSIDE any torch.compile region and pass its result in as plain data:
@@ -133,9 +133,20 @@ def build_doc_args(idx, bos_token_id, max_docs=None):
     sequences when the real batch had ~270 documents. Default is `DEFAULT_MAX_DOCS_PER_ROW * B` --
     tune it down for less memory, up if a dataset genuinely packs more documents per row.
 
-    A run of consecutive BOS ids (BestFitPadPacker's pad tail, datacore/packing.py) collapses into
-    one document rather than one document per pad token -- `is_start` only fires on the first BOS
-    of a run.
+    A run of consecutive BOS ids (e.g. a pad tail written with bos_token_id as filler) collapses
+    into one document rather than one document per pad token -- `is_start` only fires on the first
+    BOS of a run.
+
+    padding_id: what a packer used to fill unused row capacity (datacore.packing.BestFitPadPacker;
+    irrelevant for a never-padded pretraining row). None (default) means "unknown, or the packer
+    reused bos_token_id itself" (every dataset prepared before this parameter existed, and
+    BestFitPadPacker's own default) -- in that case a document consisting ENTIRELY of
+    bos_token_id can only be that pad tail, since a real document always has non-BOS content after
+    its own leading BOS, so it's folded into the preceding document instead of counted as its own
+    (a row that is 100% padding, with no preceding document to fold into, is left alone). When
+    padding_id is a real, distinct value, no special-casing is needed at all: it never equals
+    bos_token_id, so it never triggers is_start in the first place, and padded positions already
+    inherit the preceding document's id from the cumsum below.
     """
     B, T = idx.shape
     is_bos = idx == bos_token_id
@@ -144,6 +155,16 @@ def build_doc_args(idx, bos_token_id, max_docs=None):
     doc_ids = is_start.to(torch.int32).cumsum(dim=1) - 1  # 0-based within each row
     doc_ids = doc_ids.clamp(min=0)  # a row that starts mid-document (shouldn't happen -- every
                                      # row is BOS-aligned -- but stay defined rather than negative)
+
+    if padding_id is None:
+        last_doc = doc_ids.max(dim=1, keepdim=True).values  # (B, 1)
+        is_last_doc = doc_ids == last_doc
+        tail_is_all_bos = (is_bos | ~is_last_doc).all(dim=1, keepdim=True)  # (B, 1)
+        should_fold = tail_is_all_bos & (last_doc > 0)  # nothing to fold into if it's the only doc
+        fold_mask = is_last_doc & should_fold
+        doc_ids = doc_ids - fold_mask.to(doc_ids.dtype)
+        is_start = is_start & ~fold_mask  # the folded document's own leading BOS is no longer a
+                                           # boundary either -- keeps the FA3 path (below) consistent
 
     if not USE_FA3:
         return DocArgs(doc_ids=doc_ids)

@@ -96,6 +96,45 @@ def test_prepare_with_token_source_for_sft_style_data(tmp_path):
     assert inputs.shape == (1, 16)
 
 
+def test_prepare_records_packer_params_including_padding_id(tmp_path):
+    tok = CharTokenizer(CHARS)
+    bos = tok.get_bos_token_id()
+
+    def conv(user, asst):
+        ids = [bos] + tok.encode(user) + tok.encode(asst)
+        mask = [0] * (1 + len(user)) + [1] * len(asst)
+        return EncodedDoc(ids=ids, mask=mask)
+
+    source = ListTokenSource([("conv_batch", [conv("hi", "hello!")])])
+
+    # Default (padding_id=None -> resolves to bos_token_id): recorded value is the resolved one.
+    store_default = FileSystemDatasetStore(str(tmp_path / "default"))
+    manifest_default = DataManager().prepare(
+        store_default, sources={"train": source}, tokenizer=tok,
+        sequence_len=16, sequences_per_volume=10, packer=BestFitPadPacker(bos_token_id=bos, buffer_size=10),
+    )
+    assert manifest_default["packer"]["params"]["padding_id"] == bos
+
+    # Explicit padding_id: recorded as given, distinct from bos_token_id.
+    source2 = ListTokenSource([("conv_batch", [conv("hi", "hello!")])])
+    store_explicit = FileSystemDatasetStore(str(tmp_path / "explicit"))
+    pad_id = bos + 1
+    manifest_explicit = DataManager().prepare(
+        store_explicit, sources={"train": source2}, tokenizer=tok,
+        sequence_len=16, sequences_per_volume=10,
+        packer=BestFitPadPacker(bos_token_id=bos, padding_id=pad_id, buffer_size=10),
+    )
+    assert manifest_explicit["packer"]["params"]["padding_id"] == pad_id
+
+    # BestFitCropPacker has no padding_id at all -- key must be absent, not None.
+    store_crop = FileSystemDatasetStore(str(tmp_path / "crop"))
+    manifest_crop = DataManager().prepare(
+        store_crop, sources={"train": ListTextSource([("f", ["one two three.\n"] * 5)])}, tokenizer=tok,
+        sequence_len=8, sequences_per_volume=5, packer=BestFitCropPacker(buffer_size=10),
+    )
+    assert "padding_id" not in manifest_crop["packer"]["params"]
+
+
 def test_two_splits_from_different_sources(tmp_path):
     tok = CharTokenizer(CHARS)
     train_source = ListTextSource([("f1", ["training text here.\n"] * 20)])
