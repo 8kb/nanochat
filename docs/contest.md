@@ -720,8 +720,8 @@ attempt found at d16, now reproduced on this fork's kv-sharing + sliding-window 
 the added, measured cost of the varlen kernel itself.
 
 One asymmetry worth flagging for anyone re-reading these two numbers later: this run's val bpb is
-computed *with* the same intra-document masking as training (`nanochat/loss_eval.py`'s
-`evaluate_bpb` takes `bos_token_id`/`doc_masking_max_docs_per_row` and masks val batches
+computed *with* the same intra-document masking as training (`modelcore.ModelManager.evaluate_bpb`
+takes `bos_token_id`/`doc_masking_max_docs_per_row` and masks val batches
 identically) — deliberate, so val bpb stays comparable to the training loss it's evaluating, but it
 means the two runs' val bpb aren't measuring exactly the same quantity (unmasked vs. masked
 attention over the same held-out tokens), only the same *procedure* each run actually trained
@@ -880,7 +880,7 @@ guess (which did OOM) was.
 
 **`scripts/chat_sft.py` gained `--doc-masking` / `--doc-masking-max-docs-per-row`**, mirroring
 `scripts/base_train.py`'s wiring exactly (`doc_args` built outside the `torch.compile`'d model, in
-the micro-batch loop; `evaluate_bpb` given the same `bos_token_id`/`padding_id`/
+the micro-batch loop; `ModelManager.evaluate_bpb` given the same `bos_token_id`/`padding_id`/
 `doc_masking_max_docs_per_row`). `datacore.reader.DatasetInfo` now also surfaces `padding_id` and
 `bos_token_id` (previously readable only from the raw manifest dict), which both `base_train.py`
 and `chat_sft.py` use to pass the dataset's actual resolved `padding_id` into `build_doc_args`

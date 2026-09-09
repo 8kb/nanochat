@@ -417,7 +417,8 @@ real-machine lesson worth recording separately: `docs/architecture.md`'s canonic
 overrides `--eval-tokens`; a run that doesn't (this stage's first ad hoc smoke test) hits
 `evaluate_bpb`'s per-step `(y.int() < 0).any()` check tens of thousands of times, each one an
 MPS-synchronizing op — slow enough on this backend to look exactly like a hang. Not a datacore
-bug, but the kind of thing worth overriding explicitly in any small local run.
+bug, but the kind of thing worth overriding explicitly in any small local run. (`evaluate_bpb`
+itself moved to `modelcore.ModelManager.evaluate_bpb` at Stage 14, below — this check is unchanged.)
 
 ## Stage 10 — the repo split (done)
 
@@ -479,6 +480,47 @@ Config files as an alternative to pure argparse CLI flags — `--model-config` i
 architecture specifically; this stage is the rest of a run's configuration (data, optimizer,
 eval). A `docs/experiments/` log in the spirit of `docs/upstream/LOG.md`, but for architecture
 ablations specifically — Stage 5's contest is this stage's first real entry.
+
+## Stage 14 — `evaluate_bpb` moves to modelcore; the token-byte table moves to datacore (done)
+
+`nanochat/loss_eval.py`'s `evaluate_bpb` was already subsystem-shaped -- no `nanochat` imports, only
+`modelcore.Model`'s own API and a plain `(x, y, ...)` batch iterable. It moved into
+`modelcore/evaluate.py`, exposed as `ModelManager.evaluate_bpb` (mirrors `new_decoder`'s free-function-plus-wrapper
+split). The one thing keeping it in the host was `token_bytes`, the per-token UTF-8 byte-length
+table bpb needs: previously an inline loop in `scripts/tok_train.py`, saved as `token_bytes.pt` in
+the tokenizer directory, loaded by `nanochat.tokenizer.get_token_bytes()`.
+
+Deriving that table is now `RustBPETokenizer.token_byte_lengths()` -- a tokenizer method, not a
+script's inline loop -- and it crosses the datacore boundary as an OPTIONAL, duck-typed fifth
+member of `datacore.tokenizer.Tokenizer`'s protocol (checked with `getattr`, not declared on the
+`Protocol` itself, so a tokenizer without it is still a valid `Tokenizer`). `DataManager.prepare`
+calls it when present and persists the result as `token_bytes.npy` beside the dataset, recorded in
+the manifest as `token_bytes_file` (omitted, not `None`, when the tokenizer lacks the method --
+same back-compat convention as `bos_token_id`/`mask_file`/`padding_id`). `DataManager.token_bytes(dataset)`
+reads it back as a plain numpy array (datacore's read-side stays torch-free outside `batches()`);
+`ModelManager.evaluate_bpb` accepts `token_bytes` as any of list/numpy array/tensor and converts
+once, internally, with `torch.as_tensor` -- modelcore never learns how the caller obtained it.
+
+The consequence for every caller (`scripts/base_train.py`, `scripts/chat_sft.py`,
+`scripts/base_eval.py`): `token_bytes` is now read from the prepared dataset, right after opening
+it, not from a tokenizer directory. **A dataset prepared before this stage has no `token_bytes`
+artefact, and `DataManager.token_bytes()` raises on it rather than falling back or backfilling** --
+it must be re-prepared with `scripts/data_prep.py` (a CPU-pod job, same as any other prep) before a
+bpb eval against it works again. `nanochat.tokenizer.get_token_bytes()` (the tokenizer-directory
+loader) and `nanochat/default_tokenizer/token_bytes.pt` are unchanged and still work standalone;
+they're just no longer on the bpb-eval path.
+
+Verified: both subsystems' own suites plus their `test_standalone.py` AST-scan proof (`cp -r
+<pkg> /tmp && PYTHONPATH=/tmp python -m pytest ...`, no host on the path); nanochat's full suite
+(148 passed, one pre-existing unrelated `test_execution.py` macOS-sandbox failure, unchanged from
+prior stages); a real dataset re-prepared locally against real cached ClimbMix shards, confirming
+`token_bytes.npy`/the manifest key/`DataManager.token_bytes()`'s returned values match
+`RustBPETokenizer.token_byte_lengths()` exactly; `base_eval --eval=bpb` against a real local
+checkpoint and the freshly-prepared dataset, producing sane bpb numbers; a tiny real
+`base_train`/`chat_sft` run each confirming the `Validation bpb:` stdout line
+(`runs/scaling_laws.sh`/`runs/miniseries.sh` grep this) still prints in its exact format; and
+`DataManager.token_bytes()` raising with a re-prepare message against a real dataset that predates
+this stage.
 
 ## Explicitly deferred, not scheduled
 

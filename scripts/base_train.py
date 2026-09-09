@@ -29,9 +29,8 @@ from modelcore import Model, ModelManager, OptimizerHparams
 from nanochat.architectures import presets
 from nanochat.scaling import derive_training_plan, B_REF
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_tokenizer
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from modelcore.kernels.flash_attn import build_doc_args
@@ -128,7 +127,6 @@ print0(f"Intra-document masking: {'ON' if args.doc_masking else 'off'}")
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 tokenizer_fingerprint = tokenizer.fingerprint()
 bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
@@ -169,6 +167,7 @@ if dataset.info.tokenizer_fingerprint != tokenizer_fingerprint:
     )
 print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
       f"{dataset.num_sequences('val'):,} val sequences)")
+token_bytes = data_manager.token_bytes(dataset)
 
 # padding_id is None for the crop packer pretraining always uses -- build_doc_args's bos-run
 # fold-in heuristic already handles that case correctly, so this is a no-op for base_train.py
@@ -468,9 +467,9 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
-                                    doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
-                                    padding_id=padding_id)
+            val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                            doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                            padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb

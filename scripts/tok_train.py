@@ -73,18 +73,10 @@ assert decoded == test_text
 # for efficient evaluation of bits per byte. Unlike the typical mean loss, this
 # allows us to report a loss that is invariant to the vocab size of the tokenizer.
 # The bits per byte on the validation set is then one of the primary metrics we care about.
-vocab_size = tokenizer.get_vocab_size()
-special_ids = set(tokenizer.encode_special(s) for s in tokenizer.get_special_tokens())
-token_bytes = []
-for token_id in range(vocab_size):
-    if token_id in special_ids:
-        token_bytes.append(0) # special tokens are not counted
-    else:
-        # use the raw bytes of the token: decoding to a string first corrupts
-        # tokens that are not valid standalone UTF-8 (e.g. the raw bytes >= 0x80)
-        num_bytes = len(tokenizer.decode_single_token_bytes(token_id))
-        token_bytes.append(num_bytes)
-token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
+# See RustBPETokenizer.token_byte_lengths() for how this is derived -- a prepared dataset
+# captures the same vector itself at data_prep time, so this tokenizer-directory copy is a
+# fallback for when there's no prepared dataset to read it from yet.
+token_bytes = torch.tensor(tokenizer.token_byte_lengths(), dtype=torch.int32, device='cpu')
 token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
 with open(token_bytes_path, "wb") as f:
     torch.save(token_bytes, f)

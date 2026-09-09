@@ -53,10 +53,12 @@ nanochat/             everything that knows nanochat's own conventions
 ├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; LegacyCheckpointStore
 │                        adapts an old checkpoint onto ModelManager.load_model
 ├── optim.py, flash_attention.py   one-line re-export shims onto modelcore.optim/modelcore.kernels
-├── tokenizer.py            BPE tokenizer wrapper (satisfies datacore.Tokenizer unmodified)
+├── tokenizer.py            BPE tokenizer wrapper (satisfies datacore.Tokenizer unmodified,
+│                        including datacore's optional token_byte_lengths() member)
 ├── dataset.py               ClimbMix identity (URL, shard count, local dir) -- download/parquet
 │                        mechanism lives in datacore.download/datacore.sources
-├── core_eval.py / loss_eval.py   base-model evaluation (CORE benchmark, bits-per-byte)
+├── core_eval.py            base-model evaluation, CORE benchmark (bits-per-byte moved to
+│                        modelcore.ModelManager.evaluate_bpb -- see docs/roadmap.md Stage 14)
 ├── execution.py            sandboxed Python execution (tool use)
 └── scaling.py               muP training-plan math (architecture-agnostic)
 scripts/              entry points, run as `python -m scripts.<name>`
@@ -94,6 +96,13 @@ These are `modelcore`'s or `datacore`'s own invariants, not this repo's — full
   and hard-error if either doesn't match; a pre-datacore checkpoint's old `{pq_idx, rg_idx, epoch}`
   dataloader state (no `"format"` key) is refused unless `--ignore-dataloader-state` is passed —
   model/optimizer weights still load fine either way, only the data-stream position is affected.
+- **A bpb eval's `token_bytes` comes from the prepared dataset, not a tokenizer directory** --
+  [datacore's](https://github.com/8kb/datacore/blob/main/AGENTS.md) `DataManager.token_bytes()`,
+  raising if the dataset has none. Consequence here: `scripts/base_train.py`/`scripts/chat_sft.py`/
+  `scripts/base_eval.py` all read it right after opening their dataset, not from
+  `nanochat.tokenizer.get_token_bytes()` any more; a dataset prepared before this existed (Stage
+  14, see `docs/roadmap.md`) must be re-prepared with `scripts/data_prep.py` before a bpb eval
+  against it will work again -- there is no backfill path, and this is not automatic.
 
 ## Invariants that will bite you (nanochat's own)
 

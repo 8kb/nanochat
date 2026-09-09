@@ -18,9 +18,7 @@ import wandb
 import torch
 from datacore import DataManager, FileSystemDatasetStore
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, arch_of
-from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from nanochat.engine import Engine
@@ -129,7 +127,6 @@ grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
@@ -195,6 +192,7 @@ if dataset.info.tokenizer_fingerprint != tokenizer.fingerprint():
     )
 print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
       f"{dataset.num_sequences('val'):,} val sequences)")
+token_bytes = data_manager.token_bytes(dataset)
 
 bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
 padding_id = dataset.info.padding_id if args.doc_masking else None
@@ -262,9 +260,9 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
-                                doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
-                                padding_id=padding_id)
+        val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                        doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                        padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb

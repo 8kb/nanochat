@@ -141,6 +141,27 @@ class RustBPETokenizer:
             h.update(self.decode_single_token_bytes(token_id))
         return h.hexdigest()[:16]
 
+    def token_byte_lengths(self):
+        """A list[int] of length vocab_size: the number of bytes for each token id, or 0 for a
+        special token (not counted). Used for bits-per-byte evaluation -- a vocab size-independent
+        metric, so a checkpoint trained against a different vocab is still comparable. This is
+        the tokenizer's own optional half of datacore.tokenizer.Tokenizer's protocol (see there);
+        datacore.DataManager.prepare calls this at prepare() time and persists the result
+        alongside the dataset, so evaluate_bpb never needs a tokenizer directory at eval time.
+
+        Special ids come from get_special_tokens()/encode_special() -- e.g. <|bos|> -- and are
+        zeroed regardless of what decode_single_token_bytes would report for them. Every other
+        token's length comes from its raw bytes, deliberately not decode()-to-a-string first,
+        which would corrupt a token that isn't valid standalone UTF-8 (e.g. a raw byte >= 0x80)."""
+        special_ids = set(self.encode_special(s) for s in self.get_special_tokens())
+        lengths = []
+        for token_id in range(self.get_vocab_size()):
+            if token_id in special_ids:
+                lengths.append(0)
+            else:
+                lengths.append(len(self.decode_single_token_bytes(token_id)))
+        return lengths
+
     def save(self, tokenizer_dir):
         # save the encoding object to disk
         os.makedirs(tokenizer_dir, exist_ok=True)
@@ -280,6 +301,12 @@ def get_tokenizer():
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):
+    """Reads token_bytes.pt from the tokenizer directory (written by tok_train.py, from
+    RustBPETokenizer.token_byte_lengths()). A bpb eval against a prepared dataset should prefer
+    that dataset's own token_bytes (datacore.DataManager.token_bytes(dataset)) instead -- it's
+    self-sufficient and needs no tokenizer directory at all. This loader remains for
+    nanochat/default_tokenizer/'s committed token_bytes.pt and any other direct
+    tokenizer-directory use."""
     import torch
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()

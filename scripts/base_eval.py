@@ -29,12 +29,11 @@ import argparse
 import torch
 
 from datacore import DataManager, FileSystemDatasetStore
+from modelcore import ModelManager
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.data_prep import default_dataset_name, prepared_dir
 
@@ -153,7 +152,7 @@ def main():
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step, arch=args.arch)
     sequence_len = meta["model_config"]["sequence_len"]
-    token_bytes = get_token_bytes(device=device)
+    manager = ModelManager()
     model_name = f"{meta['model_tag']} (step {meta['step']})"
     model_slug = f"{meta['model_tag']}_{meta['step']:06d}" # includes the tag so two architectures evaluated in the same run don't overwrite each other's CSV
 
@@ -228,11 +227,12 @@ def main():
                 f"checkpoint's model was trained at sequence_len={sequence_len}. Re-prepare it:\n"
                 f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={sequence_len}"
             )
+        token_bytes = data_manager.token_bytes(dataset)
 
         for split_name in ["train", "val"]:
             loader = data_manager.batches(dataset, split_name, args.device_batch_size, device=device,
                                           rank=ddp_rank, world_size=ddp_world_size, infinite=True)
-            bpb = evaluate_bpb(model, loader, steps, token_bytes)
+            bpb = manager.evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
 
