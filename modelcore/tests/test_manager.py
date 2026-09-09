@@ -6,9 +6,6 @@ or an old checkpoint; modelcore only ever consumes the materialized result).
 
 python -m pytest modelcore/tests/test_manager.py -v
 """
-import hashlib
-import json
-
 import pytest
 import torch
 
@@ -16,7 +13,6 @@ from modelcore import ComponentSpec, ModelConfig, OptimizerHparams
 from modelcore.components.linear import Linear
 from modelcore.roles import collect_param_roles
 
-from modelcore.tests import GOLDENS_DIR, TINY_DIR
 from modelcore.tests.conftest import FLAVORS, build
 
 
@@ -228,43 +224,3 @@ def test_kv_sharing_consumer_without_kv_slot_is_reported(manager):
     report = manager.validate_config(config)
     assert not report.ok
     assert any("explicit kv_slot" in e.message for e in report.errors)
-
-
-# -----------------------------------------------------------------------------
-# Cross-check against the pre-refactor goldens (modelcore/tests/goldens/tiny_composed_*): proves
-# modelcore's components (has_ve removed, n_layer dropped from Block, runtime injected instead of
-# a COMPUTE_DTYPE global, ...) reproduce the pre-Stage-7 composed-architecture path bit-for-bit.
-
-GOLDEN_PRESETS = ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"]
-
-
-@pytest.mark.parametrize("preset", GOLDEN_PRESETS)
-def test_matches_pre_refactor_composed_golden(manager, preset):
-    import os
-    golden_name = f"tiny_composed_{preset}"
-    with open(os.path.join(GOLDENS_DIR, f"{golden_name}.json"), encoding="utf-8") as f:
-        golden = json.load(f)
-    config = manager.config_from_dict(golden["meta_model_config"])
-    state = torch.load(os.path.join(TINY_DIR, golden_name, "model_000000.pt"), map_location="cpu")
-
-    with torch.device("meta"):
-        from modelcore.model import Model
-        model = Model(config)
-    model.to_empty(device="cpu")
-    model.init_weights()
-    model.load_state_dict(state, strict=True, assign=True)
-    model.eval()
-
-    stats = manager.stats(config)
-    assert stats.num_params == golden["accounting"]["num_scaling_params"]["total"]
-    assert stats.num_matmul_params == golden["accounting"]["num_matmul_params"]
-    assert stats.flops_per_token == golden["accounting"]["estimate_flops"]
-    assert stats.kv_bytes_per_token() == golden["accounting"]["kv_bytes_per_token"]
-    assert stats.kv_cache_spec == golden["accounting"]["kv_cache_spec"]
-
-    T = min(8, config.sequence_len)
-    idx = (torch.arange(T) % config.vocab_size).long().unsqueeze(0)
-    with torch.no_grad():
-        logits = model(idx)
-    h = hashlib.sha256(logits.float().contiguous().numpy().tobytes()).hexdigest()
-    assert h == golden["logits_hash"]

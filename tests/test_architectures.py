@@ -14,11 +14,11 @@ import torch
 
 from modelcore import ModelManager
 from modelcore.model import Model
-from modelcore.tests import GOLDENS_DIR as MODELCORE_GOLDENS_DIR, TINY_DIR as MODELCORE_TINY_DIR
 
 from nanochat.architectures import legacy, presets
 
 GOLDENS_DIR = os.path.join(os.path.dirname(__file__), "goldens")
+TINY_DIR = os.path.join(GOLDENS_DIR, "tiny")
 
 
 def _tensor_hash(t):
@@ -31,10 +31,11 @@ def _load_golden(name):
 
 
 def _load_composed_golden(preset):
-    """The tiny_composed_* goldens are modelcore's own baseline (moved into modelcore/tests/goldens
-    at Stage 8, see docs/roadmap.md) -- this is the one place nanochat's own tests read modelcore's
-    test data, since presets.expand's job is exactly to reproduce that same tree."""
-    with open(os.path.join(MODELCORE_GOLDENS_DIR, f"tiny_composed_{preset}.json"), encoding="utf-8") as f:
+    """The tiny_composed_* goldens are modelcore's own pre-Stage-7 baseline, moved from
+    modelcore/tests/goldens into tests/goldens/ at Stage 10's repo split (see docs/roadmap.md) --
+    this is the one place nanochat's own tests reproduce that same tree, since presets.expand's
+    job is exactly to reproduce it."""
+    with open(os.path.join(GOLDENS_DIR, f"tiny_composed_{preset}.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -73,7 +74,35 @@ def test_expand_matches_pre_refactor_golden(manager, preset, kwargs):
     golden = _load_composed_golden(preset)
     _assert_matches_composed_golden(manager, config, golden)
 
-    state = torch.load(os.path.join(MODELCORE_TINY_DIR, f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
+    state = torch.load(os.path.join(TINY_DIR, f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
+    with torch.device("meta"):
+        model = Model(config)
+    model.to_empty(device="cpu")
+    model.init_weights()
+    model.load_state_dict(state, strict=True, assign=True)
+    model.eval()
+    T = min(8, config.sequence_len)
+    idx = (torch.arange(T) % config.vocab_size).long().unsqueeze(0)
+    with torch.no_grad():
+        logits = model(idx)
+    assert _tensor_hash(logits.float()) == golden["logits_hash"]
+
+
+GOLDEN_PRESETS = ["gpt", "llama", "llama_kvshare", "llama_kvshare_win"]
+
+
+@pytest.mark.parametrize("preset", GOLDEN_PRESETS)
+def test_config_from_dict_matches_pre_refactor_composed_golden(manager, preset):
+    """The complementary half of test_expand_matches_pre_refactor_golden above (moved here from
+    modelcore/tests/test_manager.py at Stage 10's repo split): builds the config from the golden's
+    own stored meta_model_config (ModelManager.config_from_dict) rather than from presets.expand,
+    proving modelcore's serialization round-trip reproduces the pre-Stage-7 composed-architecture
+    path bit-for-bit, independent of nanochat's own depth-dial derivation layer."""
+    golden = _load_composed_golden(preset)
+    config = manager.config_from_dict(golden["meta_model_config"])
+    _assert_matches_composed_golden(manager, config, golden)
+
+    state = torch.load(os.path.join(TINY_DIR, f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
     with torch.device("meta"):
         model = Model(config)
     model.to_empty(device="cpu")
