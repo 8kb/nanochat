@@ -57,6 +57,24 @@ wheels = [
 ]
 
 [[package]]
+name = "benchcore"
+version = "0.1.1"
+source = { git = "https://github.com/8kb/benchcore?tag=v0.1.1#c896c3083c718ebfd1abdebcf6bc8eb8bb7935b2" }
+dependencies = [
+    { name = "datacore", extra = ["parquet"] },
+    { name = "filelock" },
+    { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
+    { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu') or (extra != 'extra-8-nanochat-cpu' and extra != 'extra-8-nanochat-gpu')" },
+    { name = "torch", version = "2.9.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
+    { name = "torch", version = "2.9.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "extra == 'extra-8-nanochat-gpu'" },
+]
+
+[package.optional-dependencies]
+bundle = [
+    { name = "pyyaml" },
+]
+
+[[package]]
 name = "certifi"
 version = "2025.8.3"
 source = { registry = "https://pypi.org/simple" }
@@ -426,9 +444,10 @@ wheels = [
 
 [[package]]
 name = "datacore"
-version = "0.1.0"
-source = { git = "https://github.com/8kb/datacore?tag=v0.1.0#8b730c8e4f60bb28d1ab091dcfc0dd1a43445d4c" }
+version = "0.2.1"
+source = { git = "https://github.com/8kb/datacore?tag=v0.2.1#a62f3c30f8f0d425a40560f62e139c37bf0b2d24" }
 dependencies = [
+    { name = "filelock" },
     { name = "numpy" },
 ]
 
@@ -1113,8 +1132,8 @@ wheels = [
 
 [[package]]
 name = "modelcore"
-version = "0.1.0"
-source = { git = "https://github.com/8kb/modelcore?tag=v0.1.0#4dec530b72802e18e752c6a048c21cffd83ce62b" }
+version = "0.2.0"
+source = { git = "https://github.com/8kb/modelcore?tag=v0.2.0#13d2f4a4dc27210d5fe2fc619cb6c534ed55716e" }
 dependencies = [
     { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu') or (extra != 'extra-8-nanochat-cpu' and extra != 'extra-8-nanochat-gpu')" },
@@ -1142,6 +1161,7 @@ name = "nanochat"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "benchcore", extra = ["bundle"] },
     { name = "datacore", extra = ["parquet", "torch"] },
     { name = "filelock" },
     { name = "hf-transfer" },
@@ -1179,11 +1199,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datacore", extras = ["torch", "parquet"], git = "https://github.com/8kb/datacore?tag=v0.1.0" },
+    { name = "benchcore", extras = ["bundle"], git = "https://github.com/8kb/benchcore?tag=v0.1.1" },
+    { name = "datacore", extras = ["torch", "parquet"], git = "https://github.com/8kb/datacore?tag=v0.2.1" },
     { name = "filelock", specifier = ">=3.19.0" },
     { name = "hf-transfer", specifier = ">=0.1.9" },
     { name = "kernels", specifier = ">=0.11.7" },
-    { name = "modelcore", extras = ["fa3"], git = "https://github.com/8kb/modelcore?tag=v0.1.0" },
+    { name = "modelcore", extras = ["fa3"], git = "https://github.com/8kb/modelcore?tag=v0.2.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "psutil", specifier = ">=7.1.0" },
     { name = "pyarrow", specifier = ">=21.0.0" },
