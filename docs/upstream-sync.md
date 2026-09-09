@@ -5,6 +5,16 @@ architectures side by side (see [architecture.md](architecture.md)). We still in
 changes from upstream, so this page exists to make that tractable: where upstream code ended up,
 what changed on the way, and how to bring in a new upstream commit.
 
+**Historical note**: the table below records where `gpt.py` went at Stage 1 — into
+`nanochat/model/`, which existed in this tree at the time. Stage 7 deleted `nanochat/model/`
+entirely and moved its contents into a new standalone package, `modelcore`; Stage 10 moved that
+package into its own repository, [8kb/modelcore](https://github.com/8kb/modelcore). None of the
+paths in the table below exist in this tree any more — see this doc's own "Stage 7" and "Stage 8"
+sections further down for where each piece landed after that, and
+[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) for
+the current shape. The table is kept as-is because it's still the accurate record of *upstream's*
+`gpt.py`, line for line — only the "now lives in" column has since moved further.
+
 There is currently no `upstream` git remote configured. Add one with:
 
 ```bash
@@ -131,8 +141,10 @@ bypassing migrations — a pre-existing gap, fixed alongside this).
     kv_cache.advance(T)` was deleted; `kv_cache.advance(idx.size(1))` is now called once by each
     model's own `forward`, after its whole block loop (`GPT.forward`/`Llama.forward`/
     `LlamaKVShare.forward`) — see "Cross-layer KV sharing" in
-    [architecture.md](architecture.md#cross-layer-kv-sharing) for why (a same-layer-count
-    assumption broke once a layer's KV slot can differ from its position).
+    [modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#cross-layer-kv-sharing)
+    for why (a same-layer-count assumption broke once a layer's KV slot can differ from its
+    position). That section (and this whole mechanism) lived in this repo at the time this
+    paragraph was written; Stage 7/10 moved it into `modelcore`.
   - `nanochat/model/llama/mlp.py` (`SwiGLUMLP`) and `nanochat/model/llama/block.py` (`PlainBlock`)
     moved into `nanochat/model/components/mlp.py`/`block.py` (alongside GPT's `MLP`/`Block`), since
     `llama_kvshare` needed `PlainBlock` too — a second consumer is this repo's bar for promoting
@@ -283,5 +295,5 @@ as a back-compat alias (both work, everywhere).
 4. For a genuinely new file or a change elsewhere in the repo: apply directly, no mapping needed.
 5. After merging, re-run the golden-checkpoint regression check (see
    [architecture.md](architecture.md#verifying-a-change-is-behavior-preserving), and
-   [modelcore/docs/architecture.md](../modelcore/docs/architecture.md#verifying-a-change-is-behavior-preserving)
+   [modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#verifying-a-change-is-behavior-preserving)
    for anything touching `modelcore` itself) before trusting the result.

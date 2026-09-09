@@ -75,9 +75,10 @@ slot); `kv_cache.advance()` moved out of `CausalSelfAttention` (it used to fire 
 `num_kv_slots`/`n_slots`/`get_slot_cache`; `flops.kv_bytes_per_token` now sums per distinct slot,
 not per layer. `CausalSelfAttention` gained `kv_slot`/`produces_kv` constructor kwargs and a
 `kv_bus` forward kwarg so a consumer layer can reuse a producer layer's already-RoPE'd/normed K/V
-from the same forward pass — see [architecture.md](architecture.md#cross-layer-kv-sharing) for why
-the consumer re-passes the producer's own tensors rather than `k=None` (a real FA3-vs-SDPA
-semantics divergence). `SwiGLUMLP`/`PlainBlock` moved from `nanochat/model/llama/` into
+from the same forward pass — see
+[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#cross-layer-kv-sharing)
+(this mechanism moved there at Stage 7/10) for why the consumer re-passes the producer's own
+tensors rather than `k=None` (a real FA3-vs-SDPA semantics divergence). `SwiGLUMLP`/`PlainBlock` moved from `nanochat/model/llama/` into
 `nanochat/model/components/`, shared by both `llama` and `llama_kvshare`. Also added `--arch-opt
 KEY=VALUE` (`nanochat.model.registry.apply_arch_opts`) to `scripts/base_train.py` so an
 architecture-specific config field like `kv_share_frac` is reachable from the CLI without a new
@@ -463,10 +464,11 @@ tensor pair).
 ## Stage 12 — depth and residual topology
 
 Weight tying across layers, looped/universal transformers, layer skipping, multi-token-prediction
-(MTP) heads — new composers under `modelcore/composers/` (`BackoutComposer`/`StackComposer` are
-the seed: Stage 7 made every composer a real, swappable component). Muon's shape-bucketed param
-grouping (`modelcore/roles.py:build_param_groups`, driven by `ModelManager.create_optimizer`'s
-policy table) needs generalizing for an architecture with tied or ragged-shaped matrix params —
+(MTP) heads — new composers, added in the `modelcore` repo's own `modelcore/composers/`
+(`BackoutComposer`/`StackComposer` are the seed: Stage 7 made every composer a real, swappable
+component). Muon's shape-bucketed param grouping (`modelcore/roles.py:build_param_groups`, also in
+that repo, driven by `ModelManager.create_optimizer`'s policy table) needs generalizing for an
+architecture with tied or ragged-shaped matrix params —
 the role protocol makes this more tractable than before (a tied parameter is already a solved case
 at the role-collection level, just not yet exercised by any real architecture), but the
 shape-based Muon stacking itself still assumes independent, per-layer-shaped matrices.

@@ -1,11 +1,14 @@
 # AGENTS.md
 
 Repo map and non-obvious invariants for anyone (human or agent) working in this fork. Read
-[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md)
-before touching anything that depends on `modelcore`,
-[datacore's architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md)
-before touching anything that depends on `datacore`, [docs/architecture.md](docs/architecture.md)
-before touching `nanochat/architectures/` or how the app consumes `ModelManager`, and
+[../llmllab/AGENTS.md](../llmllab/AGENTS.md) first for family-wide conventions (style, RunPod ops,
+the standalone-subsystem pattern) that apply here too but aren't repeated below.
+Read [modelcore's AGENTS.md](https://github.com/8kb/modelcore/blob/main/AGENTS.md) and
+[architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) before touching
+anything that depends on `modelcore`, [datacore's AGENTS.md](https://github.com/8kb/datacore/blob/main/AGENTS.md)
+and [architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md) before
+touching anything that depends on `datacore`, [docs/architecture.md](docs/architecture.md) before
+touching `nanochat/architectures/` or how the app consumes `ModelManager`, and
 [docs/upstream-sync.md](docs/upstream-sync.md) before touching anything that used to live in
 `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section for where its code lives today).
 
@@ -13,9 +16,10 @@ before touching `nanochat/architectures/` or how the app consumes `ModelManager`
 ([8kb/modelcore](https://github.com/8kb/modelcore), [8kb/datacore](https://github.com/8kb/datacore)
 — Stage 10, see docs/roadmap.md), consumed here as pinned git dependencies (`pyproject.toml`'s
 `[tool.uv.sources]`), not directories in this tree. `uv sync` installs both into `.venv/`;
-`import modelcore`/`import datacore` resolve from there, same as any other dependency. Working on
-either subsystem itself means cloning its own repo, not editing a copy inside this one — see each
-repo's own README for its local dev loop, or use `uv pip install -e ../modelcore` (after
+`import modelcore`/`import datacore` resolve from there. Working on either subsystem itself means
+cloning its own repo (both are siblings of this one under `../`, see
+[../llmllab/AGENTS.md](../llmllab/AGENTS.md)), not editing a copy inside this one — see each
+repo's own README/AGENTS.md for its local dev loop, or use `uv pip install -e ../modelcore` (after
 `uv sync`) to point this checkout at a local sibling clone for cross-repo development.
 
 ## What this fork is
@@ -34,13 +38,13 @@ modelcore              -- separate repo (github.com/8kb/modelcore), pinned git d
                           Model, config/ (ComponentSpec, ModelConfig), catalog.py's component
                           registry, components/, composers/, roles.py, stats.py, store.py,
                           runtime.py, precision/fp8.py, optim/ (MuonAdamW), kernels/ (FA3/SDPA),
-                          cache.py (KVCache). See its own docs/architecture.md.
+                          cache.py (KVCache). See its own AGENTS.md/docs/architecture.md.
 datacore               -- separate repo (github.com/8kb/datacore), pinned git dependency, not a
                           directory here. Data subsystem: DataManager (the one entrypoint --
                           prepare a dataset, open one, read batches), store.py, packing.py
                           (BestFitCropPacker/BestFitPadPacker), writer.py, reader.py (the only
                           module that imports torch, lazily), sources.py, download.py, tokenizer.py.
-                          See its own docs/architecture.md.
+                          See its own AGENTS.md/docs/architecture.md.
 nanochat/             everything that knows nanochat's own conventions
 ├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
 │                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
@@ -68,48 +72,31 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
                         dev/capture_data_goldens.py (frozen pre-datacore packing-algorithm reference)
 ```
 
-## Invariants that will bite you
+## Invariants owned elsewhere
 
-- **`__init__` may run under `torch.device("meta")`.** `Model.__init__` (and any component's) must
-  not compute anything that depends on real tensor *values* — only shapes/dtypes. Real
-  initialization goes in `init_weights()`, called after `model.to_empty(device=...)`.
-  `ModelManager.create_model`/`load_model` own this dance; nothing else should repeat it. See
-  "The meta-device footgun" in [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md).
-- **No `torch.amp.autocast`.** Precision is `modelcore.runtime.Runtime.compute_dtype`, injected
-  into any component declaring `needs=("runtime",)` — not a bare global read off an attribute.
-  `nanochat.common.COMPUTE_DTYPE` (override via `MODELCORE_DTYPE`, or the back-compat
-  `NANOCHAT_DTYPE`, env var) re-exports the default runtime's value for existing readers. Model
-  weights stay fp32; `modelcore.components.linear.Linear` casts to `COMPUTE_DTYPE` in `forward()`.
-  Route every matmul-participating parameter through it.
-- **`Linear` is the structural marker for "matmul params".**
-  `modelcore.stats.num_matmul_params` finds every FLOPs-relevant parameter by scanning for
-  `isinstance(m, Linear)`. A new matmul that uses a raw `nn.Linear` or bare `nn.Parameter`
-  silently disappears from `ModelStats.flops_per_token`/`decode_flops`/`prefill_flops` and every
-  FLOPs/s or MFU number derived from them. This is also why
-  `modelcore.precision.fp8.Float8Linear` subclasses `Linear` rather than a bare `nn.Linear` — it
-  used to subclass `nn.Linear` directly (`nanochat/fp8.py`, pre-Stage-8), which meant an
-  fp8-converted model's `collect_param_roles` raised outright (`Float8Linear.weight has no
-  declared role`) the moment `ModelManager.create_optimizer` tried to build its param groups.
-- **Every parameter needs a declared role.** `modelcore.roles.collect_param_roles` walks the
-  module tree and raises on any parameter it can't assign a role to (a `Linear.weight` defaults to
-  `"matrix"`; anything else needs a `PARAM_ROLES` class attribute or a `param_roles()` override).
-  `ModelManager.create_optimizer`/`ModelStats.params_by_role` are built on this, so a new
-  `nn.Parameter` or submodule that forgets to declare a role raises at construction — far better
-  than it silently defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping).
-  See [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#component-contracts).
-- **A config tree carries only concrete, already-decided values, never a derivation rule.**
-  `has_value_embed` is a plain bool per block, `window` a concrete int, `kv_slot`/`produces_kv`
-  concrete per-block values — never a pattern string or a fraction a component would need to
-  interpret. Every rule that produces these values (`has_value_embed`'s alternating-parity policy,
-  `compute_window_sizes`, `compute_kv_slots`, the muP depth dial) lives in
-  `nanochat/architectures/derive.py`, run once at tree-expansion time, outside `modelcore` entirely.
-  A component asking "which layer am I" or "how many layers are there" to re-derive a policy is
-  exactly the abstraction leak this fork's Stage 7 redesign eliminated — don't reintroduce it.
-- **`ArtifactStore` is a real code path, not aspirational.** `nanochat.checkpoint_manager.save_checkpoint`/
-  `load_checkpoint`/`build_model` route through `modelcore.store.FileSystemStore` (and, for an old
-  checkpoint, `LegacyCheckpointStore(FileSystemStore)`, which migrates on first read and memoizes) —
-  they don't call `torch.save`/`torch.load` directly. A new checkpoint-touching code path should go
-  through the store too, not add a third way to read/write the same files.
+These are `modelcore`'s or `datacore`'s own invariants, not this repo's — full explanation and
+"why" live in their `AGENTS.md`s. One line each here for the local consequence:
+
+- **Meta-device `__init__`, no `torch.amp.autocast`, `Linear` as the matmul marker, every
+  parameter needs a declared role, a config tree carries only concrete values, optimizer state is
+  positional, `kv_cache.advance()` belongs to `Model.forward`, `doc_args` built outside
+  `torch.compile`, `build_doc_args`'s `max_docs` is dataset-tuned not worst-case,
+  `AttentionLayerSpec.kv_slot`, `ArtifactStore` is a real code path** — all
+  [modelcore's](https://github.com/8kb/modelcore/blob/main/AGENTS.md). Consequence here: a new
+  architecture added under `nanochat/architectures/` inherits every one of these automatically by
+  going through `ModelManager`/`presets.py`'s existing helpers — bypassing them (a raw `nn.Linear`,
+  a hand-rolled save path) is how each of these invariants gets violated in practice.
+- **A prepared dataset's `sequence_len`/tokenizer fingerprint must match at read time (raises, not
+  warns); the dataloader cursor is an exact, world-size-independent sequence count** — both
+  [datacore's](https://github.com/8kb/datacore/blob/main/AGENTS.md). Consequence here:
+  `scripts/base_train.py`/`scripts/chat_sft.py` open their dataset via `--dataset` (default:
+  `scripts/data_prep.py:default_dataset_name`, derived from `--max-seq-len`/tokenizer fingerprint)
+  and hard-error if either doesn't match; a pre-datacore checkpoint's old `{pq_idx, rg_idx, epoch}`
+  dataloader state (no `"format"` key) is refused unless `--ignore-dataloader-state` is passed —
+  model/optimizer weights still load fine either way, only the data-stream position is affected.
+
+## Invariants that will bite you (nanochat's own)
+
 - **`runs/scaling_laws.sh` and `runs/miniseries.sh` grep exact stdout text** out of
   `scripts/base_train.py`: `runs/scaling_laws.sh` greps six `^key ` lines
   (`wte`, `value_embeds`, `lm_head`, `transformer_matrices`, `scalars`, `total`) from
@@ -145,41 +132,6 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   everywhere except `scripts/base_train.py`/`scripts/base_eval.py`) picks the largest checkpoint
   regardless of architecture. See [docs/architecture.md](docs/architecture.md) "Checkpoint tags
   and architecture-aware discovery".
-- **Optimizer state is checkpointed and reloaded positionally.** `torch.optim.Optimizer.state_dict()`
-  flattens every parameter across every group into one global index order; a parameter that
-  splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state
-  silently (no shape-mismatch error) rather than loudly. `ModelManager.create_optimizer`'s policy
-  dict order is therefore part of the on-disk format, not just a style choice — see
-  [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#component-contracts). A change that does reorder or
-  resplit needs a migration in `nanochat/architectures/legacy.py` (see `_patch_resid_x0_split`/
-  `_split_backout_lambda_from_smear` for the pattern) or old optimizer shards fail to load —
-  `scripts/base_train.py`'s `--resume-from-step` and `scripts/chat_sft.py`'s `--load-optimizer`
-  are the two call sites that route through `migrate_optimizer_state`.
-- **`kv_cache.advance()` belongs to `Model.forward`, not the last attention layer.** It fires once,
-  after the whole block/composer loop runs — broken the moment a model has fewer KV slots than
-  layers (cross-layer KV sharing), since no layer's index then equals the slot count.
-- **Intra-document masking's `doc_args` must be built outside `torch.compile`.**
-  `modelcore.kernels.flash_attn.build_doc_args(idx, bos_token_id)` derives per-row document
-  boundaries via `nonzero()`, and `scripts/base_train.py --doc-masking` calls it in the training
-  loop, before `model(x, y, doc_args=...)` — never inside the compiled model itself. See
-  [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#intra-document-masking) for why
-  (a real, measured recompile cost otherwise) and why positions are deliberately not reset per
-  document (RoPE + QK-norm make it a no-op).
-- **`build_doc_args`'s `max_docs` default is a dataset-tuned guess, not a safe worst case.** It
-  sizes the FA3 varlen kernel's backward-pass scratch allocation directly — defaulting it to
-  `batch_size * sequence_len` (every token its own document) OOM'd a real 2x H100 run trying to
-  allocate 28GB of scratch for a declared batch of 131,072 sequences when the real batch had ~270
-  documents. `DEFAULT_MAX_DOCS_PER_ROW=64` is tuned against ClimbMix's measured ~4.2 documents/row
-  at `sequence_len=2048`; `--doc-masking-max-docs-per-row` overrides it for a different
-  dataset/sequence-length combination.
-- **`AttentionLayerSpec.kv_slot` decouples layer index from KV-cache slot.**
-  `ModelStats.kv_cache_spec["num_kv_slots"]` can be `<= n_layer`: a layer whose `kv_slot` points
-  at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`
-  allocation instead of getting its own. `KVCache`'s constructor kwarg and attribute are
-  `num_kv_slots`/`n_slots`, and `get_slot_cache(slot)` returns that slot's view — see
-  "Cross-layer KV sharing" in [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) for the full mechanism,
-  including a real FA3-vs-SDPA divergence in what `k=None` means to `flash_attn_with_kvcache` that
-  a naive sharing implementation would hit.
 - **Checkpoint meta carries `tokenizer_fingerprint` and `core_metric`.**
   `RustBPETokenizer.fingerprint()` (`nanochat/tokenizer.py`) is a content hash of the vocab, not
   the pickle file -- it identifies *what a token id means*. `scripts/base_train.py` writes it (plus
@@ -190,25 +142,6 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   happily load a checkpoint trained against a *different* tokenizer of the same size and produce
   silent garbage, which is exactly the failure mode a multi-machine architecture comparison
   (`runs/contest.sh`, see [docs/contest.md](docs/contest.md)) would otherwise hit undetected.
-- **A prepared dataset's `sequence_len` and tokenizer fingerprint are fixed, and must match, or
-  training raises.** `scripts/base_train.py`/`scripts/chat_sft.py` open their `datacore.Dataset`
-  via `--dataset` (default: derived from `--max-seq-len`/tokenizer fingerprint,
-  `scripts/data_prep.py:default_dataset_name`) and hard-error -- not warn -- if `--max-seq-len`
-  doesn't equal `dataset.info.sequence_len` or the local tokenizer's fingerprint doesn't match
-  `dataset.info.tokenizer_fingerprint`. Unlike the checkpoint fingerprint check above, this one
-  raises: there is no scenario where training on a mismatched tokenization was intended, and it
-  produces silent garbage. Batch size, world size, rank, and split are the only things free at
-  read time -- see [datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md).
-- **The dataloader state in checkpoint meta is an exact global sequence cursor, not an
-  approximation.** `meta["dataloader_state_dict"]` is now `{"format": "datacore.v1", "cursor",
-  "epoch", "num_sequences", "batch_size", "world_size"}` -- `cursor` is the count of sequences
-  consumed by all ranks so far, world-size-independent by construction (resuming at a different
-  `--nproc_per_node` than the run that saved it still produces a gap-free, duplicate-free
-  continuation). A pre-datacore checkpoint's `{pq_idx, rg_idx, epoch}` state (detected by the
-  absent `"format"` key) is **refused**, not translated -- `scripts/base_train.py` raises with an
-  actionable message unless `--ignore-dataloader-state` is passed, since there is no faithful
-  mapping into a sequence cursor. Model and optimizer weights still load fine either way; only the
-  data-stream position is affected.
 - **`nanochat/default_tokenizer/` is a committed, portable default tokenizer** (532KB:
   `tokenizer.pkl` + `token_bytes.pt`) -- content-derived, so a checked-in copy is exactly as valid
   as a freshly-trained one. `runs/contest.sh`/`runs/contest_d12.sh` copy it into
@@ -244,84 +177,29 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
 
 ## Before you spend money on a pod
 
-Stage 8 (see `docs/contest.md`) paid for a CPU pod and a 2x H100 pod on a run that could not have
-tested what it was named for: `scripts/chat_sft.py` had no `--doc-masking` wiring, so a new
-`padding_id`-filled SFT dataset changed nothing reachable by that script. Answer these six
-questions **in writing, before creating any billed pod** — not as a formality, each has a
-falsifiable answer:
+Read [../llmllab/docs/runpod-ops.md](../llmllab/docs/runpod-ops.md) first — the six-question
+pre-spend gate, CPU pod sizing, SSH quirks, GPU-stock reality checks, and network-volume tradeoffs
+all live there now (Stage 8, see `docs/contest.md`, is the pre-spend gate's own worked failure
+case: a paid CPU pod and 2x H100 run that could not have tested what it was named for, because
+`scripts/chat_sft.py` had no `--doc-masking` wiring at the time).
 
-1. **What number does this produce, and against what number is it compared?** Quote the baseline's
-   actual value and where it's recorded (a `docs/contest.md` stage, or a log under
-   `runs/results/`). No existing baseline means this is two runs, not one.
-2. **What is the single variable that differs?** More than one differing ⇒ the result isn't
-   attributable to anything.
-3. **Trace the consumer.** Name the `file:line` where the flag/parameter under test is *read* in
-   the exact script being launched. **No consumer ⇒ stop — the run cannot test it.** This is the
-   question Stage 8 failed, and it's answerable by `grep` alone.
-4. **What can be checked for free or nearly free first?** A local CPU smoke run, a manifest read, a
-   dataset diff, a `pytest` — all free. A CPU pod is ~$0.05/run; a wrong GPU hour is not. Do the
-   cheap check and report its result before creating the GPU pod.
-5. **Expected effect size vs. known noise.** Every result in the doc-masking line so far sits at or
-   near noise (upstream's own d16 attempt, `docs/upstream/LOG.md:715-741`: 0.85427→0.85407; this
-   fork's Stage 7 wall-time-adjusted; Stage 8's 0.24%). State what would make *this* run
-   distinguishable from noise, or don't run it.
-6. **Written cost estimate before launch**: pod flavor × expected minutes × $/hr.
-
-Two operational facts worth not re-deriving:
+Two nanochat-specific facts worth not re-deriving:
 
 - **CPU pod sizing for `--kind=sft` data prep needs ≥16GB.** `SmolTalk`/`MMLU`/`GSM8K` load their
-  full source datasets into memory before any `--max-conversations` cap applies. Neither the MCP
-  `create-pod` tool nor `runpodctl` (`create pod` or `pod create`) can select a CPU flavor/vCPU
-  count — both land on `cpu3c` (2 vcpu, 4GB, enforced as a hard cgroup limit regardless of what the
-  host reports), which OOMs this job at exit 137 with no output. Work around it via
-  `POST https://api.runpod.io/v2/pods` directly with `cpu: {id, vcpuCount}` (`cpu3m`/4vcpu/32GB is
-  known-good), using the API key already configured for `runpodctl` in `~/.runpod/config.toml`. See
-  the repo map's own "CPU-only, run before base_train.py/chat_sft.py, never on a billed GPU pod"
-  (above, `data_prep.py`'s entry) — this is the CPU-side counterpart: size the CPU pod correctly
-  instead of discovering the OOM after paying for the attempt.
+  full source datasets into memory before any `--max-conversations` cap applies — see the repo
+  map's own "CPU-only, run before base_train.py/chat_sft.py, never on a billed GPU pod"
+  (`data_prep.py`'s entry) and [../llmllab/docs/runpod-ops.md](../llmllab/docs/runpod-ops.md)'s CPU
+  pod flavor section for how to actually get a big-enough CPU pod (`cpu3m`/4vcpu/32GB, not the
+  4GB-capped `cpu3c` both `runpodctl` and the MCP tools default to).
 - **`scripts/data_prep.py --kind=sft`'s `--sft-padding-id` should stay at its `None` default** until
   a tokenizer exists with a genuinely free pad token id. Every id in the current tokenizer is a real
   special token (Stage 8 tried `<|output_end|>`); passing one in is strictly worse than falling back
   to `bos_token_id`, which `build_doc_args`'s fold-in heuristic already handles correctly.
-- **RunPod's SSH proxy (`ssh.runpod.io`, the route used when a pod has no public IP —
-  `ssh.direct` is `null` in the create/get-pod response) needs an account-registered key, not the
-  container's `PUBLIC_KEY` env var, and only supports an interactive PTY channel.** `startSsh: true`
-  on pod creation injects whatever's registered via `GET/PUT /v2/account/ssh-keys` into
-  `PUBLIC_KEY` — check that endpoint first (`~/.runpod/ssh/runpodctl-ssh-key` is typically already
-  the registered key from a prior `runpodctl` use) rather than generating and threading through a
-  new one. Plain `ssh host cmd` fails outright ("doesn't support PTY"); use `ssh -tt host < script`
-  (commands piped via stdin) instead. `scp`/`sftp` don't work over this proxy at all (no subsystem
-  support) — to get a locally-edited file onto the pod, base64-encode it and pipe
-  `base64 -d > path <<'EOF' ... EOF` through the same stdin channel, and verify with `md5sum` on
-  both ends (the interactive shell's echoed terminal output looks garbled but the actual bytes
-  received are unaffected).
-- **Adding *any* exposed port to a pod (even one you don't otherwise need, e.g. `8000/http`) makes
-  RunPod allocate it a real public IP**, populating `ssh.direct` in the create/get-pod response —
-  after which normal `ssh -p <port> root@<ip>` and, critically, **real `scp`/`rsync`** work, unlike
-  the PTY-only proxy above. Worth doing any time you need to move more than a few KB (a checkpoint,
-  a dataset) rather than reaching for base64-over-stdin, which is fine for small text files but not
-  gigabytes. Changing a running pod's `ports` (via `update-pod`) restarts the container and
-  reallocates the port mapping — reread the pod's current `ssh.direct` port after the update rather
-  than reusing the one from creation.
-- **A GPU type's "LOW" stock label in `GET /v2/catalog/datacenters?include=GPU_AVAILABILITY` is not
-  "zero."** A specific datacenter can have literally no stock for a GPU type/count (pod creation
-  fails with "no longer any instances available") while the *global* aggregate
-  (`get-capacity`/`list-gpu-types`) still reads "High," and a datacenter separately labeled "LOW"
-  can still provision successfully. Confirm by actually attempting creation (terminating
-  immediately if it succeeds and isn't needed yet) rather than trusting the label either way — a
-  failed attempt costs nothing, a wrongly-abandoned option costs the alternative's overhead (e.g.
-  migrating data to a different datacenter that doesn't actually need it).
-- **A network volume is pinned to its datacenter; a pod can mount at most one.** If the datacenter
-  with your data has no GPU stock but another one does, moving *only* what's strictly needed (e.g.
-  a trained checkpoint) via direct `scp` is usually cheaper than migrating an entire dataset — a
-  dataset built by `scripts/data_prep.py` from public sources is often faster to just re-prepare
-  fresh on the new pod than to transfer, and doing so is a real (if content-deterministic, per
-  Stage 10) way to verify the pipeline reproduces byte-for-byte-equivalent document/sequence counts.
 
 ## What runs on this Mac
 
-Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to `float32` here
-(see `modelcore`'s `runtime.py`'s `detect_compute_dtype`, in its own repo). Set up with:
+See [../llmllab/AGENTS.md](../llmllab/AGENTS.md) for the machine-level facts (no CUDA, `COMPUTE_DTYPE`
+default, the MPS/`torch.compile` cold-start behavior, `print()` buffering). Set up with:
 
 ```bash
 uv sync --extra cpu --group dev && source .venv/bin/activate
@@ -339,14 +217,6 @@ real FA3 kernel — the SDPA fallback classes in that file run fine on CPU). `sc
 `runs/runcpu.sh`) against a `scripts/data_prep.py`-prepared dataset at the same `--max-seq-len` (or
 `--sequence-len` for SFT). `scripts/infer_bench.py` hard-asserts CUDA and does not run here.
 
-**MPS's first real op after `torch.compile` can genuinely take minutes**, not seconds — a cold
-Metal shader cache means the very first training run in a fresh shell can look hung (CPU busy in
-`waitUntilCompleted`/`MPSStream::synchronize`, no new stdout) for several minutes before proceeding
-normally; a second run against the same shapes is fast. Real behavior, not a bug — don't mistake it
-for a hang while testing a change on this machine. Redirecting stdout to a file also fully
-block-buffers Python's `print()` (line-buffering is TTY-only), which compounds the appearance of a
-hang — use `python -u`/`PYTHONUNBUFFERED=1` when diagnosing one for real.
-
 Untested on this machine as a result: the `bfloat16` compute path, the real FA3 kernel path
 (vs. the SDPA fallback it's checked against), the real fp8 `_scaled_mm` numerics
 (`modelcore/precision/fp8.py` — the role/accounting bookkeeping around it is CPU-tested, see
@@ -356,13 +226,11 @@ Keep changes to those paths conservative and prefer reasoning from the code plus
 real 2x H100 hardware — see `docs/contest.md`'s "Stage 4 results" — so the disclaimer here is about
 this machine specifically, not the feature.)
 
-**Do not attempt large multi-hour training runs in this environment** (no GPU, thermal/power
-constraints of a laptop) — use tiny smoke configs (see
+**Do not attempt large multi-hour training runs in this environment** — see
+[../llmllab/AGENTS.md](../llmllab/AGENTS.md); use tiny smoke configs (see
 [docs/architecture.md](docs/architecture.md#verifying-a-change-is-behavior-preserving)) to check
 plumbing, not to produce a usable model.
 
 ## Style
 
-Match the surrounding code: minimal comments explaining *why*, not *what*; no giant config
-objects or factory indirection beyond what `modelcore/catalog.py`'s registry already adds; prefer
-extending an existing component/composer over adding a new abstraction layer.
+See [../llmllab/AGENTS.md](../llmllab/AGENTS.md#style).
