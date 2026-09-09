@@ -31,6 +31,19 @@ from nanochat.engine import Engine
 from scripts.data_prep import default_dataset_name, prepared_dir
 
 # -----------------------------------------------------------------------------
+# evaluate_core: base_train.py's periodic in-training CORE check imports this directly (a
+# thin wrapper around BenchManager.core -- main()'s own 'core' eval mode below duplicates the
+# per-task loop instead, to add CLI-only timing prints and the CSV write).
+
+def evaluate_core(model, tokenizer, device, max_per_task=-1, rank=0, world_size=1):
+    """Evaluate a base model on the CORE benchmark. Returns a dict with results,
+    centered_results, and core_metric -- the same shape base_train.py has always expected."""
+    suite = load_core_suite(get_base_dir(), max_per_task=max_per_task)
+    bench_manager = BenchManager()
+    report = bench_manager.core(model, tokenizer, suite, device=device, rank=rank, world_size=world_size)
+    return {"results": report.results, "centered_results": report.centered_results, "core_metric": report.core_metric}
+
+# -----------------------------------------------------------------------------
 # Main
 
 def main():
