@@ -418,19 +418,34 @@ overrides `--eval-tokens`; a run that doesn't (this stage's first ad hoc smoke t
 MPS-synchronizing op — slow enough on this backend to look exactly like a hang. Not a datacore
 bug, but the kind of thing worth overriding explicitly in any small local run.
 
-## Stage 10 — the repo split
+## Stage 10 — the repo split (done)
 
-The actual extraction: `modelcore/` and `datacore/` each become their own git repository (a
-`git subtree split` preserving history), and this repo depends on both as path or VCS dependencies
-instead of same-repo directories. What Stages 8/9 leave for this stage specifically: deciding
-whether the one remaining cross-boundary test dependency (`tests/test_architectures.py` reading
-`modelcore/tests/goldens/tiny_composed_*` directly, to prove `nanochat.architectures.presets.expand`
-reproduces modelcore's own baseline) vendors a copy of those goldens or narrows to a
-config-tree-equality assertion that doesn't need modelcore's test data at all; wiring both
-`pyproject.toml` files into actual installable dependencies (a git URL or a local path override)
-rather than the aspirational, unwired files they are today; and re-verifying each standalone guard
-(`modelcore/tests/test_standalone.py`, `datacore/tests/test_standalone.py`) still passes against
-the split repos' own history, not just a directory copy.
+`modelcore/` and `datacore/` are now [8kb/modelcore](https://github.com/8kb/modelcore) and
+[8kb/datacore](https://github.com/8kb/datacore), each a fresh-init, single-commit repo (not a
+`git subtree split` -- per-directory history was 12 commits for modelcore, 2 for datacore, thin
+enough that starting clean outweighed preserving it) built straight from this working tree:
+package + its own `tests/`, `README.md`, `docs/architecture.md`, plus a new `LICENSE` (MIT,
+dual-copyrighted Karpathy/Mendel -- both packages' core algorithms descend from pre-extraction
+`nanochat/gpt.py`/`nanochat/dataloader.py`) and `.gitignore`. Both tagged `v0.1.0`. This repo
+depends on both as pinned git dependencies (`pyproject.toml`'s `[tool.uv.sources]`), not path
+overrides -- a pod's `git clone nanochat && uv sync` stays one step, fetching both from GitHub.
+
+The one cross-boundary test dependency the previous version of this section flagged
+(`tests/test_architectures.py`/`tests/test_goldens.py` reading
+`modelcore/tests/goldens/tiny_composed_*`) was resolved by **moving**, not vendoring: those four
+goldens (JSON digests + checkpoint dirs) now live under `tests/goldens/` alongside nanochat's own
+`tiny_*` set, and the modelcore-side test that read them
+(`test_matches_pre_refactor_composed_golden`) moved into `tests/test_architectures.py` as
+`test_config_from_dict_matches_pre_refactor_composed_golden`. Reproducing a pre-Stage-7 nanochat
+checkpoint is nanochat's own regression concern, not modelcore's -- modelcore's extracted repo
+carries none of this data. (That test's continued relevance is itself now questionable, now that
+the modelcore migration is prod-tested via `runs/contest.sh`; retiring it is a separate, later
+call, not made here.)
+
+Both `test_standalone.py` guards (the mechanical zero-host-import scan) were re-verified passing
+inside their own extracted repo, in a fresh `uv venv`, before pushing -- not just as a directory
+copy still living next to nanochat. Full nanochat suite after rewiring: identical to the
+pre-split baseline (one pre-existing, unrelated `test_execution.py` failure aside).
 
 ## Stage 11 — attention variants
 

@@ -41,6 +41,11 @@ source .venv/bin/activate
 (`uv sync --extra gpu --group dev` on a CUDA machine — see upstream's
 [precision/dtype notes](docs/upstream/README.md#precision--dtype) for what that changes.)
 
+`uv sync` also fetches [`modelcore`](https://github.com/8kb/modelcore) and
+[`datacore`](https://github.com/8kb/datacore) — this fork's standalone model and data subsystems,
+each its own public repo, pinned by tag — so it needs network access to github.com the first time
+(or after bumping either pin).
+
 Run the test suite:
 
 ```bash

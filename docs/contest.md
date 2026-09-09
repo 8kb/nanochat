@@ -89,7 +89,8 @@ from that pod's filesystem directly.
   shards while training is in flight (see "What to bring back" — these are *not* worth keeping,
   but they exist on disk during the run).
 - Any recent PyTorch + CUDA container image; `runs/contest.sh`'s setup step runs `uv sync
-  --extra gpu`, which pulls the rest.
+  --extra gpu`, which pulls the rest -- including `modelcore`/`datacore` from their own public
+  GitHub repos (Stage 10), so the pod needs outbound network access to github.com at sync time.
 
 ## 2. One-time setup on the pod
 

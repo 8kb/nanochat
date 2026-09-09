@@ -1,12 +1,22 @@
 # AGENTS.md
 
 Repo map and non-obvious invariants for anyone (human or agent) working in this fork. Read
-[modelcore/docs/architecture.md](modelcore/docs/architecture.md) before touching anything under
-`modelcore/`, [datacore/docs/architecture.md](datacore/docs/architecture.md) before touching
-anything under `datacore/`, [docs/architecture.md](docs/architecture.md) before touching
-`nanochat/architectures/` or how the app consumes `ModelManager`, and
+[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md)
+before touching anything that depends on `modelcore`,
+[datacore's architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md)
+before touching anything that depends on `datacore`, [docs/architecture.md](docs/architecture.md)
+before touching `nanochat/architectures/` or how the app consumes `ModelManager`, and
 [docs/upstream-sync.md](docs/upstream-sync.md) before touching anything that used to live in
 `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section for where its code lives today).
+
+`modelcore` and `datacore` are separate repositories
+([8kb/modelcore](https://github.com/8kb/modelcore), [8kb/datacore](https://github.com/8kb/datacore)
+— Stage 10, see docs/roadmap.md), consumed here as pinned git dependencies (`pyproject.toml`'s
+`[tool.uv.sources]`), not directories in this tree. `uv sync` installs both into `.venv/`;
+`import modelcore`/`import datacore` resolve from there, same as any other dependency. Working on
+either subsystem itself means cloning its own repo, not editing a copy inside this one — see each
+repo's own README for its local dev loop, or use `uv pip install -e ../modelcore` (after
+`uv sync`) to point this checkout at a local sibling clone for cross-repo development.
 
 ## What this fork is
 
@@ -18,35 +28,19 @@ plan and current progress.
 ## Repo map
 
 ```
-modelcore/            standalone model subsystem (zero nanochat imports) — see modelcore/docs/architecture.md
-├── manager.py           ModelManager: the one entrypoint (create/load/save model+optimizer, stats,
-│                         validate, precision, decoding)
-├── model.py              Model: the one model class, built from a materialized config tree
-├── generate.py            sample_next_token, generate_naive, Decoder (cached prefill+decode)
-├── config/                ComponentSpec, ModelConfig, AttentionLayerSpec; validate_config()
-├── catalog.py             component registry: "#type" name -> (cls, needs, validate)
-├── components/             linear, norm, rope, rotary, attention, mlp, block, embedding, unembedding
-├── composers/              base, stack, backout
-├── roles.py               parameter-role protocol (optimizer grouping)
-├── stats.py                FLOPs/param/KV-bytes accounting, ModelStats
-├── store.py                ArtifactStore protocol + FileSystemStore
-├── runtime.py              Runtime: compute dtype + log sink (injected, not a global)
-├── precision/fp8.py         Float8Linear + convert_to_float8_training (ModelManager.enable_fp8)
-├── optim/                  MuonAdamW (single combined optimizer, ZeRO-2 sharded)
-├── kernels/                 unified FA3/SDPA attention interface
-├── cache.py                 KVCache
-└── tests/, docs/, README.md, pyproject.toml   modelcore's own suite, contract, and packaging
-datacore/             standalone data subsystem (zero nanochat imports) — see datacore/docs/architecture.md
-├── manager.py           DataManager: the one entrypoint (prepare a dataset, open one, read batches)
-├── store.py              DatasetStore protocol + FileSystemDatasetStore + the manifest schema
-├── packing.py             Packer protocol; BestFitCropPacker, BestFitPadPacker
-├── writer.py              rolls PackedRow into volumes, flushed at a cap or a source boundary
-├── reader.py              memmap volumes + the cursor-based, DDP-sharded, resumable batch iterator
-│                        (the only module that imports torch, lazily)
-├── sources.py             TextSource/TokenSource protocols; ParquetDirectorySource
-├── download.py            generic resumable HTTP shard downloader
-├── tokenizer.py            Tokenizer protocol + CharTokenizer (dependency-free test double)
-└── tests/, docs/, README.md, pyproject.toml   datacore's own suite, contract, and packaging
+modelcore              -- separate repo (github.com/8kb/modelcore), pinned git dependency, not a
+                          directory here. Model subsystem: ModelManager (the one entrypoint --
+                          create/load/save model+optimizer, stats, validate, precision, decoding),
+                          Model, config/ (ComponentSpec, ModelConfig), catalog.py's component
+                          registry, components/, composers/, roles.py, stats.py, store.py,
+                          runtime.py, precision/fp8.py, optim/ (MuonAdamW), kernels/ (FA3/SDPA),
+                          cache.py (KVCache). See its own docs/architecture.md.
+datacore               -- separate repo (github.com/8kb/datacore), pinned git dependency, not a
+                          directory here. Data subsystem: DataManager (the one entrypoint --
+                          prepare a dataset, open one, read batches), store.py, packing.py
+                          (BestFitCropPacker/BestFitPadPacker), writer.py, reader.py (the only
+                          module that imports torch, lazily), sources.py, download.py, tokenizer.py.
+                          See its own docs/architecture.md.
 nanochat/             everything that knows nanochat's own conventions
 ├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
 │                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
@@ -67,7 +61,7 @@ scripts/              entry points, run as `python -m scripts.<name>`
 └── ...
 tasks/                task/dataset definitions for eval (arc, mmlu, gsm8k, humaneval, smoltalk)
 tests/                nanochat's pytest suite — see "What runs on this Mac" below
-                        (modelcore/tests/, datacore/tests/ are each component's own standalone suite)
+                        (modelcore/datacore each own their own standalone suite, in their own repo)
 runs/                 shell scripts wiring scripts/ together (speedrun.sh, runcpu.sh, ...)
 docs/                 this fork's documentation; docs/upstream/ holds the original nanochat docs
 dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py,
@@ -80,7 +74,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   not compute anything that depends on real tensor *values* — only shapes/dtypes. Real
   initialization goes in `init_weights()`, called after `model.to_empty(device=...)`.
   `ModelManager.create_model`/`load_model` own this dance; nothing else should repeat it. See
-  "The meta-device footgun" in [modelcore/docs/architecture.md](modelcore/docs/architecture.md).
+  "The meta-device footgun" in [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md).
 - **No `torch.amp.autocast`.** Precision is `modelcore.runtime.Runtime.compute_dtype`, injected
   into any component declaring `needs=("runtime",)` — not a bare global read off an attribute.
   `nanochat.common.COMPUTE_DTYPE` (override via `MODELCORE_DTYPE`, or the back-compat
@@ -102,7 +96,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   `ModelManager.create_optimizer`/`ModelStats.params_by_role` are built on this, so a new
   `nn.Parameter` or submodule that forgets to declare a role raises at construction — far better
   than it silently defaulting into the wrong optimizer (e.g. Muon's shape-based matrix grouping).
-  See [modelcore/docs/architecture.md](modelcore/docs/architecture.md#component-contracts).
+  See [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#component-contracts).
 - **A config tree carries only concrete, already-decided values, never a derivation rule.**
   `has_value_embed` is a plain bool per block, `window` a concrete int, `kv_slot`/`produces_kv`
   concrete per-block values — never a pattern string or a fraction a component would need to
@@ -156,7 +150,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   splits, merges, or moves group changes that indexing, and a same-size reorder corrupts state
   silently (no shape-mismatch error) rather than loudly. `ModelManager.create_optimizer`'s policy
   dict order is therefore part of the on-disk format, not just a style choice — see
-  [modelcore/docs/architecture.md](modelcore/docs/architecture.md#component-contracts). A change that does reorder or
+  [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#component-contracts). A change that does reorder or
   resplit needs a migration in `nanochat/architectures/legacy.py` (see `_patch_resid_x0_split`/
   `_split_backout_lambda_from_smear` for the pattern) or old optimizer shards fail to load —
   `scripts/base_train.py`'s `--resume-from-step` and `scripts/chat_sft.py`'s `--load-optimizer`
@@ -168,7 +162,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   `modelcore.kernels.flash_attn.build_doc_args(idx, bos_token_id)` derives per-row document
   boundaries via `nonzero()`, and `scripts/base_train.py --doc-masking` calls it in the training
   loop, before `model(x, y, doc_args=...)` — never inside the compiled model itself. See
-  [modelcore/docs/architecture.md](modelcore/docs/architecture.md#intra-document-masking) for why
+  [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#intra-document-masking) for why
   (a real, measured recompile cost otherwise) and why positions are deliberately not reset per
   document (RoPE + QK-norm make it a no-op).
 - **`build_doc_args`'s `max_docs` default is a dataset-tuned guess, not a safe worst case.** It
@@ -183,7 +177,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   at an earlier layer's slot (cross-layer KV sharing) shares that `modelcore.cache.KVCache`
   allocation instead of getting its own. `KVCache`'s constructor kwarg and attribute are
   `num_kv_slots`/`n_slots`, and `get_slot_cache(slot)` returns that slot's view — see
-  "Cross-layer KV sharing" in [modelcore/docs/architecture.md](modelcore/docs/architecture.md) for the full mechanism,
+  "Cross-layer KV sharing" in [modelcore/docs/architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) for the full mechanism,
   including a real FA3-vs-SDPA divergence in what `k=None` means to `flash_attn_with_kvcache` that
   a naive sharing implementation would hit.
 - **Checkpoint meta carries `tokenizer_fingerprint` and `core_metric`.**
@@ -204,7 +198,7 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   `dataset.info.tokenizer_fingerprint`. Unlike the checkpoint fingerprint check above, this one
   raises: there is no scenario where training on a mismatched tokenization was intended, and it
   produces silent garbage. Batch size, world size, rank, and split are the only things free at
-  read time -- see [datacore/docs/architecture.md](datacore/docs/architecture.md).
+  read time -- see [datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md).
 - **The dataloader state in checkpoint meta is an exact global sequence cursor, not an
   approximation.** `meta["dataloader_state_dict"]` is now `{"format": "datacore.v1", "cursor",
   "epoch", "num_sequences", "batch_size", "world_size"}` -- `cursor` is the count of sequences
@@ -235,15 +229,17 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   no registry to add it to — `modelcore` builds every tree through the same `Model` class,
   regardless of which preset produced it. See
   [docs/architecture.md](docs/architecture.md#nanochatarchitectures-presets-and-legacy-migration).
-- **`tests/goldens/*.json` (plus `modelcore/tests/goldens/tiny_composed_*.json`) is the regression
-  net for anything touching `modelcore`, `nanochat/architectures/`,
+- **`tests/goldens/*.json` (including the four `tiny_composed_*` ones -- modelcore's own
+  pre-Stage-7 baseline, moved here from `modelcore/tests/goldens/` at Stage 10's repo split) is the
+  regression net for anything touching `modelcore`, `nanochat/architectures/`,
   `nanochat/checkpoint_manager.py`, or `nanochat/engine.py`.** Captured once
   (`dev/capture_model_goldens.py`, now frozen — its `main()`/`capture_synthetic()` depend on code
   this refactor deleted; the live digest helpers it used moved to `tests/golden_helpers.py`)
   before Stage 7's redesign, from every real checkpoint on this machine plus a seeded synthetic
   model of every architecture/preset. `tests/test_goldens.py` replays it;
-  `modelcore/tests/test_manager.py`/`tests/test_architectures.py` cross-check the same numbers
-  through the new API directly. Run all three after any change to those areas — see
+  `tests/test_architectures.py` cross-checks the same numbers through the new API directly (both
+  via `presets.expand` and via `ModelManager.config_from_dict` straight off the golden). Run both
+  after any change to those areas — see
   [docs/architecture.md](docs/architecture.md#verifying-a-change-is-behavior-preserving).
 
 ## Before you spend money on a pod
@@ -325,13 +321,17 @@ Two operational facts worth not re-deriving:
 ## What runs on this Mac
 
 Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to `float32` here
-(see `modelcore/runtime.py`'s `detect_compute_dtype`). Set up with:
+(see `modelcore`'s `runtime.py`'s `detect_compute_dtype`, in its own repo). Set up with:
 
 ```bash
 uv sync --extra cpu --group dev && source .venv/bin/activate
 ```
 
-Runs fine locally: everything in `tests/`, `modelcore/tests/`, and `datacore/tests/` except
+`uv sync` also builds and installs `modelcore`/`datacore` from their pinned git tags (Stage 10) --
+needs network access to github.com the first time or after bumping either pin.
+
+Runs fine locally: everything in `tests/`. modelcore's and datacore's own suites (each in its own
+repo, cloned separately -- `uv run pytest` there) run clean here too except
 `modelcore/tests/test_optim.py` (module-level `skipif(not cuda_available)`) and the
 `TestFA3VsSDPA` class in `modelcore/tests/test_kernels.py` (needs an sm80/sm89/sm90 GPU for the
 real FA3 kernel — the SDPA fallback classes in that file run fine on CPU). `scripts/base_train.py` /

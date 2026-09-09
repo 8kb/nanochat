@@ -1,20 +1,22 @@
 # Architecture contract
 
-Stage 7 (see [roadmap.md](roadmap.md)) split the model subsystem in two: `modelcore/`, a
+Stage 7 (see [roadmap.md](roadmap.md)) split the model subsystem in two: `modelcore`, a
 standalone package that knows only a materialized config tree and nothing about architecture
 *names*, CLI flags, checkpoints, or tokenizers; and `nanochat/architectures/`, which turns a
 `--depth` dial or an old checkpoint into a tree for `modelcore` to build. Stage 8 made `modelcore`
-self-contained (its own tests, docs, and packaging metadata — see
-[modelcore/docs/architecture.md](../modelcore/docs/architecture.md) for the core contract itself);
-this document covers the nanochat side: how the app consumes `ModelManager` and (Stage 9)
-`datacore.DataManager`, how an old checkpoint gets there, and how to verify a change is
-behavior-preserving.
+self-contained (its own tests, docs, and packaging metadata), and Stage 10 moved it into its own
+repository, [8kb/modelcore](https://github.com/8kb/modelcore) — see
+[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) for
+the core contract itself, and this repo's `pyproject.toml`'s `[tool.uv.sources]` for how it's
+pinned as a dependency here. This document covers the nanochat side: how the app consumes
+`ModelManager` and (Stage 9) `datacore.DataManager`, how an old checkpoint gets there, and how to
+verify a change is behavior-preserving.
 
 ```
-modelcore/                standalone model subsystem -- see modelcore/docs/architecture.md
-├── manager.py               ModelManager -- the one entrypoint
-├── ... (components, composers, catalog, roles, stats, store, runtime, precision, optim, kernels)
-└── tests/, docs/, README.md, pyproject.toml   modelcore's own suite/contract/packaging
+modelcore                 separate repo (github.com/8kb/modelcore), pinned git dependency --
+                          ModelManager (the one entrypoint), components, composers, catalog,
+                          roles, stats, store, runtime, precision, optim, kernels; its own
+                          tests/docs/README/pyproject. See its own docs/architecture.md.
 
 nanochat/architectures/   everything that knows an architecture *by name*
 ├── derive.py                mup_dims, compute_window_sizes, compute_kv_slots, has_value_embed,
@@ -46,16 +48,18 @@ optimizer = manager.create_optimizer(model, OptimizerHparams(...))
 stats = manager.stats(config)   # params/FLOPs/KV-cache, no weights needed
 ```
 
-The one deliberate exception: `scripts/base_train.py` imports `modelcore.components.linear.Linear`
-directly as a low-level utility class (a leaf `nn.Module`, not an implementation detail) — this
-was previously also needed for fp8's eval swap-back, which now goes through
-`manager.enable_fp8`/`manager.fp8_disabled` instead (see
-[modelcore/docs/architecture.md](../modelcore/docs/architecture.md#fp8-precision)).
+`scripts/base_train.py` no longer imports `modelcore.components.linear.Linear` directly — the fp8
+eval swap-back it used to need that for goes through `manager.enable_fp8`/`manager.fp8_disabled`
+instead (see
+[modelcore's architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#fp8-precision)).
+A comment near its `--fp8` handling still names `Linear`/`modelcore.precision.fp8` for context, but
+the module itself imports only `Model`, `ModelManager`, `OptimizerHparams`, and
+`modelcore.kernels.flash_attn.build_doc_args`.
 
 ## Consuming `DataManager`
 
 Training and eval scripts read data through one `datacore.DataManager` instance, exactly the same
-pattern as `ModelManager` — see [datacore/docs/architecture.md](../datacore/docs/architecture.md)
+pattern as `ModelManager` — see [datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md)
 for the full contract. `nanochat`'s job is producing the dataset (once, offline, via
 `scripts/data_prep.py`) and naming it; `DataManager` knows nothing about ClimbMix, SmolTalk, or
 this fork's checkpoint conventions:
@@ -77,7 +81,7 @@ for inputs, targets, state in manager.batches(dataset, "train", args.device_batc
 `scripts/data_prep.py` is the preparation entrypoint (`--kind=base` for the pretraining corpus via
 `nanochat.dataset`'s ClimbMix identity, `--kind=sft` for the `tasks/` mixture rendered through
 `RustBPETokenizer.render_conversation`) — see its own docstring and
-[datacore/docs/architecture.md](../datacore/docs/architecture.md) for the on-disk format, the
+[datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md) for the on-disk format, the
 cursor-based resumable read order, and why `sequence_len`/tokenizer fingerprint mismatches raise
 rather than warn. `nanochat/dataset.py` keeps only the corpus *identity* (`BASE_URL`, `MAX_SHARD`,
 the local directory, the legacy `base_data` fallback) — the download mechanism is
@@ -210,19 +214,20 @@ greedy-generation token ids (both the naive and KV-cached paths), a forward-logi
 optimizer layout plus a full state-tensor digest. `tests/test_goldens.py` replays every one of them
 against the current code; real-checkpoint cases skip automatically on a machine without
 `~/.cache/nanochat` populated. (The four `tiny_composed_*` presets' own goldens moved to
-`modelcore/tests/goldens/` at Stage 8 — they're `modelcore`'s baseline, reproduced here via
-`nanochat.architectures.presets.expand`, not owned by this repo.)
+`modelcore/tests/goldens/` at Stage 8, then back into `tests/goldens/` at Stage 10 once modelcore
+became a separate repo — reproducing a pre-Stage-7 checkpoint is a nanochat regression concern, not
+modelcore's, so modelcore's own extracted repo carries none of this data.)
 
-For a change to shared code (anything under `modelcore/`, or `nanochat/architectures/`,
+For a change to shared code (anything `modelcore`/`datacore` provide, or `nanochat/architectures/`,
 `nanochat/checkpoint_manager.py`, `nanochat/engine.py`):
 
 ```bash
-python -m pytest tests/test_goldens.py tests/test_architectures.py modelcore/tests -v
+python -m pytest tests/test_goldens.py tests/test_architectures.py -v
 ```
 
-`modelcore/tests/test_manager.py` cross-checks every preset-equivalent tree's accounting and
-forward output against the same `tiny_composed_*` goldens directly through `modelcore.ModelManager`,
-independent of `nanochat.checkpoint_manager`; `tests/test_architectures.py` does the same through
+`tests/test_architectures.py` cross-checks every preset-equivalent tree's accounting and forward
+output against the `tiny_composed_*` goldens two ways: through `presets.expand` +
+`modelcore.ModelManager` directly (independent of `nanochat.checkpoint_manager`), and through
 `nanochat.architectures.legacy.migrate_checkpoint` against the real on-disk checkpoints — the
 authoritative proof that migration reproduces pre-refactor behavior exactly, including the
 backout-lambda optimizer-state case above.
@@ -247,12 +252,16 @@ Delete `~/.cache/nanochat/base_checkpoints/smoke` and `~/.cache/nanochat/prepare
 save+load through `ModelManager` (and `FileSystemStore`) *and* the exact-cursor dataloader resume
 through `DataManager` end to end.
 
-For a change purely inside `modelcore/` itself (a new component, a new precision scheme, ...), see
-[modelcore/docs/architecture.md](../modelcore/docs/architecture.md#verifying-a-change-is-behavior-preserving) —
-its own suite runs standalone (`python -m pytest modelcore/tests -v`) and includes a mechanical
-check (`test_standalone.py`) that it never grows a dependency back on this repo. For a change
-purely inside `datacore/` (a new packer, a format change, ...), see
-[datacore/docs/architecture.md](../datacore/docs/architecture.md#verifying-a-change-is-behavior-preserving)
-— same shape (`python -m pytest datacore/tests -v`, its own `test_standalone.py`), plus
+For a change purely inside `modelcore` itself (a new component, a new precision scheme, ...), work
+in its own repo, [8kb/modelcore](https://github.com/8kb/modelcore) — see
+[its architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md#verifying-a-change-is-behavior-preserving).
+Its suite runs standalone there (`python -m pytest modelcore/tests -v`) and includes a mechanical
+check (`test_standalone.py`) that it never grows a dependency back on nanochat. Once a change is
+ready, bump this repo's `pyproject.toml`'s `[tool.uv.sources]` tag (or point it at a local clone
+via `uv pip install -e ../modelcore` for the inner dev loop) and re-run this repo's own suite
+against it. For a change purely inside `datacore` (a new packer, a format change, ...), same shape
+in [8kb/datacore](https://github.com/8kb/datacore) — see
+[its architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md#verifying-a-change-is-behavior-preserving)
+(`python -m pytest datacore/tests -v`, its own `test_standalone.py`) — plus
 `tests/test_data_packing_parity.py` in this repo to cross-check the packing algorithms against
 `dev/capture_data_goldens.py`'s frozen pre-datacore reference.
