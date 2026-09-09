@@ -22,6 +22,9 @@ class DatasetInfo:
     has_mask: bool
     tokenizer_fingerprint: str
     packer_name: str
+    bos_token_id: int | None  # None only for a manifest predating this field
+    padding_id: int | None  # the packer's resolved pad-fill id; None for a packer with no padding
+                            # concept at all (BestFitCropPacker), not for "defaulted to bos"
     splits: dict  # split_name -> {"num_sequences", "num_tokens", "num_documents",
                   #                "num_documents_dropped", "num_tokens_encoded", "num_tokens_dropped"}
 
@@ -106,6 +109,8 @@ class Dataset:
             has_mask=has_mask,
             tokenizer_fingerprint=manifest["tokenizer_fingerprint"],
             packer_name=manifest["packer"]["name"],
+            bos_token_id=manifest.get("bos_token_id"),
+            padding_id=manifest["packer"]["params"].get("padding_id"),
             splits={
                 split: {**{k: v for k, v in data.items() if k != "volumes"}, "num_volumes": len(data["volumes"])}
                 for split, data in manifest["splits"].items()
@@ -114,6 +119,13 @@ class Dataset:
 
     def num_sequences(self, split: str) -> int:
         return self._split_indices[split].num_sequences
+
+    def read_rows(self, split: str, start: int, count: int):
+        """Raw (tokens, mask) numpy arrays for rows [start, start+count) of a split, straight off
+        the memmapped volumes -- the read-side counterpart of batches()'s windowing, minus the
+        input/target shift and DDP cursor logic, for callers that want whole rows (e.g. a
+        diagnostic scan) rather than a training batch. mask is None when the dataset has none."""
+        return self._split_indices[split].read_contiguous(start, count)
 
 
 def open_dataset(store) -> Dataset:

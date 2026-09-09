@@ -469,6 +469,19 @@ class TestBuildDocArgs:
         doc_ids = build_doc_args(idx, BOS, padding_id=PAD).doc_ids
         assert doc_ids.tolist() == [[0, 0, 0, 1, 1, 1]]
 
+    def test_explicit_padding_id_matches_the_default_bos_fold_heuristic(self):
+        """padding_id is a robustness/clarity improvement, not a correctness fix: the default
+        (None -> bos-run fold-in) heuristic already produces the same document boundaries as
+        passing the real padding_id explicitly would, for the row shape it's designed to handle."""
+        idx_bos_padded = torch.tensor([[BOS, 1, 2, BOS, BOS, BOS]])
+        heuristic_doc_ids = build_doc_args(idx_bos_padded, BOS).doc_ids
+
+        PAD = 12345
+        idx_distinct_padded = torch.tensor([[BOS, 1, 2, PAD, PAD, PAD]])
+        explicit_doc_ids = build_doc_args(idx_distinct_padded, BOS, padding_id=PAD).doc_ids
+
+        assert heuristic_doc_ids.tolist() == explicit_doc_ids.tolist() == [[0, 0, 0, 0, 0, 0]]
+
     def test_no_bos_is_one_document(self):
         idx = torch.tensor([[1, 2, 3, 4]])
         doc_ids = build_doc_args(idx, BOS).doc_ids

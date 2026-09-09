@@ -133,16 +133,6 @@ vocab_size = tokenizer.get_vocab_size()
 tokenizer_fingerprint = tokenizer.fingerprint()
 bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
 
-def make_doc_args(x):
-    """None when --doc-masking is off; otherwise build_doc_args on x's actual batch size, honoring
-    --doc-masking-max-docs-per-row if given (its own default, DEFAULT_MAX_DOCS_PER_ROW, is sized
-    for ClimbMix at sequence_len=2048 -- see build_doc_args's docstring for why a wrong default
-    here is a real memory bug, not just a style choice)."""
-    if not args.doc_masking:
-        return None
-    max_docs = args.doc_masking_max_docs_per_row * x.size(0) if args.doc_masking_max_docs_per_row is not None else None
-    return build_doc_args(x, bos_token_id, max_docs=max_docs)
-
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -179,6 +169,23 @@ if dataset.info.tokenizer_fingerprint != tokenizer_fingerprint:
     )
 print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
       f"{dataset.num_sequences('val'):,} val sequences)")
+
+# padding_id is None for the crop packer pretraining always uses -- build_doc_args's bos-run
+# fold-in heuristic already handles that case correctly, so this is a no-op for base_train.py
+# today, but a --dataset pointed at a pad-packed source (not currently a real use case for
+# pretraining) picks up the dataset's own resolved padding_id automatically rather than silently
+# using the heuristic against a real, distinct padding_id.
+padding_id = dataset.info.padding_id if args.doc_masking else None
+
+def make_doc_args(x):
+    """None when --doc-masking is off; otherwise build_doc_args on x's actual batch size, honoring
+    --doc-masking-max-docs-per-row if given (its own default, DEFAULT_MAX_DOCS_PER_ROW, is sized
+    for ClimbMix at sequence_len=2048 -- see build_doc_args's docstring for why a wrong default
+    here is a real memory bug, not just a style choice)."""
+    if not args.doc_masking:
+        return None
+    max_docs = args.doc_masking_max_docs_per_row * x.size(0) if args.doc_masking_max_docs_per_row is not None else None
+    return build_doc_args(x, bos_token_id, padding_id=padding_id, max_docs=max_docs)
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -462,7 +469,8 @@ while True:
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
-                                    doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row)
+                                    doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                    padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb

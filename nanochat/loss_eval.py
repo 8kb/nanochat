@@ -8,7 +8,7 @@ import torch.distributed as dist
 from modelcore.kernels.flash_attn import build_doc_args
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None, doc_masking_max_docs_per_row=None):
+def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None, doc_masking_max_docs_per_row=None, padding_id=None):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -31,7 +31,10 @@ def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None, doc_mask
     val bpb stays comparable to the training loss it's evaluating. None (default) is unmasked, as
     before. doc_masking_max_docs_per_row: forwarded to build_doc_args's max_docs (as a per-row
     count, scaled by x's actual batch size) -- see build_doc_args's docstring for why its default
-    is dataset-dependent, not a safe worst case.
+    is dataset-dependent, not a safe worst case. padding_id: the dataset's resolved pad-fill id
+    (datacore.reader.DatasetInfo.padding_id), forwarded to build_doc_args so a pad-packed dataset's
+    document boundaries are derived the same way training's own doc_args are, rather than always
+    falling back to build_doc_args's bos-run heuristic.
     """
     # record the losses
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -42,7 +45,7 @@ def evaluate_bpb(model, batches, steps, token_bytes, bos_token_id=None, doc_mask
         doc_args = None
         if bos_token_id is not None:
             max_docs = doc_masking_max_docs_per_row * x.size(0) if doc_masking_max_docs_per_row is not None else None
-            doc_args = build_doc_args(x, bos_token_id, max_docs=max_docs)
+            doc_args = build_doc_args(x, bos_token_id, padding_id=padding_id, max_docs=max_docs)
         loss2d = model(x, y, loss_reduction='none', doc_args=doc_args) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten

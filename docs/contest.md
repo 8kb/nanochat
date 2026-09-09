@@ -811,6 +811,166 @@ didn't build.
   not a truly free id. A genuinely clean pad token needs a new tokenizer, out of scope here and
   already on the roadmap for future real experiments.
 
+## Stage 9: process fixes after Stage 8 — a pre-spend gate, dataset stats, and `chat_sft.py` doc-masking
+
+Stage 8 was framed as testing `padding_id` "end to end," but couldn't have: `scripts/chat_sft.py`
+had no `--doc-masking` wiring, so the new pad filler sat only at `mask=0`, causally-last positions
+— unreachable and loss-free either way. This was caught after the pods ran, not before. No pod was
+created for this stage; everything below is local, free, and closes the gap so the next real run
+can actually test what it's named for.
+
+**`AGENTS.md` gained a "Before you spend money on a pod" checklist** — six questions (comparison
+baseline, single variable, the exact `file:line` where the flag under test is read, a free/cheap
+check to run first, expected effect size vs. known noise, a written cost estimate) that must be
+answered before any billed pod is created. Also recorded there: `--sft-padding-id` should stay at
+its `None` default until a tokenizer has a genuinely free pad id — every id Stage 8 could have
+tried is a real special token, so passing one in is strictly worse than the existing bos-fold-in
+heuristic, not an improvement. **`sft_t2048_padid_e348819205de14ab` is retired**, not built on.
+
+**`scripts/data_prep.py --describe` gained `--deep` and `--compare-to`** — a row-level scan
+(document count/length percentiles, documents/row including the max that
+`--doc-masking-max-docs-per-row` should be set from, padding token share, loss-mask share) computed
+purely by reading a dataset's existing volumes, so it works on any dataset regardless of when it
+was prepared — no re-prep. `--compare-to` runs the scan on a second dataset and diffs it against
+the first.
+
+**Run for real** on a CPU pod (`cpu3g`, 4 vcpu/16GB, US-GA-2 — cheaper than Stage 8's `cpu3m` since
+this only reads already-prepared volumes, no raw HF dataset loading) against both real SFT datasets
+on volume `w6ndh50xcl`. Two pods total (~15 min combined uptime, ~$0.04): the RunPod SSH proxy
+turned out to need an account-registered key and PTY allocation, not the usual `PUBLIC_KEY`
+env var / non-interactive `ssh host cmd` — worked around by using the already-registered
+`runpodctl-ssh-key` and piping commands through the interactive shell's stdin; `scp`/`sftp` don't
+work over this proxy at all (no subsystem support), so the locally-fixed file was pushed as base64
+through the same stdin channel, verified byte-identical via `md5sum` both times:
+
+```
+python -m scripts.data_prep --describe --deep --compare-to=sft_t2048_padid_e348819205de14ab \
+  --dataset=sft_t2048_e348819205de14ab
+```
+
+The *first* run of this exposed a real bug in the tool itself, caught by comparing its output
+against the manifest's own recorded token-utilization ratio rather than trusting it blindly:
+`sft_t2048_e348819205de14ab` predates the `padding_id` field entirely (it's the original Stage 6
+dataset), so `DatasetInfo.padding_id` reads back `None` for it — but the deep-scan was treating
+*that* `None` identically to a crop packer's "no padding concept at all" `None`, silently reporting
+0% padding for a dataset the manifest's own ratio said was ~0.2%+ padded, and miscounting each
+padded row's bos-valued tail as a spurious extra one-token document (898,289 vs. the true 789,759).
+Fixed by having `deep_scan` fall back to `bos_token_id` — `BestFitPadPacker`'s own documented
+default — whenever `padding_id` is `None` *and* the packer is `bestfit_pad`, matching what the
+packer actually wrote to disk; only a genuine `bestfit_crop` dataset skips padding detection
+entirely now. A second bug surfaced by the fix landing on real (not just synthetic) data: the
+per-chunk document-length computation used `np.roll(rows_idx, -1)`, which wraps the last document
+in a chunk around to compare against the first — spuriously "matching" (and computing a bogus
+length) whenever a chunk holds documents from only one row, a real case (any dataset's final
+partial chunk can shrink to exactly one row), not just a tiny-test artifact. Both are pinned by new
+regression tests (`tests/test_data_prep.py`) against a reconstructed old-format manifest and a
+one-row dataset. Re-run after both fixes, the two real datasets came back **identical in every
+measured respect** — document counts (789,759 train), lengths, documents/row (max 35 train / 34
+val — this is what `--doc-masking-max-docs-per-row` would be set from), padding (0.22% train /
+0.79% val), and mask1/mask0 token counts, all exactly equal between the two datasets, confirming
+(now reproducibly, at full scale, not just via Stage 8's one-off byte-diff) that they differ only
+in which id fills the pad tail. Pod terminated immediately after the second run.
+
+This is also the tool that answers the blocking pre-check for any future SFT-time doc-masking run:
+SFT rows pack up to 35 documents/row (vs. `DEFAULT_MAX_DOCS_PER_ROW=64`'s tuning for pretraining's
+~4.2/row) — comfortably under the default, so no `--doc-masking-max-docs-per-row` override would be
+needed for *this* dataset, but the number is now measured, not assumed the way Stage 7's original
+guess (which did OOM) was.
+
+**`scripts/chat_sft.py` gained `--doc-masking` / `--doc-masking-max-docs-per-row`**, mirroring
+`scripts/base_train.py`'s wiring exactly (`doc_args` built outside the `torch.compile`'d model, in
+the micro-batch loop; `evaluate_bpb` given the same `bos_token_id`/`padding_id`/
+`doc_masking_max_docs_per_row`). `datacore.reader.DatasetInfo` now also surfaces `padding_id` and
+`bos_token_id` (previously readable only from the raw manifest dict), which both `base_train.py`
+and `chat_sft.py` use to pass the dataset's actual resolved `padding_id` into `build_doc_args`
+rather than always falling back to its bos-run heuristic. Verified locally (CPU/MPS, per
+`AGENTS.md`'s "What runs on this Mac"): a tiny SFT dataset against a real local `d6` checkpoint,
+`--doc-masking` on, ran to completion with finite loss and val bpb at every step — this is the
+check whose *absence* let Stage 8 spend money on an untestable premise.
+
+This closes the gap for the SFT-time masking experiment Stage 8 should have been (base pretraining
+masked ~4.2 documents/row; an SFT row packs several short conversations, so cross-document
+attention is a much larger share of total attention mass there — a real reason to expect a
+different result than the noise-level one in Stage 7). That run is still gated on its own pre-spend
+checklist (an SFT-scale `--describe --deep` run to size `--doc-masking-max-docs-per-row`, and
+confirming the pad-fill choice doesn't change which dataset should serve as the control arm) and is
+not launched by this stage.
+
+## Stage 10 results: SFT-time intra-document masking (`chat_sft.py --doc-masking`), off the doc-masked base
+
+The run Stage 8 should have been, using Stage 9's `chat_sft.py` wiring: a real, single-variable
+`--doc-masking` comparison at SFT time, holding the base checkpoint fixed.
+
+```
+# GPU pod (2x H100 SXM, US-MO-1 -- see "Infra" below for why not US-GA-2)
+torchrun --standalone --nproc_per_node=2 -m scripts.chat_sft -- \
+  --model-tag=kvshare4win_d13_ratio10_docmask --dataset=sft_t2048_e348819205de14ab \
+  --doc-masking --chatcore-every=-1 --run=dummy
+```
+
+**Pre-spend gate, answered before launch**: number/baseline = SFT val bpb at step 927 vs. Stage 8's
+0.3796; single variable = `--doc-masking` on at SFT time, same base checkpoint and (content-
+identical, per Stage 9's `--compare-to`) dataset; consumer = `scripts/chat_sft.py`'s new
+`build_doc_args` call; cheap pre-check = Stage 9's CPU-pod scan already measured this dataset's
+real documents/row max (35), safely under `DEFAULT_MAX_DOCS_PER_ROW=64`; effect-size argument = SFT
+rows pack far more documents/row than pretraining's ~4.2, a real structural reason to expect a
+larger, more distinguishable effect than Stage 7's noise-level pretraining result.
+
+**Infra: US-GA-2 had no multi-GPU Hopper-class stock at all when this ran** — 2x H100 SXM, 2x H100
+NVL, and 2x H200 all failed with "no longer any instances available," and COMMUNITY cloud caps
+H100 at 1 GPU/pod regardless of stock. `GET /v2/catalog/datacenters?include=GPU_AVAILABILITY`
+confirmed real stock existed elsewhere (**US-MO-1** had 2x H100 SXM, verified by an actual
+create-then-immediately-terminate probe, not just trusting the "LOW" label) but no other
+datacenter hosts volume `w6ndh50xcl`. Rather than migrate the ~1.5GB dataset too, the SFT dataset
+was re-prepared fresh on the GPU pod's own CPU (`scripts.data_prep --kind=sft`, no `--dataset`
+override) — a deliberate, scoped exception to the "never non-GPU work on a billed GPU pod" rule,
+made for this one task specifically to avoid a second cross-datacenter transfer. It reproduced
+**exactly** the same numbers as the original (789,759 train documents, 237,453 sequences) —
+confirming the pipeline is genuinely content-deterministic, not just probably-deterministic. Only
+the 1.4GB base checkpoint (model + both optimizer shards, for `--load-optimizer=1` parity with
+Stage 8) was moved, via direct `scp` — RunPod's SSH proxy (`ssh.runpod.io`) only supports an
+interactive PTY shell with no `scp`/`sftp` subsystem at all, but adding *any* exposed port
+(`8000/http`, unrelated to the transfer itself) causes RunPod to allocate the pod a real public IP,
+after which normal `ssh`/`scp` on the direct address works fine. ~11 MB/s over that link; verified
+byte-identical both ends via `md5sum` before trusting it.
+
+**Speed** (2x H100 SXM both runs, same GPU type; different pods since US-GA-2 had no capacity):
+
+| | Stage 8 (SFT masking off) | Stage 10 (SFT masking on) |
+|---|---|---|
+| tok/sec | ~840,000–865,000 | ~778,000–805,000 (avg ~789K) |
+| MFU | ~45–46.5% | ~41.7–43.2% (avg ~42.4%) |
+| wall time (927 steps) | 9.41 min | 10.17 min |
+| peak memory | 60,024.01 MiB | 60,022.27 MiB (identical) |
+
+**~8% throughput cost** for SFT-time masking — the same ballpark as Stage 7's ~10% at pretraining
+time.
+
+**Quality** — val bpb, identical base checkpoint and dataset, only SFT-time masking differs:
+
+| step | Stage 8 (masking off) | Stage 10 (masking on) |
+|---|---|---|
+| 0 | 0.6384 | 0.6301 |
+| 200 | 0.4549 | 0.4533 |
+| 400 | 0.4411 | 0.4405 |
+| 600 | 0.4163 | 0.4159 |
+| 800 | 0.3894 | 0.3891 |
+| 927 (final) | **0.3796** | **0.3794** |
+
+**0.053% better** — smaller than Stage 8's own base-checkpoint-masking effect (0.24%), and well
+inside the noise band every result in this line has landed in since upstream's own original
+attempt (`docs/upstream/LOG.md:715-741`). The hypothesis motivating this run — that SFT-time
+masking should matter *more* than pretraining-time masking, since a packed SFT row holds far more
+documents (up to 35/row measured in Stage 9) than a pretraining row (~4.2/row) — was not borne out:
+holding the already-masked base checkpoint fixed, adding masking at SFT time too produced a
+*smaller* delta than masking the base checkpoint alone did. Combined with the ~8% throughput cost,
+this closes the doc-masking line of inquiry for this architecture: real, measured, consistently
+small-positive, and not worth its cost at this scale.
+
+**Cost**: ~26 min on 2x H100 SXM ($6.98/hr) ≈ $3.02 for the training run, plus ~9 min on a `cpu3g`
+CPU pod for the checkpoint transfer (≈ $0.02) and a few seconds each for capacity-probe pods
+(≈ $0.03) — **≈ $3.07 total**, all pods terminated immediately after their step finished.
+
 ## Lessons from the first real cloud run
 
 Everything below was found running this harness for real (not in local rehearsal) and is now

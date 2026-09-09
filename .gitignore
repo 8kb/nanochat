@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 dev-ignore/
 report.md
 eval_bundle/
@@ -10,3 +11,5 @@ eval_bundle/
 
 # Local setup
 wandb/
+.idea/
+runs/results/

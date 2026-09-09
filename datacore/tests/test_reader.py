@@ -216,3 +216,79 @@ def test_open_dataset_raises_on_missing_manifest(tmp_path):
     store = FileSystemDatasetStore(str(tmp_path))
     with pytest.raises(FileNotFoundError):
         open_dataset(store)
+
+
+def test_read_rows_matches_batches_content(tmp_path):
+    store = _make_dataset(tmp_path, n_sequences=8, sequence_len=3, volume_cap=3)
+    dataset = open_dataset(store)
+    tokens, mask = dataset.read_rows("train", 2, 4)
+    assert mask is None
+    for offset, row in enumerate(tokens):
+        k = 2 + offset
+        assert row.tolist() == [k, k + 1, k + 2, k + 3]
+
+
+def test_read_rows_spans_volumes_like_batches(tmp_path):
+    # volume_cap=2, 5 sequences -> volumes [2,2,1]; a read of 4 rows starting at 0 spans all three.
+    store = _make_dataset(tmp_path, n_sequences=5, sequence_len=2, volume_cap=2)
+    dataset = open_dataset(store)
+    tokens, _ = dataset.read_rows("train", 0, 4)
+    assert tokens.shape == (4, 3)
+    assert tokens[:, 0].tolist() == [0, 1, 2, 3]
+
+
+def test_read_rows_returns_mask_when_dataset_has_one(tmp_path):
+    store = FileSystemDatasetStore(str(tmp_path))
+    packer = BestFitPadPacker(bos_token_id=9, buffer_size=4)
+    docs = [EncodedDoc(ids=[9, 1, 2], mask=[0, 1, 1])]  # -> row [9,1,2,9,9,9] mask [0,1,1,0,0,0]
+    totals = write_split(store, "train", packer, sequence_len=5, sequences_per_volume=10, vocab_size=50,
+                          named_document_batches=[("f", docs)])
+    manifest = {
+        "format": "datacore.v1", "sequence_len": 5, "stride": 6, "dtype": "uint16", "has_mask": True,
+        "vocab_size": 50, "bos_token_id": 9, "tokenizer_fingerprint": "t",
+        "packer": {"name": packer.name, "params": {"padding_id": packer.padding_id}}, "sequences_per_volume": 10,
+        "splits": {"train": {
+            "volumes": [{"file": v.file, "rows": v.rows, "source": v.source, "mask_file": v.mask_file}
+                        for v in totals.volumes],
+            "num_sequences": totals.num_sequences, "num_tokens": totals.num_tokens,
+            "num_documents": totals.num_documents, "num_documents_dropped": 0,
+            "num_tokens_encoded": totals.num_tokens_encoded, "num_tokens_dropped": totals.num_tokens_dropped,
+        }},
+    }
+    store.write_manifest(manifest)
+    dataset = open_dataset(store)
+    tokens, mask = dataset.read_rows("train", 0, 1)
+    assert tokens[0].tolist() == [9, 1, 2, 9, 9, 9]
+    assert mask[0].tolist() == [0, 1, 1, 0, 0, 0]
+
+
+def test_dataset_info_padding_and_bos_token_id(tmp_path):
+    store = _make_dataset(tmp_path, n_sequences=3, sequence_len=2, volume_cap=2)
+    dataset = open_dataset(store)
+    # BestFitCropPacker: no padding_id concept at all -- must be None, not defaulted to bos.
+    assert dataset.info.padding_id is None
+    assert dataset.info.bos_token_id == 0
+
+
+def test_dataset_info_padding_id_from_pad_packer_manifest(tmp_path):
+    store = FileSystemDatasetStore(str(tmp_path))
+    packer = BestFitPadPacker(bos_token_id=9, buffer_size=4)
+    docs = [EncodedDoc(ids=[9, 1, 2], mask=[0, 1, 1])]
+    totals = write_split(store, "train", packer, sequence_len=5, sequences_per_volume=10, vocab_size=50,
+                          named_document_batches=[("f", docs)])
+    manifest = {
+        "format": "datacore.v1", "sequence_len": 5, "stride": 6, "dtype": "uint16", "has_mask": True,
+        "vocab_size": 50, "bos_token_id": 9, "tokenizer_fingerprint": "t",
+        "packer": {"name": packer.name, "params": {"padding_id": packer.padding_id}}, "sequences_per_volume": 10,
+        "splits": {"train": {
+            "volumes": [{"file": v.file, "rows": v.rows, "source": v.source, "mask_file": v.mask_file}
+                        for v in totals.volumes],
+            "num_sequences": totals.num_sequences, "num_tokens": totals.num_tokens,
+            "num_documents": totals.num_documents, "num_documents_dropped": 0,
+            "num_tokens_encoded": totals.num_tokens_encoded, "num_tokens_dropped": totals.num_tokens_dropped,
+        }},
+    }
+    store.write_manifest(manifest)
+    dataset = open_dataset(store)
+    assert dataset.info.padding_id == 9
+    assert dataset.info.bos_token_id == 9

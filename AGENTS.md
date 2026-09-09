@@ -246,6 +246,82 @@ dev/                  images, notebooks, dev/repackage_data_reference.py, dev/ca
   through the new API directly. Run all three after any change to those areas — see
   [docs/architecture.md](docs/architecture.md#verifying-a-change-is-behavior-preserving).
 
+## Before you spend money on a pod
+
+Stage 8 (see `docs/contest.md`) paid for a CPU pod and a 2x H100 pod on a run that could not have
+tested what it was named for: `scripts/chat_sft.py` had no `--doc-masking` wiring, so a new
+`padding_id`-filled SFT dataset changed nothing reachable by that script. Answer these six
+questions **in writing, before creating any billed pod** — not as a formality, each has a
+falsifiable answer:
+
+1. **What number does this produce, and against what number is it compared?** Quote the baseline's
+   actual value and where it's recorded (a `docs/contest.md` stage, or a log under
+   `runs/results/`). No existing baseline means this is two runs, not one.
+2. **What is the single variable that differs?** More than one differing ⇒ the result isn't
+   attributable to anything.
+3. **Trace the consumer.** Name the `file:line` where the flag/parameter under test is *read* in
+   the exact script being launched. **No consumer ⇒ stop — the run cannot test it.** This is the
+   question Stage 8 failed, and it's answerable by `grep` alone.
+4. **What can be checked for free or nearly free first?** A local CPU smoke run, a manifest read, a
+   dataset diff, a `pytest` — all free. A CPU pod is ~$0.05/run; a wrong GPU hour is not. Do the
+   cheap check and report its result before creating the GPU pod.
+5. **Expected effect size vs. known noise.** Every result in the doc-masking line so far sits at or
+   near noise (upstream's own d16 attempt, `docs/upstream/LOG.md:715-741`: 0.85427→0.85407; this
+   fork's Stage 7 wall-time-adjusted; Stage 8's 0.24%). State what would make *this* run
+   distinguishable from noise, or don't run it.
+6. **Written cost estimate before launch**: pod flavor × expected minutes × $/hr.
+
+Two operational facts worth not re-deriving:
+
+- **CPU pod sizing for `--kind=sft` data prep needs ≥16GB.** `SmolTalk`/`MMLU`/`GSM8K` load their
+  full source datasets into memory before any `--max-conversations` cap applies. Neither the MCP
+  `create-pod` tool nor `runpodctl` (`create pod` or `pod create`) can select a CPU flavor/vCPU
+  count — both land on `cpu3c` (2 vcpu, 4GB, enforced as a hard cgroup limit regardless of what the
+  host reports), which OOMs this job at exit 137 with no output. Work around it via
+  `POST https://api.runpod.io/v2/pods` directly with `cpu: {id, vcpuCount}` (`cpu3m`/4vcpu/32GB is
+  known-good), using the API key already configured for `runpodctl` in `~/.runpod/config.toml`. See
+  the repo map's own "CPU-only, run before base_train.py/chat_sft.py, never on a billed GPU pod"
+  (above, `data_prep.py`'s entry) — this is the CPU-side counterpart: size the CPU pod correctly
+  instead of discovering the OOM after paying for the attempt.
+- **`scripts/data_prep.py --kind=sft`'s `--sft-padding-id` should stay at its `None` default** until
+  a tokenizer exists with a genuinely free pad token id. Every id in the current tokenizer is a real
+  special token (Stage 8 tried `<|output_end|>`); passing one in is strictly worse than falling back
+  to `bos_token_id`, which `build_doc_args`'s fold-in heuristic already handles correctly.
+- **RunPod's SSH proxy (`ssh.runpod.io`, the route used when a pod has no public IP —
+  `ssh.direct` is `null` in the create/get-pod response) needs an account-registered key, not the
+  container's `PUBLIC_KEY` env var, and only supports an interactive PTY channel.** `startSsh: true`
+  on pod creation injects whatever's registered via `GET/PUT /v2/account/ssh-keys` into
+  `PUBLIC_KEY` — check that endpoint first (`~/.runpod/ssh/runpodctl-ssh-key` is typically already
+  the registered key from a prior `runpodctl` use) rather than generating and threading through a
+  new one. Plain `ssh host cmd` fails outright ("doesn't support PTY"); use `ssh -tt host < script`
+  (commands piped via stdin) instead. `scp`/`sftp` don't work over this proxy at all (no subsystem
+  support) — to get a locally-edited file onto the pod, base64-encode it and pipe
+  `base64 -d > path <<'EOF' ... EOF` through the same stdin channel, and verify with `md5sum` on
+  both ends (the interactive shell's echoed terminal output looks garbled but the actual bytes
+  received are unaffected).
+- **Adding *any* exposed port to a pod (even one you don't otherwise need, e.g. `8000/http`) makes
+  RunPod allocate it a real public IP**, populating `ssh.direct` in the create/get-pod response —
+  after which normal `ssh -p <port> root@<ip>` and, critically, **real `scp`/`rsync`** work, unlike
+  the PTY-only proxy above. Worth doing any time you need to move more than a few KB (a checkpoint,
+  a dataset) rather than reaching for base64-over-stdin, which is fine for small text files but not
+  gigabytes. Changing a running pod's `ports` (via `update-pod`) restarts the container and
+  reallocates the port mapping — reread the pod's current `ssh.direct` port after the update rather
+  than reusing the one from creation.
+- **A GPU type's "LOW" stock label in `GET /v2/catalog/datacenters?include=GPU_AVAILABILITY` is not
+  "zero."** A specific datacenter can have literally no stock for a GPU type/count (pod creation
+  fails with "no longer any instances available") while the *global* aggregate
+  (`get-capacity`/`list-gpu-types`) still reads "High," and a datacenter separately labeled "LOW"
+  can still provision successfully. Confirm by actually attempting creation (terminating
+  immediately if it succeeds and isn't needed yet) rather than trusting the label either way — a
+  failed attempt costs nothing, a wrongly-abandoned option costs the alternative's overhead (e.g.
+  migrating data to a different datacenter that doesn't actually need it).
+- **A network volume is pinned to its datacenter; a pod can mount at most one.** If the datacenter
+  with your data has no GPU stock but another one does, moving *only* what's strictly needed (e.g.
+  a trained checkpoint) via direct `scp` is usually cheaper than migrating an entire dataset — a
+  dataset built by `scripts/data_prep.py` from public sources is often faster to just re-prepare
+  fresh on the new pod than to transfer, and doing so is a real (if content-deterministic, per
+  Stage 10) way to verify the pipeline reproduces byte-for-byte-equivalent document/sequence counts.
+
 ## What runs on this Mac
 
 Dev machine: Apple Silicon (M4), macOS, **no CUDA**. `COMPUTE_DTYPE` defaults to `float32` here

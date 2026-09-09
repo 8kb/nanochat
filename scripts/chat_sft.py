@@ -26,6 +26,7 @@ from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from nanochat.engine import Engine
 from nanochat.architectures import legacy
 from modelcore import ModelManager, OptimizerHparams
+from modelcore.kernels.flash_attn import build_doc_args
 from scripts.chat_eval import run_chat_eval
 from scripts.data_prep import default_dataset_name, prepared_dir
 
@@ -63,6 +64,8 @@ parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max proble
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
 # Data
 parser.add_argument("--dataset", type=str, default=None, help="prepared SFT dataset name (see scripts/data_prep.py --kind=sft, which also owns --mmlu-epochs/--gsm8k-epochs now); default: derived from --max-seq-len and the tokenizer fingerprint")
+parser.add_argument("--doc-masking", action="store_true", help="restrict attention to within each packed row's own document (BOS-delimited), instead of allowing attention across document boundaries within a row -- see modelcore.kernels.flash_attn.build_doc_args. Independent of whether the base checkpoint was pretrained with masking on or off.")
+parser.add_argument("--doc-masking-max-docs-per-row", type=int, default=None, help="override build_doc_args's default per-row document budget (DEFAULT_MAX_DOCS_PER_ROW=64) used to size the FA3 varlen kernel's cu_seqlens -- an SFT row packs many short conversations, so this plausibly needs raising; check with `python -m scripts.data_prep --describe --deep --dataset=<name>`'s documents/row max BEFORE launching a GPU run, not after hitting build_doc_args's assertion")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -88,6 +91,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 # Flash Attention status
 if not HAS_FA3:
     print0(f"WARNING: Flash Attention 3 not available ({FA3_LOAD_ERROR}), using PyTorch SDPA fallback. Training will be less efficient.")
+print0(f"Intra-document masking: {'ON' if args.doc_masking else 'off'}")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step, arch=args.arch)
@@ -192,6 +196,19 @@ if dataset.info.tokenizer_fingerprint != tokenizer.fingerprint():
 print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
       f"{dataset.num_sequences('val'):,} val sequences)")
 
+bos_token_id = tokenizer.get_bos_token_id() if args.doc_masking else None
+padding_id = dataset.info.padding_id if args.doc_masking else None
+
+def make_doc_args(x):
+    """None when --doc-masking is off; otherwise build_doc_args on x's actual batch size, honoring
+    --doc-masking-max-docs-per-row if given. Mirrors scripts/base_train.py's make_doc_args --
+    called outside the torch.compile'd model, in the micro-batch loop, same reason (see
+    modelcore.kernels.flash_attn.build_doc_args's docstring)."""
+    if not args.doc_masking:
+        return None
+    max_docs = args.doc_masking_max_docs_per_row * x.size(0) if args.doc_masking_max_docs_per_row is not None else None
+    return build_doc_args(x, bos_token_id, padding_id=padding_id, max_docs=max_docs)
+
 # --num-iterations now means optimizer STEPS (matching scripts/base_train.py), not micro-batches
 # -- the old inline generator's `it` counted individual next() calls, i.e. micro-batches, which
 # meant the same flag meant something different in every training script. A caller relying on the
@@ -245,7 +262,9 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -329,7 +348,8 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        doc_args = make_doc_args(x)  # built outside the compiled model -- see make_doc_args's docstring
+        loss = model(x, y, doc_args=doc_args)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

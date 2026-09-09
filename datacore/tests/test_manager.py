@@ -135,6 +135,55 @@ def test_prepare_records_packer_params_including_padding_id(tmp_path):
     assert "padding_id" not in manifest_crop["packer"]["params"]
 
 
+def test_dataset_info_surfaces_padding_id_and_bos_token_id(tmp_path):
+    """DatasetInfo (what DataManager.open() returns) must carry padding_id/bos_token_id through
+    from the manifest -- these are what modelcore.kernels.flash_attn.build_doc_args needs at train
+    time, and what scripts/data_prep.py's --describe stats (documents-per-row, padding share) are
+    computed against."""
+    tok = CharTokenizer(CHARS)
+    bos = tok.get_bos_token_id()
+
+    def conv(user, asst):
+        ids = [bos] + tok.encode(user) + tok.encode(asst)
+        mask = [0] * (1 + len(user)) + [1] * len(asst)
+        return EncodedDoc(ids=ids, mask=mask)
+
+    manager = DataManager()
+
+    # Pad packer, default padding_id -> resolves to bos_token_id, and DatasetInfo reflects that.
+    store_pad = FileSystemDatasetStore(str(tmp_path / "pad"))
+    manager.prepare(
+        store_pad, sources={"train": ListTokenSource([("b", [conv("hi", "hello!")])])}, tokenizer=tok,
+        sequence_len=16, sequences_per_volume=10, packer=BestFitPadPacker(bos_token_id=bos, buffer_size=10),
+    )
+    ds_pad = manager.open(store_pad)
+    assert ds_pad.info.padding_id == bos
+    assert ds_pad.info.bos_token_id == bos
+
+    # Crop packer: no padding concept -- DatasetInfo.padding_id must be None, not defaulted.
+    store_crop = FileSystemDatasetStore(str(tmp_path / "crop"))
+    manager.prepare(
+        store_crop, sources={"train": ListTextSource([("f", ["one two three.\n"] * 5)])}, tokenizer=tok,
+        sequence_len=8, sequences_per_volume=5, packer=BestFitCropPacker(buffer_size=10),
+    )
+    ds_crop = manager.open(store_crop)
+    assert ds_crop.info.padding_id is None
+    assert ds_crop.info.bos_token_id == bos
+
+
+def test_read_rows_round_trips_through_data_manager(tmp_path):
+    tok = CharTokenizer(CHARS)
+    texts = ["one two three four five.\n"] * 6
+    manager = DataManager()
+    store = FileSystemDatasetStore(str(tmp_path))
+    manager.prepare(store, sources={"train": ListTextSource([("f", texts)])}, tokenizer=tok,
+                     sequence_len=6, sequences_per_volume=3, packer=BestFitCropPacker(buffer_size=20))
+    dataset = manager.open(store)
+    tokens, mask = manager.read_rows(dataset, "train", 0, dataset.num_sequences("train"))
+    assert mask is None
+    assert tokens.shape == (dataset.num_sequences("train"), 7)
+
+
 def test_two_splits_from_different_sources(tmp_path):
     tok = CharTokenizer(CHARS)
     train_source = ListTextSource([("f1", ["training text here.\n"] * 20)])

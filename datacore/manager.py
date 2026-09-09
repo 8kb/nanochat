@@ -64,6 +64,9 @@ class DataManager:
     def batches(self, dataset: Dataset, split: str, batch_size: int, **kwargs):
         return _batches(dataset, split, batch_size, **kwargs)
 
+    def read_rows(self, dataset: Dataset, split: str, start: int, count: int):
+        return dataset.read_rows(split, start, count)
+
 
 def _split_totals_to_dict(totals):
     volumes = []
