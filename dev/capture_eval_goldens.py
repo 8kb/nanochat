@@ -14,6 +14,12 @@ one multiple_choice, one schema, and one language_modeling task, 5 examples each
 configured in eval_bundle/core.yaml) and tests/goldens/eval_render_for_completion.json (20
 render_for_completion() token-id outputs across ARC-Easy/MMLU/GSM8K/HumanEval).
 
+Like dev/capture_model_goldens.py and dev/capture_data_goldens.py, this can no longer actually run
+once the benchcore move lands (nanochat.core_eval and tasks/ are deleted) -- it's kept as a record
+of how tests/goldens/eval_core_prompts.json and eval_render_for_completion.json were produced, not
+a live tool. benchcore/tests/test_prompts.py cross-checks its own plain-Python rendering against
+these same goldens' values (hand-crafted fixtures there, verified against these at extraction time).
+
 python -m dev.capture_eval_goldens          # (re)writes the goldens
 python -m dev.capture_eval_goldens --check  # recomputes and asserts identical to what's on disk
 """

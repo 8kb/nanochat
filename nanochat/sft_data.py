@@ -1,18 +1,24 @@
 """
-SmolTalk by HuggingFace. Good "general" conversational dataset.
+SmolTalk by HuggingFace. Good "general" conversational dataset used to build the SFT training
+mixture (scripts/data_prep.py). Lives here, not in benchcore, because it has no eval criterion at
+all -- pure SFT training data, built directly on datacore.ExampleSet + datacore.load_hub_dataset
+rather than benchcore.Task (see datacore/docs/architecture.md's ExampleSet/HubTable section, and
+the benchcore extraction plan's rationale for this split).
 https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk
 We use the "smol" version, which is more appropriate for smaller models.
 """
+from datacore import ExampleSet, load_hub_dataset
 
-from tasks.common import Task, load_hub_dataset
+from nanochat.common import get_base_dir
 
-class SmolTalk(Task):
+
+class SmolTalk(ExampleSet):
     """ smol-smoltalk dataset. train is 460K rows, test is 24K rows. """
 
     def __init__(self, split, **kwargs):
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SmolTalk split must be train|test"
-        self.ds = load_hub_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=42)
+        self.ds = load_hub_dataset("HuggingFaceTB/smol-smoltalk", split=split, cache_dir=get_base_dir()).shuffle(seed=42)
         self.length = len(self.ds)
 
     def num_examples(self):

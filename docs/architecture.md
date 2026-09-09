@@ -79,7 +79,8 @@ for inputs, targets, state in manager.batches(dataset, "train", args.device_batc
 ```
 
 `scripts/data_prep.py` is the preparation entrypoint (`--kind=base` for the pretraining corpus via
-`nanochat.dataset`'s ClimbMix identity, `--kind=sft` for the `tasks/` mixture rendered through
+`nanochat.dataset`'s ClimbMix identity, `--kind=sft` for the SFT mixture -- `datacore.ExampleMixture`
+of `benchcore.MMLU`/`GSM8K` and `nanochat.sft_data.SmolTalk` -- rendered through
 `RustBPETokenizer.render_conversation`) — see its own docstring and
 [datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md) for the on-disk format, the
 cursor-based resumable read order, and why `sequence_len`/tokenizer fingerprint mismatches raise

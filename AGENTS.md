@@ -7,20 +7,24 @@ Read [modelcore's AGENTS.md](https://github.com/8kb/modelcore/blob/main/AGENTS.m
 [architecture.md](https://github.com/8kb/modelcore/blob/main/docs/architecture.md) before touching
 anything that depends on `modelcore`, [datacore's AGENTS.md](https://github.com/8kb/datacore/blob/main/AGENTS.md)
 and [architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md) before
-touching anything that depends on `datacore`, [docs/architecture.md](docs/architecture.md) before
-touching `nanochat/architectures/` or how the app consumes `ModelManager`, and
-[docs/upstream-sync.md](docs/upstream-sync.md) before touching anything that used to live in
-`nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section for where its code lives today).
+touching anything that depends on `datacore`, [benchcore's AGENTS.md](https://github.com/8kb/benchcore/blob/main/AGENTS.md)
+and [architecture.md](https://github.com/8kb/benchcore/blob/main/docs/architecture.md) before
+touching anything that depends on `benchcore` (CORE/ChatCORE evaluation),
+[docs/architecture.md](docs/architecture.md) before touching `nanochat/architectures/` or how the
+app consumes `ModelManager`, and [docs/upstream-sync.md](docs/upstream-sync.md) before touching
+anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section
+for where its code lives today).
 
-`modelcore` and `datacore` are separate repositories
-([8kb/modelcore](https://github.com/8kb/modelcore), [8kb/datacore](https://github.com/8kb/datacore)
-— Stage 10, see docs/roadmap.md), consumed here as pinned git dependencies (`pyproject.toml`'s
-`[tool.uv.sources]`), not directories in this tree. `uv sync` installs both into `.venv/`;
-`import modelcore`/`import datacore` resolve from there. Working on either subsystem itself means
-cloning its own repo (both are siblings of this one under `../`, see
-[../llmllab/AGENTS.md](../llmllab/AGENTS.md)), not editing a copy inside this one — see each
-repo's own README/AGENTS.md for its local dev loop, or use `uv pip install -e ../modelcore` (after
-`uv sync`) to point this checkout at a local sibling clone for cross-repo development.
+`modelcore`, `datacore`, and `benchcore` are separate repositories
+([8kb/modelcore](https://github.com/8kb/modelcore), [8kb/datacore](https://github.com/8kb/datacore),
+[8kb/benchcore](https://github.com/8kb/benchcore) — Stage 10 and Stage 15, see docs/roadmap.md),
+consumed here as pinned git dependencies (`pyproject.toml`'s `[tool.uv.sources]`), not directories
+in this tree. `uv sync` installs all three into `.venv/`; `import modelcore`/`import datacore`/
+`import benchcore` resolve from there. Working on any of them means cloning its own repo (each is
+a sibling of this one under `../`, see [../llmllab/AGENTS.md](../llmllab/AGENTS.md)), not editing a
+copy inside this one — see each repo's own README/AGENTS.md for its local dev loop, or use
+`uv pip install -e ../modelcore` (after `uv sync`) to point this checkout at a local sibling clone
+for cross-repo development.
 
 ## What this fork is
 
@@ -44,34 +48,51 @@ datacore               -- separate repo (github.com/8kb/datacore), pinned git de
                           prepare a dataset, open one, read batches), store.py, packing.py
                           (BestFitCropPacker/BestFitPadPacker), writer.py, reader.py (the only
                           module that imports torch, lazily), sources.py, download.py, tokenizer.py.
+                          Also ExampleSet/ExampleMixture/ExampleSequence and HubTable/
+                          load_hub_dataset -- a separate, standalone value-type surface (not
+                          through DataManager) that benchcore's Task builds on.
                           See its own AGENTS.md/docs/architecture.md.
+benchcore              -- separate repo (github.com/8kb/benchcore), pinned git dependency, not a
+                          directory here. Evaluation subsystem: BenchManager (the one entrypoint --
+                          score a model against CORE and/or a chat-style task suite), Model/
+                          Tokenizer/Generator protocols (no modelcore dependency -- any model with
+                          the right __call__ shape works), tasks/ (ARC/MMLU/GSM8K/HumanEval),
+                          execution.py (sandboxed HumanEval eval), mock.py (MockTokenizer/
+                          ScriptedModel/ScriptedGenerator). See its own AGENTS.md/docs/architecture.md.
 nanochat/             everything that knows nanochat's own conventions
 ├── architectures/       expand a --depth dial (presets.py) or migrate an old checkpoint (legacy.py)
 │                        into a modelcore.ModelConfig; derive.py holds the depth-dial derivation rules
 ├── engine.py             inference: Engine (calculator/tool-use, KV-cached generate) built on
-│                        modelcore.generate.Decoder; generate_naive/KVCache re-exported
+│                        modelcore.generate.Decoder; also satisfies benchcore's Generator protocol
+│                        unmodified for chat-suite evaluation
 ├── checkpoint_manager.py  naming policy (tags, steps) + meta.json extras; LegacyCheckpointStore
 │                        adapts an old checkpoint onto ModelManager.load_model
 ├── optim.py, flash_attention.py   one-line re-export shims onto modelcore.optim/modelcore.kernels
-├── tokenizer.py            BPE tokenizer wrapper (satisfies datacore.Tokenizer unmodified,
-│                        including datacore's optional token_byte_lengths() member)
+├── tokenizer.py            BPE tokenizer wrapper (satisfies datacore.Tokenizer and benchcore.Tokenizer
+│                        unmodified, including datacore's optional token_byte_lengths() member)
 ├── dataset.py               ClimbMix identity (URL, shard count, local dir) -- download/parquet
 │                        mechanism lives in datacore.download/datacore.sources
-├── core_eval.py            base-model evaluation, CORE benchmark (bits-per-byte moved to
-│                        modelcore.ModelManager.evaluate_bpb -- see docs/roadmap.md Stage 14)
-├── execution.py            sandboxed Python execution (tool use)
+├── sft_data.py              SmolTalk -- pure SFT training data, no eval criterion, built on
+│                        datacore.ExampleSet directly (not benchcore.Task -- see benchcore's
+│                        docs/architecture.md for why that split exists)
 └── scaling.py               muP training-plan math (architecture-agnostic)
 scripts/              entry points, run as `python -m scripts.<name>`
 ├── data_prep.py            prepares a datacore dataset (--kind=base|sft); CPU-only, run before
 │                        base_train.py/chat_sft.py, never on a billed GPU pod
+├── base_eval.py             CORE/bpb/sample eval for base models -- CORE scoring is
+│                        benchcore.BenchManager.core_task/load_core_suite; this script is the CLI
+├── chat_eval.py             ARC/MMLU/GSM8K/HumanEval + ChatCORE eval for chat models -- the eval
+│                        loops are benchcore.BenchManager.chat; this script is the CLI
 └── ...
-tasks/                task/dataset definitions for eval (arc, mmlu, gsm8k, humaneval, smoltalk)
 tests/                nanochat's pytest suite — see "What runs on this Mac" below
-                        (modelcore/datacore each own their own standalone suite, in their own repo)
+                        (modelcore/datacore/benchcore each own their own standalone suite, in their
+                        own repo)
 runs/                 shell scripts wiring scripts/ together (speedrun.sh, runcpu.sh, ...)
 docs/                 this fork's documentation; docs/upstream/ holds the original nanochat docs
 dev/                  images, notebooks, dev/repackage_data_reference.py, dev/capture_model_goldens.py,
-                        dev/capture_data_goldens.py (frozen pre-datacore packing-algorithm reference)
+                        dev/capture_data_goldens.py (frozen pre-datacore packing-algorithm reference),
+                        dev/capture_eval_goldens.py (frozen pre-benchcore CORE-prompt-rendering
+                        reference -- see benchcore's extraction in docs/roadmap.md)
 ```
 
 ## Invariants owned elsewhere

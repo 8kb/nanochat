@@ -25,7 +25,7 @@ from nanochat.engine import Engine
 from nanochat.architectures import legacy
 from modelcore import ModelManager, OptimizerHparams
 from modelcore.kernels.flash_attn import build_doc_args
-from scripts.chat_eval import run_chat_eval
+from benchcore import ARC, GSM8K, MMLU, ALL_CHAT_TASKS, CATEGORICAL_CHAT_TASKS, HumanEval, BenchManager, chatcore_metric
 from scripts.data_prep import default_dataset_name, prepared_dir
 
 # -----------------------------------------------------------------------------
@@ -280,25 +280,28 @@ while True:
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
-        all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval']
-        categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
-        baseline_accuracies = {
-            'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
-            'GSM8K': 0.0, 'HumanEval': 0.0,
+        cache_dir = get_base_dir()
+        task_builders = {
+            'ARC-Easy': lambda: ARC(subset="ARC-Easy", split="test", cache_dir=cache_dir),
+            'ARC-Challenge': lambda: ARC(subset="ARC-Challenge", split="test", cache_dir=cache_dir),
+            'MMLU': lambda: MMLU(subset="all", split="test", cache_dir=cache_dir),
+            'GSM8K': lambda: GSM8K(subset="main", split="test", cache_dir=cache_dir),
+            'HumanEval': lambda: HumanEval(cache_dir=cache_dir),
         }
+        bench_manager = BenchManager()
         task_results = {}
-        for task_name in all_tasks:
-            limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
+        for task_name in ALL_CHAT_TASKS:
+            limit = args.chatcore_max_cat if task_name in CATEGORICAL_CHAT_TASKS else args.chatcore_max_sample
             max_problems = None if limit < 0 else limit  # -1 means no limit
-            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                batch_size=args.device_batch_size, max_problems=max_problems)
+            task = task_builders[task_name]()
+            acc = bench_manager.chat(task, orig_model, tokenizer, generator=engine,
+                                      batch_size=args.device_batch_size, max_problems=max_problems,
+                                      rank=ddp_rank, world_size=ddp_world_size)
             task_results[task_name] = acc
             print0(f"  {task_name}: {100*acc:.2f}%")
         # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
-        def centered_mean(tasks):
-            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
-        chatcore = centered_mean(all_tasks)
-        chatcore_cat = centered_mean(categorical_tasks)
+        chatcore = chatcore_metric(task_results)
+        chatcore_cat = chatcore_metric(task_results, tasks=CATEGORICAL_CHAT_TASKS)
         print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
         wandb_run.log({
             "step": step,

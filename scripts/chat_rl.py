@@ -26,7 +26,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir,
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from modelcore import ModelManager, OptimizerHparams
-from tasks.gsm8k import GSM8K
+from benchcore import GSM8K
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -78,8 +78,8 @@ engine = Engine(model, tokenizer) # for sampling rollouts
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
 
-train_task = GSM8K(subset="main", split="train")
-val_task = GSM8K(subset="main", split="test")
+train_task = GSM8K(subset="main", split="train", cache_dir=get_base_dir())
+val_task = GSM8K(subset="main", split="test", cache_dir=get_base_dir())
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
 

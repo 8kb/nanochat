@@ -522,10 +522,67 @@ checkpoint and the freshly-prepared dataset, producing sane bpb numbers; a tiny 
 `DataManager.token_bytes()` raising with a re-prepare message against a real dataset that predates
 this stage.
 
+## Stage 15 — extract `benchcore/`: CORE + ChatCORE evaluation, zero modelcore dependency (done)
+
+`nanochat/core_eval.py` (CORE benchmark scoring), `scripts/base_eval.py`'s bundle-handling/
+centering code, `scripts/chat_eval.py`'s two eval loops + ChatCORE metric, `nanochat/execution.py`
+(the HumanEval sandbox), and the eval-specific half of `tasks/` (ARC/MMLU/GSM8K/HumanEval) moved
+into a new repo, [8kb/benchcore](https://github.com/8kb/benchcore) — the third standalone subsystem,
+alongside `modelcore`/`datacore`. Unlike either of those, `benchcore` has **zero dependency on
+modelcore**: a model reaches it through a duck-typed `benchcore.Model` protocol (just
+`__call__(input_ids) -> logits`, plus two optional members), so any model with the right shape —
+`modelcore.Model`, a raw HuggingFace model, a mock — works unmodified. `Tokenizer`/`Generator` are
+the same shape of protocol; `nanochat.tokenizer.RustBPETokenizer`/`nanochat.engine.Engine` satisfy
+them with zero adapter code.
+
+`tasks/`'s container half (the `Task` base class's slicing view, `TaskMixture`/`TaskSequence`, and
+`HubDataset`/`load_hub_dataset`) split out to `datacore` instead, as `ExampleSet`/`ExampleMixture`/
+`ExampleSequence` and `HubTable`/`load_hub_dataset` — it has no eval criterion at all, so it isn't
+benchcore's concern; `benchcore.Task` subclasses `ExampleSet` and adds only `eval_type`/
+`evaluate()`/`reward()`/`render_mc`. `tasks/smoltalk.py` (pure SFT training data, no eval
+criterion) moved to `nanochat/sft_data.py` instead, built directly on `datacore.ExampleSet` — not
+`benchcore.Task`, since nothing about it can be scored. `scripts/data_prep.py`'s SFT mixture now
+builds on `datacore.ExampleMixture` + `benchcore.MMLU`/`GSM8K` + `nanochat.sft_data.SmolTalk`.
+
+`jinja2` (three prompt-rendering templates) was dropped entirely, rewritten as plain Python string
+building in `benchcore/prompts.py` — proven byte-identical to the original jinja2 output two ways:
+against hand-crafted fixtures in `benchcore/tests/test_prompts.py`, and against real bundle data
+via `nanochat/tests/goldens/eval_core_prompts.json`/`eval_render_for_completion.json` (captured
+from the pre-move code by `dev/capture_eval_goldens.py`, frozen — see that file's docstring).
+`pyyaml` (only `core.yaml` parsing) became a declared optional extra (`benchcore[bundle]`) instead
+of an undeclared transitive dependency — this resolves the "Explicitly deferred" bullet below for
+both packages.
+
+No ambient distributed state: `benchcore.core.evaluate_task` and `benchcore.chat`'s two eval loops
+take explicit `rank`/`world_size` and return each rank's partial counts rather than calling
+`torch.distributed` themselves — `BenchManager` does the actual `all_reduce`, only when
+`world_size > 1`. `device`/`cache_dir` are always explicit parameters too, never an ambient
+global — `load_core_suite`/`load_hub_dataset` both take `cache_dir` rather than reading a host's
+base-directory convention. (`datacore.load_hub_dataset`'s on-disk cache directory is still named
+`task_data`, matching nanochat's original `tasks/common.py::load_hub_dataset` exactly, so a
+machine with a pre-existing cache there doesn't re-download everything under a new name.)
+
+`scripts/base_eval.py`/`scripts/chat_eval.py` are now thin CLIs over `BenchManager`; the ChatCORE
+baseline-accuracy table (previously a literal duplicated in both `scripts/chat_eval.py` and
+`scripts/chat_sft.py`) is a single fact, `benchcore.CHAT_BASELINE_ACCURACIES`.
+
+Verified: `datacore`'s and `benchcore`'s own suites plus their `test_standalone.py` AST-scan proof
+(datacore is an allowed import for benchcore, since it builds on `ExampleSet`/`load_hub_dataset`;
+nanochat/scripts/modelcore are not); a real end-to-end comparison against a worktree of the
+pre-extraction commit — `base_eval --eval=core --max-per-task=20` against the real cached `d6`
+checkpoint and the real CORE bundle (all 22 tasks) produced byte-identical per-task accuracies,
+centered values, and the same `CORE metric: 0.0110`; `chat_eval -i sft -a ARC-Easy -x 20` against
+`smoketest_kvshare_win_d2` produced the identical `40.00%`; nanochat's full suite went from 149
+tests (148 passed, the one pre-existing `test_execution.py` macOS-sandbox failure) to exactly 128
+passed (0 failed) — the 21 tests removed are exactly `tests/test_tasks.py`'s 9 and
+`tests/test_execution.py`'s 12, both moved into `benchcore/tests/` (`test_execution.py`'s memory
+limit test still fails there for the same pre-existing macOS reason, now inside benchcore's own
+suite); and all five real HF-hub datasets (ARC/MMLU/GSM8K/HumanEval/SmolTalk) loaded correctly
+through the new `datacore.load_hub_dataset` path against this machine's real pre-existing
+`~/.cache/nanochat/task_data/` cache, with no re-download.
+
 ## Explicitly deferred, not scheduled
 
-- `jinja2` / `pyyaml` are imported (`nanochat/core_eval.py`, `scripts/base_eval.py`) but
-  undeclared in `pyproject.toml`, resolving only transitively through `torch`/`wandb`. Worth a
-  standalone dependency-hygiene commit whenever convenient. (`nanochat/dataset.py`'s `requests`
-  import, previously in this same bullet, is gone as of Stage 9 — the downloader moved to
-  `datacore.download`, built on stdlib `urllib.request` instead.)
+Nothing currently deferred — Stage 15 resolved the previous entry here (`jinja2`/`pyyaml` were
+undeclared, transitively-resolved dependencies of `nanochat/core_eval.py`/`scripts/base_eval.py`;
+`jinja2` is gone entirely and `pyyaml` is now a declared `benchcore[bundle]` extra).

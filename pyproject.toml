@@ -5,6 +5,7 @@ description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "benchcore[bundle]",
     "datacore[torch,parquet]",
     "filelock>=3.19.0",
     "hf_transfer>=0.1.9",
@@ -43,7 +44,8 @@ torch = [
     { index = "pytorch-cu128", extra = "gpu" },
 ]
 modelcore = { git = "https://github.com/8kb/modelcore", tag = "v0.1.0" }
-datacore = { git = "https://github.com/8kb/datacore", tag = "v0.1.0" }
+datacore = { git = "https://github.com/8kb/datacore", tag = "v0.2.1" }
+benchcore = { git = "https://github.com/8kb/benchcore", tag = "v0.1.0" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

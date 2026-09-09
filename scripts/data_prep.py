@@ -84,10 +84,10 @@ def prepare_base(args, tokenizer):
 # --kind=sft: the SFT task mixture
 
 class TaskMixtureTokenSource:
-    """Adapts a tasks.common.TaskMixture into datacore's TokenSource protocol: each conversation
-    is rendered via RustBPETokenizer.render_conversation (ids + per-token loss mask) here, in
-    chunks, so DataManager.prepare gets a volume flush boundary every `chunk_size` conversations
-    rather than one giant flush at the very end."""
+    """Adapts a datacore.ExampleMixture into datacore's own TokenSource protocol: each
+    conversation is rendered via RustBPETokenizer.render_conversation (ids + per-token loss mask)
+    here, in chunks, so DataManager.prepare gets a volume flush boundary every `chunk_size`
+    conversations rather than one giant flush at the very end."""
 
     def __init__(self, task_mixture, tokenizer, name, max_tokens=2048, chunk_size=2000):
         self.task_mixture = task_mixture
@@ -110,21 +110,21 @@ class TaskMixtureTokenSource:
 
 
 def _build_sft_mixtures(args):
-    from tasks.common import TaskMixture
-    from tasks.gsm8k import GSM8K
-    from tasks.mmlu import MMLU
-    from tasks.smoltalk import SmolTalk
+    from datacore import ExampleMixture
+    from benchcore import GSM8K, MMLU
+    from nanochat.sft_data import SmolTalk
 
+    cache_dir = get_base_dir()
     train_tasks = [
         SmolTalk(split="train"),
-        *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
-        *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
+        *[MMLU(subset="all", split="auxiliary_train", cache_dir=cache_dir) for _ in range(args.mmlu_epochs)],
+        *[GSM8K(subset="main", split="train", cache_dir=cache_dir) for _ in range(args.gsm8k_epochs)],
     ]
-    train_mixture = TaskMixture(train_tasks)
-    val_mixture = TaskMixture([
+    train_mixture = ExampleMixture(train_tasks)
+    val_mixture = ExampleMixture([
         SmolTalk(split="test"),
-        MMLU(subset="all", split="test", stop=5200),
-        GSM8K(subset="main", split="test", stop=420),
+        MMLU(subset="all", split="test", cache_dir=cache_dir, stop=5200),
+        GSM8K(subset="main", split="test", cache_dir=cache_dir, stop=420),
     ])
     if args.max_conversations is not None:
         train_mixture = _Truncated(train_mixture, args.max_conversations)
@@ -133,7 +133,7 @@ def _build_sft_mixtures(args):
 
 
 class _Truncated:
-    """Caps a Task/TaskMixture's apparent length for smoke tests, without touching tasks/."""
+    """Caps an ExampleSet/ExampleMixture's apparent length for smoke tests, without touching datacore."""
     def __init__(self, task, limit):
         self.task = task
         self.limit = min(limit, len(task))
