@@ -657,7 +657,7 @@ torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
 separate CPU pod against the same volume, terminated before the GPU pod started — the CPU-work
 discipline this repo's AGENTS.md calls for.
 
-| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | wall time |
+| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | netto time |
 |---|---|---|---|---|---|---|---|---|---|
 | 175,472,640 | 146,112,512 | 2,786 | 524,288 | 10.00 | **0.874398** | ~915,000 | ~49% | 69.87 GB | 26.52 min |
 
@@ -697,7 +697,7 @@ dataset's manifest: 3,727,360 documents / 893,729 sequences) — see the commit 
 `modelcore/kernels/flash_attn.py` for the full account. Terminated the crashed pod immediately,
 fixed and tested locally, then retried on a fresh pod; the retry ran clean end to end.
 
-| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | wall time | fp8 converted |
+| params | scaling params | iterations | total batch | tokens:param | **val bpb** | tok/sec | bf16 MFU | peak mem | netto time | fp8 converted |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 175,472,640 | 146,112,512 | 2,786 | 524,288 | 10.00 | **0.872063** | ~832,000-840,000 | ~44.8% | 69.87 GB | 29.17 min | 74/74 |
 
@@ -1091,3 +1091,125 @@ rather than scattered across commit messages.
   pod is genuinely needed for pure data movement, it must be the cheapest pod type attached to that
   volume, never the GPU pod that was just training** — terminate the GPU pod the moment its actual
   GPU work (training/eval) is done, full stop, before running anything that isn't GPU work.
+
+## Stage 11: first prod test of Stage 14/15 (modelcore/benchcore pin bumps), and a Blackwell reality check
+
+Landed the `modelcore` v0.2.0 / `benchcore` v0.1.1 pin bumps (`TODO.md`'s pending item —
+`evaluate_bpb`/`token_bytes` moving into `modelcore`/`datacore`, Stage 14, and the `benchcore`
+extraction, Stage 15) and prod-tested them for real, on GPU hardware, for the first time — every
+verification of that work up to this point had been local CPU/MPS only
+(`nanochat/AGENTS.md`'s own disclaimer). Also the first real attempt at either Blackwell chip
+(B200, B300) on this account, and the first real run with a deliberately shrunk `--eval-tokens`
+budget (1,048,576 vs. the ~41.9M default) to see how much of a run's wall time validation eval
+actually costs.
+
+**Landing the pins surfaced a genuine gap that pure local testing had masked**: `modelcore`'s
+Stage 14 commit added `modelcore/tests/test_evaluate.py`, which imports `numpy` — never declared
+as a dev dependency, invisible because the only verification path so far was
+`uv pip install -e ../modelcore` from `nanochat/`, whose own venv already had `numpy` transitively.
+Fixed before tagging `v0.2.0`. Separately, `benchcore`'s own tagged `v0.1.0` still pinned
+`datacore@v0.2.0` while `nanochat` pins `datacore@v0.2.1` — a commit (`9106308`) had already fixed
+this in `benchcore`'s `main` but never tagged it, on the mistaken assumption that a host's own
+`[tool.uv.sources]` override always wins; in practice `uv`'s universal resolver treats two
+non-workspace packages' conflicting source pins for the same dependency as a hard error
+(`uv sync` refused with "conflicting URLs for package datacore"), not a root-project override.
+Tagged `v0.1.1` to fix it for real. Full account and the exact commands in `TODO.md`.
+
+**A second, more consequential gap only showed up when `scripts/base_train.py` actually ran**:
+Stage 15 folded the CORE-eval loop directly into `scripts/base_eval.py`'s `main()` but never left
+behind the standalone `evaluate_core` function `base_train.py` imports at module load time —
+`from scripts.base_eval import evaluate_core` has been raising `ImportError` unconditionally since
+Stage 15 landed, even with `--core-metric-every=-1` (the import runs before argparse). Nothing in
+`tests/` imports `scripts.base_train` at module scope, so `python -m pytest -q` stayed green the
+entire time. Fixed by re-adding `evaluate_core` as a thin wrapper around `BenchManager.core`
+(which already implements the same loop), and threading `ddp_rank`/`ddp_world_size` through from
+the call site — the old (also broken) call passed neither, which would have made every rank
+redundantly eval the full suite under real multi-GPU. Committed and pushed to `master` before any
+GPU pod resumed.
+
+**B300 SXM6 AC, EU-NL-1, $7.89/hr** (the pre-approved fallback — B200 read `unavailable` across
+every catalog probe and a real create-then-terminate attempt at the time): the byte-identical
+Stage 6 command (`llama_kvshare_win` d13, ratio 10, `--fp8`) hit two independent, hardware-specific
+compiler gaps back to back, neither a nanochat bug:
+
+1. `torch.compile` crashed outright — Triton's bundled `ptxas` cannot codegen for `sm_103a`
+   (Blackwell Ultra's real compute capability, `(10, 3)`) at all: `PTXASError: Internal Triton PTX
+   codegen error`, independent of FA3.
+2. With `TORCHDYNAMO_DISABLE=1` past that, FA3 crashed too: `kernels-community/flash-attn3`'s own
+   `has_kernel()` check (`modelcore/kernels/flash_attn.py`'s `_load_flash_attention_3`) reports the
+   kernel available on this GPU, but the actual published binary has no compiled kernel image for
+   sm_103 at all — `CUDA error: no kernel image is available for execution on the device` on the
+   very first `flash_attn_func` call.
+
+Forcing both off (`TORCHDYNAMO_DISABLE=1` env var + a one-off bootstrap script setting
+`modelcore.kernels.flash_attn.USE_FA3 = False` after import, no code change) ran stably at
+`--device-batch-size=128` — B300's 275GB made the 128-vs-64 batch-size question moot — but at only
+**~152,300 tok/sec**, eager-mode SDPA with no compiled kernels at all. Projected **~159 min** for
+the full 2,786-step run (vs. Stage 6's 26.52 min on 2x H100), not a representative speed number and
+well outside budget — stopped after ~30 steps rather than let it complete in a crippled mode.
+**Terminated the pod**; no checkpoint was ever written (`--save-every=-1`, only saves at the end).
+
+**B200, US-NE-1, $6.79/hr** (found on a re-probe — stock across both Blackwell chips is genuinely
+this volatile run to run, worth re-checking immediately before every attempt rather than trusting a
+prior read). Neither B200-stocked datacenter this session (`US-TX-6`, then `US-NE-1`) supports
+network volumes at all (confirmed by the create-network-volume API's own error, which lists every
+volume-capable DC and neither appears) — the prepared dataset had to be re-downloaded and
+re-prepared fresh on the pod's own local disk (`~35 min` on 36 vCPUs, reproducing **exactly** the
+same numbers as the EU-NL-1 prep: 914,113 train / 20,414 val sequences — content-deterministic
+again, as every prior re-prep in this doc has been) rather than reused from the EU-NL-1 volume, a
+same-datacenter CPU relay having also failed (EU-NL-1 had zero CPU stock of any flavor at the time,
+confirmed by five failed create attempts plus the catalog listing itself).
+
+On B200 (real compute capability `(10, 0)`, plain Blackwell, not Ultra): `torch.compile` **worked
+fine** — a cheap smoke test (`torch.compile` a bare `Linear`, run it) succeeded before committing to
+the full launch. But FA3 has the identical gap Stage 6's own code comment already anticipated
+("Blackwell (sm100) needs SDPA fallback until FA3 is recompiled") — `has_kernel()` reports true,
+the real kernel call still hits "no kernel image is available," confirming this is not
+Ultra-specific but affects **all of Blackwell** in this pinned `kernels-community/flash-attn3`
+build. With FA3 forced off the same way (bootstrap script) but `torch.compile` left **on** this
+time, the run was stable and gave a real, representative number:
+
+| | Stage 6 (2x H100, FA3 on, compiled) | Stage 11 (1x B200, FA3 off/SDPA, compiled) |
+|---|---|---|
+| tok/sec | ~915,000 (2 GPUs) | ~391,000 (1 GPU) |
+| bf16 MFU | ~49% | ~18.5% |
+| val bpb (step 1,250/2,786) | not directly comparable (different step) | 0.9225 |
+| val bpb trajectory | 1.09 @ step 250 | 1.09 @ step 250 (identical) |
+
+The val-bpb trajectory matching Stage 6's step-250 value exactly is itself a correctness proof —
+the whole point of this run — that Stage 14/15's `evaluate_bpb`/`token_bytes` code path produces
+identical numbers on real GPU hardware as it does on this Mac's CPU/MPS tests. Stopped by request
+at step 1,250/2,786 (45%) rather than complete the full run — the speed question was already
+answered, and completing it would only have added cost without changing the conclusion.
+**Terminated the pod**; again no checkpoint was written.
+
+**Decision: defer Blackwell adoption, keep using H100 for production runs.** Losing FA3 alone costs
+roughly the same ballpark as the entire H100-vs-B200 hardware generation gap would otherwise gain —
+a wash at best, before counting the engineering cost of chasing a fix. An FA2 fallback was
+considered and set aside: unclear whether FA2 even covers this gap (it may hit the identical
+"no kernel image" wall, being similarly precompiled-binary-based), so the investigation cost isn't
+obviously justified by a probable win. Native FP4 support was also considered and set aside for the
+same reason from the other direction — real development work (`modelcore/precision/` has no FP4
+path today) with no evidence yet that it would offset the FA3 gap on this hardware.
+
+**Settled for good: the "~47M validation tokens" figure.** The real number, read directly from this
+session's own prepared-dataset manifest (twice, identically, on two different pods): val split =
+**41,828,286 tokens** (20,414 sequences × 2048), i.e. ~41.8M — close to `--eval-tokens`'s ~41.9M
+default (which is why the two are easy to conflate) but not the dataset's own size. Reducing
+`--eval-tokens` to 1,048,576 ran with no functional issues at either budget; the isolated
+before/after eval-cost measurement itself (Step 2.5b of the session's plan) was never reached,
+since the run was stopped for the Blackwell speed question first — a fair remaining experiment for
+a future H100 run, now that it's cheap to ask (same command, `--eval-tokens=1048576` vs. omitted).
+
+**Cost**: roughly $15-16 total across every probe, the two false-start CPU-pod attempts, the B300
+run, and the B200 run — see this session's own transcript for the itemized breakdown; RunPod's
+billing API lags real-time by several minutes, so live totals during a session are always
+approximate on the high side of "at least."
+
+**Corrections to this doc's own past entries**: Stage 6 and Stage 7's tables both label their wall
+time column "wall time" — it is not. `total_training_time` (`scripts/base_train.py`) accumulates
+only the fwd/bwd/optimizer window between two `synchronize()` calls, for `step > 10` onward
+specifically excluding validation, CORE eval, sampling, and checkpoint saves. Both stages' printed
+values are netto training time, not wall clock — there is no recorded pod wall-clock time for
+either stage. The column headers above (Stage 11's own table) say `tok/sec`/`MFU` rather than
+repeat the ambiguous label.
