@@ -5,9 +5,11 @@ description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "datacore[torch,parquet]",
     "filelock>=3.19.0",
     "hf_transfer>=0.1.9",
     "kernels>=0.11.7",
+    "modelcore[fa3]",
     "numpy>=1.26.0",
     "psutil>=7.1.0",
     "pyarrow>=21.0.0",
@@ -29,7 +31,7 @@ dev = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-testpaths = ["tests", "modelcore/tests", "datacore/tests"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -40,6 +42,8 @@ torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "gpu" },
 ]
+modelcore = { git = "https://github.com/8kb/modelcore", tag = "v0.1.0" }
+datacore = { git = "https://github.com/8kb/datacore", tag = "v0.1.0" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
