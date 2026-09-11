@@ -192,6 +192,19 @@ These are `modelcore`'s or `datacore`'s own invariants, not this repo's — full
   no registry to add it to — `modelcore` builds every tree through the same `Model` class,
   regardless of which preset produced it. See
   [docs/architecture.md](docs/architecture.md#nanochatarchitectures-presets-and-legacy-migration).
+- **`--adapters` (LoRA/DoRA) forces `chat_sft.py`'s `--load-optimizer` warm-start off.** An
+  adapter-augmented model's optimizer param groups are shaped completely differently from a
+  fully-trainable one (a frozen base produces no `"matrix"`/`"embedding"`/... groups at all, plus
+  the new `"adapter"`/`"adapter_scalar"` roles appended after them) — loading the pretrained run's
+  optimizer shard into that layout would apply momentum state to the wrong parameters entirely,
+  not just stale ones. See `modelcore`'s own `docs/architecture.md`'s "Adapters in the config
+  tree" for the full design (adapters are `ModelConfig` fields, applied automatically by
+  `Model.__init__`, not a transform like `enable_fp8`) and `nanochat/docs/roadmap.md`'s Stage 16
+  for this repo's wiring: `nanochat/architectures/adapters.py`'s `expand_adapters`/
+  `expand_adapters_for_config`, `--adapters`/`--adapter-lr`/`--adapter-scalar-lr` on
+  `base_train.py`/`chat_sft.py` (unverified on `chat_rl.py` — see that stage entry),
+  `checkpoint_manager.build_model`'s `config_override`, and `scripts/model_info.py --list-targets`/
+  `--list-adapters` for discovering/inspecting a checkpoint's adapters without loading weights.
 - **`tests/goldens/*.json` (including the four `tiny_composed_*` ones -- modelcore's own
   pre-Stage-7 baseline, moved here from `modelcore/tests/goldens/` at Stage 10's repo split) is the
   regression net for anything touching `modelcore`, `nanochat/architectures/`,

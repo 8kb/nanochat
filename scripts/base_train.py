@@ -14,6 +14,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import ast
+import dataclasses
 import gc
 import json
 import time
@@ -25,8 +26,9 @@ import torch
 import torch.distributed as dist
 
 from datacore import DataManager, FileSystemDatasetStore
-from modelcore import Model, ModelManager, OptimizerHparams
+from modelcore import AdapterSpec, Model, ModelManager, OptimizerHparams
 from nanochat.architectures import presets
+from nanochat.architectures.adapters import expand_adapters_for_config
 from nanochat.scaling import derive_training_plan, B_REF
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer
@@ -47,6 +49,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["tensorwise"], help="FP8 scaling recipe (only tensorwise is implemented -- see modelcore.precision.fp8)")
+parser.add_argument("--fp8-eval", type=int, default=1, help="when --fp8 is on, measure val bpb directly in fp8 instead of converting back to bf16 first (1=stay in fp8 [default], 0=convert back via ModelManager.fp8_disabled like every other eval in this script, then restore fp8 for training). Irrelevant (and harmless) without --fp8. Scope is val bpb only -- CORE-metric eval and sampling always convert back, unchanged.")
 # Model architecture
 parser.add_argument("--arch", type=str, default="gpt", help="preset name (gpt, llama, llama_kvshare, llama_kvshare_win -- see nanochat.architectures.presets), used unless --model-config is also given")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
@@ -57,6 +60,13 @@ parser.add_argument("--window-pattern", type=str, default=None, help="sliding wi
 parser.add_argument("--arch-opt", action="append", default=None, metavar="KEY=VALUE", help="override an architecture-specific config field beyond from_depth's fixed kwargs, e.g. --arch-opt kv_share_frac=0.667 (repeatable)")
 parser.add_argument("--model-config", type=str, default=None, help="overrides --arch: either a preset name (gpt, llama, llama_kvshare, llama_kvshare_win) or a path to a materialized JSON tree dumped by scripts/model_info.py --dump-config")
 parser.add_argument("--d-ref-scaling-params", type=int, default=None, help="skip re-deriving the muP d12 scaling-law reference model and use this scaling-param count directly; only needed for a --model-config JSON tree with no 'reference' block")
+# PEFT: attach adapters instead of (or in addition to) full pretraining -- unusual for base_train
+# (LoRA on a from-scratch model has no pretrained base to leave frozen-and-useful), but wired the
+# same way as scripts/chat_sft.py's --adapters for consistency; see that flag's help for the JSON
+# shape. Applies only at the real --depth, never to the muP d12 scaling-law reference model.
+parser.add_argument("--adapters", type=str, default=None, help="JSON object (inline, or a path to a .json file): a low-code request for nanochat.architectures.adapters.expand_adapters, or an already-materialized {'adapters': [...], 'frozen': [...]} pair -- see scripts/chat_sft.py's --adapters help for the full shape")
+parser.add_argument("--adapter-lr", type=float, default=None, help="learning rate for adapter (LoRA/DoRA A/B) params -- default: modelcore.OptimizerHparams.adapter_lr (an unswept starting guess)")
+parser.add_argument("--adapter-scalar-lr", type=float, default=None, help="learning rate for DoRA's per-channel magnitude param -- default: modelcore.OptimizerHparams.adapter_scalar_lr (an unswept starting guess)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -226,6 +236,20 @@ def build_model_meta(depth):
         arch_opts=_parse_arch_opts(args.arch_opt),
     )
     config = real_config if depth == args.depth else presets.resolve_reference_config(real_config, depth)
+    if args.adapters and depth == args.depth:
+        # Only at the real training depth -- num_scaling_params (matrix + unembedding roles) is
+        # what the muP d12 reference model exists to match, and adapters live in their own
+        # "adapter"/"adapter_scalar" roles, untouched either way (see modelcore/manager.py's
+        # create_optimizer policy) -- so the d12 reference has no reason to carry adapters too.
+        request = json.loads(open(args.adapters, "r", encoding="utf-8").read()) if os.path.isfile(args.adapters) else json.loads(args.adapters)
+        if "adapters" in request:
+            new_adapters = [AdapterSpec.from_dict(a) for a in request["adapters"]]
+            new_frozen = list(request.get("frozen", []))
+        else:
+            new_adapters, new_frozen = expand_adapters_for_config(config, request)
+        config = dataclasses.replace(config, adapters=new_adapters, frozen=new_frozen)
+        print0(f"Attached {len(new_adapters)} adapter(s) ({sorted({a.name for a in new_adapters})}); "
+               f"{len(new_frozen)} subtree(s) frozen ({new_frozen})")
     with torch.device("meta"):
         return Model(config, runtime=manager.runtime)
 
@@ -241,7 +265,12 @@ if not using_fa3 and model_stats.has_sliding_window:
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
+# If we are resuming, overwrite the model parameters with those of the checkpoint. Note: unlike
+# ModelManager.load_model (which scripts/chat_sft.py's --adapters goes through), this is a direct
+# strict=True load -- --resume-from-step together with --adapters is not reconciled the way
+# attaching adapters to an existing base checkpoint via chat_sft.py is, and will fail loudly on a
+# key mismatch rather than silently doing something wrong. Not exercised by this repo's tests;
+# treat it as unsupported until someone actually needs it.
 base_dir = get_base_dir()
 if args.model_tag:
     output_dirname = args.model_tag
@@ -357,13 +386,18 @@ print0(f"Total training FLOPs estimate: {plan.total_flops:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = manager.create_optimizer(orig_model, OptimizerHparams(
+optimizer_hparams = dict(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
-))
+)
+if args.adapter_lr is not None:
+    optimizer_hparams["adapter_lr"] = args.adapter_lr * batch_lr_scale
+if args.adapter_scalar_lr is not None:
+    optimizer_hparams["adapter_scalar_lr"] = args.adapter_scalar_lr * batch_lr_scale
+optimizer = manager.create_optimizer(orig_model, OptimizerHparams(**optimizer_hparams))
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -466,10 +500,17 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
+        if args.fp8_eval:
+            # Stay in fp8 for the eval forward passes -- see --fp8-eval's help. A no-op precision-
+            # wise when --fp8 was never on (there's nothing to disable either way).
             val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
                                             doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
                                             padding_id=padding_id)
+        else:
+            with disable_fp8(model):
+                val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                                doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                                padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb

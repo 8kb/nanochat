@@ -581,6 +581,76 @@ suite); and all five real HF-hub datasets (ARC/MMLU/GSM8K/HumanEval/SmolTalk) lo
 through the new `datacore.load_hub_dataset` path against this machine's real pre-existing
 `~/.cache/nanochat/task_data/` cache, with no re-download.
 
+## Stage 16 — PEFT: LoRA/DoRA adapters as config, not a transform (done)
+
+Low-rank adapters (LoRA; DoRA — weight-decomposed LoRA, https://arxiv.org/abs/2402.09353) landed
+as first-class entries in the same materialized config tree `ComponentSpec` already is for
+architecture, not as a `ModelManager.enable_fp8`-style one-shot transform invisible to the config.
+That distinction is the whole point: `ModelConfig.adapters`/`.frozen` (new fields, `modelcore`
+repo) are applied automatically by `Model.__init__`, so a checkpoint's `meta.json` can be
+hand-edited (enable/disable/add an adapter) and reloaded through `ModelManager.load_model`'s new
+reconciling load — no state-dict surgery. Full design in `modelcore`'s own
+`docs/architecture.md`'s "Adapters in the config tree" and `AGENTS.md`'s new invariants; this
+entry covers only the nanochat-side wiring.
+
+**`modelcore/peft/`** (new): `AdapterLinear` (a modelcore `Linear` owning named deltas),
+`LoRADelta`/`DoRADelta` (`@register_adapter`-cataloged, same shape as the component catalog but
+for delta types), `apply_adapters`/`find_adapters`/`merge_adapters`/`strip_adapters`. Two new
+optimizer roles (`"adapter"`, `"adapter_scalar"`, both AdamW — a rank-`r` factor is the wrong
+shape for Muon), appended last in `ModelManager.create_optimizer`'s policy dict per the
+optimizer-state-is-positional rule. `modelcore.roles.build_param_groups` now drops any
+`requires_grad=False` parameter (frozen base, or a disabled adapter) rather than crashing
+`MuonAdamW.step()` on its permanently-`None` grad. `modelcore/optim/muon_adamw.py`'s ZeRO-2
+reduce-scatter path gained a fallback to all-reduce for a param whose `shape[0]` doesn't divide
+evenly across ranks (a small-rank LoRA factor) — untested on real multi-GPU hardware (see "What
+runs on this Mac" below); verify it on a real multi-GPU run before trusting it in production.
+
+**`nanochat/architectures/adapters.py`** (new): `expand_adapters(model, request)` /
+`expand_adapters_for_config(config, request)` turn a low-code request (`{"name", "method": "lora"|
+"dora", "r", "alpha", "dropout", "targets": ["attn.c_q", ...], "layers": "all"|[...],
+"freeze_base": true}`) into a materialized `(adapters, frozen)` pair — the derivation-rule-lives-
+host-side split every preset in `presets.py` already follows. `list_linear_targets(model)`
+enumerates every legal `AdapterSpec.target`. A fully materialized `{"adapters": [...], "frozen":
+[...]}` pair (e.g. hand-written JSON) is passed straight through unchanged, same
+preset-or-materialized-tree duality `--model-config` already has.
+
+**CLI**: `--adapters` (inline JSON or a path to one), `--adapter-lr`, `--adapter-scalar-lr` on
+`scripts/base_train.py` and `scripts/chat_sft.py`. `chat_sft.py`'s `--load-optimizer` warm-start
+is forced off whenever `--adapters` is given — the pretrained optimizer's param-group layout
+doesn't match an adapter-augmented model's (frozen base ⇒ no `"matrix"`/`"embedding"`/... groups
+at all), so loading it would apply momentum state to the wrong parameters, not just stale ones.
+`scripts/model_info.py` gained `--list-targets`/`--list-adapters` (read-only, meta.json-only, no
+weights loaded) — what makes hand-editing a config practical instead of guessing FQNs.
+`checkpoint_manager.build_model`/`load_model_from_dir`/`load_model` all gained a `config_override`
+parameter threading straight to `ModelManager.load_model`'s `config=`.
+
+**`chat_rl.py` also carries the `--adapters`/`--adapter-lr` flags, for consistency with the other
+two scripts — but this path is explicitly unverified.** `chat_rl.py` hasn't been exercised in a
+long time and may already be broken independent of PEFT (see TODO.md); fixing it properly is
+deferred to "the new ecosystem" rather than bundled into this stage. It is not part of this
+stage's test coverage or acceptance criteria.
+
+**Where this is going**: this is the first adapter/PEFT instance of the low-code -> materialized
+pattern the family is moving toward everywhere — dataset construction and training plans are
+still hardcoded/argparse-only today, and are meant to grow their own "DSL" the same shape
+`ComponentSpec`/`AdapterSpec` already are for architecture, with CLI/UI tooling on top once there
+is a common materialized format to configure. `expand_adapters(model, request)` is the function a
+future preset registry, CLI, or UI would call; a hand-written materialized list always works too,
+by design — nothing here requires going through the low-code layer.
+
+Verified: `modelcore`'s own suite (159 passed, 16 CUDA-gated skips — 37 new tests, `test_peft.py`
+plus `test_roles.py`/`test_manager.py` additions) including its `test_standalone.py` AST-scan and
+a real `cp -r modelcore /tmp && PYTHONPATH=... pytest` isolated run (no host on the path); nanochat's
+full suite (136 passed, up from the 128 baseline — 8 new `tests/test_adapters.py` cases) against a
+local editable install (`uv pip install -e ../modelcore`); `tests/test_goldens.py`/
+`tests/test_architectures.py` unchanged (the omit-adapters-when-empty serialization is what keeps
+every pre-existing config byte-identical); and the actual end-to-end acceptance path run for
+real against a tiny CPU checkpoint: build → attach two LoRA adapters via `expand_adapters` →
+save → `model_info.py --list-targets`/`--list-adapters` → hand-edit `meta.json`'s
+`adapters[0].enabled` to `false` → `checkpoint_manager.build_model` (the same function
+`chat_cli.py`/`base_eval.py`/`chat_eval.py` all load through) reloads clean and reports the
+correct enabled/disabled state per adapter, with no file other than `meta.json` touched.
+
 ## Explicitly deferred, not scheduled
 
 Nothing currently deferred — Stage 15 resolved the previous entry here (`jinja2`/`pyyaml` were

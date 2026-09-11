@@ -118,9 +118,16 @@ class LegacyCheckpointStore(FileSystemStore):
         return state
 
 
-def build_model(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device, phase, config_override=None):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
+
+    config_override, when given, replaces the checkpoint's own stored model_config for the build
+    -- e.g. a modelcore.ModelConfig with a hand-edited `adapters`/`frozen` list, or a fresh one
+    built by nanochat.architectures.adapters.expand_adapters. This is the caller-facing lever for
+    "add/disable an adapter on an existing checkpoint": ModelManager.load_model does the actual
+    reconciling load (see its docstring) -- this function only has to pass the override through.
+
     Returns:
     - base model - uncompiled, not wrapped in DDP
     - tokenizer
@@ -128,7 +135,7 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     store = LegacyCheckpointStore(checkpoint_dir, step, device=device, log=log0)
-    model = _manager.load_model(store, device=device, train=(phase == "train"))
+    model = _manager.load_model(store, device=device, train=(phase == "train"), config=config_override)
     log0(f"Building model with config: {_manager.config_to_dict(model.config)}")
     # Load the metadata (kept as a separate, untouched read -- see LegacyCheckpointStore's
     # docstring for why this must stay the checkpoint's raw model_config, not the migrated one)
@@ -219,7 +226,7 @@ def _checkpoint_arch(checkpoints_dir, model_tag):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, arch=None):
+def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None, arch=None, config_override=None):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model (of the given arch, if any)
         model_tag = find_largest_model(checkpoints_dir, arch=arch)
@@ -231,11 +238,11 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase, config_override=config_override)
     meta_data["model_tag"] = model_tag # so a caller with no explicit --model-tag still knows which checkpoint was picked
     return model, tokenizer, meta_data
 
-def load_model(source, *args, arch=None, **kwargs):
+def load_model(source, *args, arch=None, config_override=None, **kwargs):
     model_dir = {
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
@@ -243,7 +250,7 @@ def load_model(source, *args, arch=None, **kwargs):
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, arch=arch, **kwargs)
+    return load_model_from_dir(checkpoints_dir, *args, arch=arch, config_override=config_override, **kwargs)
 
 def load_optimizer_state(source, device, rank, model_tag=None, step=None, arch=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""

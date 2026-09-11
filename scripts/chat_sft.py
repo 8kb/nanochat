@@ -11,6 +11,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import gc
 import argparse
+import dataclasses
+import json
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -23,7 +25,8 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3, FA3_LOAD_ERROR
 from nanochat.engine import Engine
 from nanochat.architectures import legacy
-from modelcore import ModelManager, OptimizerHparams
+from nanochat.architectures.adapters import expand_adapters_for_config
+from modelcore import AdapterSpec, ModelManager, OptimizerHparams
 from modelcore.kernels.flash_attn import build_doc_args
 from benchcore import ARC, GSM8K, MMLU, ALL_CHAT_TASKS, CATEGORICAL_CHAT_TASKS, HumanEval, BenchManager, chatcore_metric
 from scripts.data_prep import default_dataset_name, prepared_dir
@@ -39,7 +42,24 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--arch", type=str, default=None, help="restrict base-checkpoint auto-discovery/output tag to this architecture (gpt|llama|llama_kvshare|llama_kvshare_win); default None picks any")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
-parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--source", type=str, default="base", choices=["base", "sft"], help="load --model-tag from base_checkpoints/ (default) or chatsft_checkpoints/ -- 'sft' is for a second SFT round on top of an already-fine-tuned checkpoint. Requires --output-tag (or a distinct --model-tag going in vs. coming out), since the output always lands in chatsft_checkpoints/ too.")
+parser.add_argument("--output-tag", type=str, default=None, help="output checkpoint tag under chatsft_checkpoints/ (default: same as --model-tag, today's behavior). Must differ from --model-tag when --source=sft, or the run would overwrite the very checkpoint it's reading from mid-save.")
+parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes); ignored (forced off) when --adapters is given -- see the --adapters help")
+# PEFT: attach adapters instead of full fine-tuning (see modelcore/docs/architecture.md's
+# "Adapters in the config tree"). Omitting --adapters trains every parameter, unchanged.
+parser.add_argument("--adapters", type=str, default=None, help="JSON object (inline, or a path to a .json file) describing what to attach: either a low-code request, e.g. "
+                     '\'{"name": "sft0", "method": "lora", "r": 16, "alpha": 32, "targets": ["attn.c_q", "attn.c_v"], "layers": "all", "freeze_base": true}\' '
+                     "(see nanochat.architectures.adapters.expand_adapters for every key), or an already-materialized "
+                     '\'{"adapters": [...], "frozen": [...]}\' pair of modelcore.AdapterSpec-shaped dicts, passed straight through -- '
+                     "the same preset-or-materialized-tree duality --model-config already has. Forces --load-optimizer off: "
+                     "the pretrained optimizer's param-group layout does not match an adapter-augmented model.")
+parser.add_argument("--adapter-lr", type=float, default=None, help="learning rate for adapter (LoRA/DoRA A/B) params -- default: modelcore.OptimizerHparams.adapter_lr (an unswept starting guess)")
+parser.add_argument("--adapter-scalar-lr", type=float, default=None, help="learning rate for DoRA's per-channel magnitude param -- default: modelcore.OptimizerHparams.adapter_scalar_lr (an unswept starting guess)")
+# FP8 training -- mirrors scripts/base_train.py's --fp8/--fp8-recipe/--fp8-eval exactly (this
+# script had no fp8 support at all before; see modelcore.precision.fp8 / ModelManager.enable_fp8+fp8_disabled)
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["tensorwise"], help="FP8 scaling recipe (only tensorwise is implemented -- see modelcore.precision.fp8)")
+parser.add_argument("--fp8-eval", type=int, default=1, help="when --fp8 is on, measure val bpb directly in fp8 instead of converting back to bf16 first (1=stay in fp8 [default], 0=convert back via ModelManager.fp8_disabled, then restore fp8 for training). Irrelevant (and harmless) without --fp8.")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
@@ -66,6 +86,15 @@ parser.add_argument("--doc-masking", action="store_true", help="restrict attenti
 parser.add_argument("--doc-masking-max-docs-per-row", type=int, default=None, help="override build_doc_args's default per-row document budget (DEFAULT_MAX_DOCS_PER_ROW=64) used to size the FA3 varlen kernel's cu_seqlens -- an SFT row packs many short conversations, so this plausibly needs raising; check with `python -m scripts.data_prep --describe --deep --dataset=<name>`'s documents/row max BEFORE launching a GPU run, not after hitting build_doc_args's assertion")
 args = parser.parse_args()
 user_config = vars(args).copy()
+if args.source == "sft":
+    # Unlike --source=base (a separate base_checkpoints/ namespace, so reusing --model-tag as the
+    # output tag is safe -- see the save-checkpoint block below), --source=sft reads from and would
+    # by default write back into the *same* chatsft_checkpoints/ directory -- require an explicit,
+    # distinct --output-tag rather than silently overwriting the input mid-save.
+    assert args.output_tag is not None and args.output_tag != args.model_tag, (
+        f"--source=sft with --model-tag={args.model_tag!r} needs a distinct --output-tag -- "
+        f"saving would otherwise overwrite the very checkpoint this run reads from."
+    )
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -92,7 +121,25 @@ if not HAS_FA3:
 print0(f"Intra-document masking: {'ON' if args.doc_masking else 'off'}")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step, arch=args.arch)
+model, tokenizer, meta = load_model(args.source, device, phase="train", model_tag=args.model_tag, step=args.model_step, arch=args.arch)
+
+# Attach adapters (LoRA/DoRA), if requested: reloads the model with an adapter-augmented config
+# via ModelManager.load_model's reconciling load (see its docstring) -- a second checkpoint read
+# is the simplest way to get a real model whose config expand_adapters can be derived against;
+# expand_adapters_for_config itself only ever needs shapes (a meta-device probe), so this reload
+# is the one real weight-load PEFT adds on top of what chat_sft.py already did.
+if args.adapters:
+    request = json.loads(open(args.adapters, "r", encoding="utf-8").read()) if os.path.isfile(args.adapters) else json.loads(args.adapters)
+    if "adapters" in request:
+        new_adapters = [AdapterSpec.from_dict(a) for a in request["adapters"]]
+        new_frozen = list(request.get("frozen", []))
+    else:
+        new_adapters, new_frozen = expand_adapters_for_config(model.config, request)
+    adapted_config = dataclasses.replace(model.config, adapters=new_adapters, frozen=new_frozen)
+    model, tokenizer, meta = load_model(args.source, device, phase="train", model_tag=args.model_tag, step=args.model_step,
+                                         arch=args.arch, config_override=adapted_config)
+    print0(f"Attached {len(new_adapters)} adapter(s) ({sorted({a.name for a in new_adapters})}); "
+           f"{len(new_frozen)} subtree(s) frozen ({new_frozen})")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -117,6 +164,23 @@ for name, fallback, source in [
 
 manager = ModelManager()
 orig_model = model
+
+# -----------------------------------------------------------------------------
+# FP8 training (this has to be done before torch.compile) -- see scripts/base_train.py's
+# identical block; AdapterLinear's own guard in convert_to_float8_training keeps a --adapters
+# target's base weight and deltas out of fp8 conversion, so --fp8 --adapters=... just compose.
+
+if args.fp8:
+    if device_type != "cuda":
+        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+    else:
+        fp8_report = manager.enable_fp8(orig_model, recipe=args.fp8_recipe)
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted "
+               f"{fp8_report.num_converted}/{fp8_report.num_linear} linear layers, "
+               f"skipped {fp8_report.num_skipped} (too small)")
+
+disable_fp8 = manager.fp8_disabled  # alias: the val-bpb eval below reads `disable_fp8(model)`
+
 model = torch.compile(model, dynamic=False)
 depth = orig_model.config.n_layer
 num_flops_per_token = manager.stats(orig_model.config).flops_per_token
@@ -130,17 +194,27 @@ print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation ste
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = manager.create_optimizer(orig_model, OptimizerHparams(
-    unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0,
-))
+optimizer_hparams = dict(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+if args.adapter_lr is not None:
+    optimizer_hparams["adapter_lr"] = args.adapter_lr
+if args.adapter_scalar_lr is not None:
+    optimizer_hparams["adapter_scalar_lr"] = args.adapter_scalar_lr
+optimizer = manager.create_optimizer(orig_model, OptimizerHparams(**optimizer_hparams))
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
-if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step, arch=args.arch)
+if args.adapters:
+    # The pretrained optimizer's param groups were built for a fully-trainable base model; an
+    # adapter-augmented model's groups are shaped completely differently (a frozen base produces
+    # no "matrix"/"embedding"/... groups at all, plus the new "adapter"/"adapter_scalar" roles
+    # positioned after them -- see modelcore.roles.build_param_groups). Loading that shard here
+    # would apply momentum state to the wrong parameters entirely, not just stale ones.
+    print0("Adapters active: skipping optimizer warm-start (pretrained optimizer's param-group layout does not match an adapter-augmented model)")
+elif args.load_optimizer:
+    optimizer_data = load_optimizer_state(args.source, device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step, arch=args.arch)
     if optimizer_data is not None:
         optimizer_data = legacy.migrate_optimizer_state_from_meta(optimizer_data, meta["model_config"], depth, log=print0)
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -260,9 +334,17 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
-                                        doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
-                                        padding_id=padding_id)
+        if args.fp8_eval:
+            # Stay in fp8 for the eval forward passes -- see --fp8-eval's help. A no-op precision-
+            # wise when --fp8 was never on (there's nothing to disable either way).
+            val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                            doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                            padding_id=padding_id)
+        else:
+            with disable_fp8(model):
+                val_bpb = manager.evaluate_bpb(model, val_loader, eval_steps, token_bytes, bos_token_id=bos_token_id,
+                                                doc_masking_max_docs_per_row=args.doc_masking_max_docs_per_row,
+                                                padding_id=padding_id)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -319,7 +401,11 @@ while True:
         # and llama both at d12, auto-discovered rather than given an explicit --model-tag) would
         # silently overwrite each other's chatsft_checkpoints/d12/ directory.
         arch = arch_of(meta["model_config"])
-        output_dirname = args.model_tag if args.model_tag else (f"d{depth}" if arch == "gpt" else f"{arch}_d{depth}") # e.g. d12, or llama_d12
+        # --output-tag (required, and distinct from --model-tag, when --source=sft -- see the
+        # assert near the top of this script) overrides the default "reuse the input tag" behavior;
+        # unset, this is byte-identical to before --output-tag existed.
+        default_tag = args.model_tag if args.model_tag else (f"d{depth}" if arch == "gpt" else f"{arch}_d{depth}") # e.g. d12, or llama_d12
+        output_dirname = args.output_tag if args.output_tag else default_tag
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,

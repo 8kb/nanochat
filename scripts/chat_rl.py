@@ -17,6 +17,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
 import argparse
+import dataclasses
+import json
 import os
 import itertools
 import wandb
@@ -25,8 +27,14 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
-from modelcore import ModelManager, OptimizerHparams
+from nanochat.architectures.adapters import expand_adapters_for_config
+from modelcore import AdapterSpec, ModelManager, OptimizerHparams
 from benchcore import GSM8K
+
+# NOTE on --adapters here specifically: chat_rl.py has not been exercised in a long time (see
+# TODO.md/docs/roadmap.md) and may already be broken independent of PEFT. --adapters is wired the
+# same way as scripts/chat_sft.py's for consistency, but is NOT part of this feature's test
+# coverage or acceptance criteria -- treat it as unverified.
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -54,6 +62,10 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
+# PEFT (unverified on this path -- see the NOTE above): same JSON shape as scripts/chat_sft.py's --adapters
+parser.add_argument("--adapters", type=str, default=None, help="JSON object (inline, or a path to a .json file) -- see scripts/chat_sft.py's --adapters help for the full shape")
+parser.add_argument("--adapter-lr", type=float, default=None, help="learning rate for adapter (LoRA/DoRA A/B) params -- default: modelcore.OptimizerHparams.adapter_lr")
+parser.add_argument("--adapter-scalar-lr", type=float, default=None, help="learning rate for DoRA's per-channel magnitude param -- default: modelcore.OptimizerHparams.adapter_scalar_lr")
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
@@ -73,6 +85,22 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+
+# Attach adapters (LoRA/DoRA), if requested -- see scripts/chat_sft.py's identical block for what
+# this does; unverified here (see the NOTE at the top of this file).
+if args.adapters:
+    request = json.loads(open(args.adapters, "r", encoding="utf-8").read()) if os.path.isfile(args.adapters) else json.loads(args.adapters)
+    if "adapters" in request:
+        new_adapters = [AdapterSpec.from_dict(a) for a in request["adapters"]]
+        new_frozen = list(request.get("frozen", []))
+    else:
+        new_adapters, new_frozen = expand_adapters_for_config(model.config, request)
+    adapted_config = dataclasses.replace(model.config, adapters=new_adapters, frozen=new_frozen)
+    model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step,
+                                         config_override=adapted_config)
+    print0(f"Attached {len(new_adapters)} adapter(s) ({sorted({a.name for a in new_adapters})}); "
+           f"{len(new_frozen)} subtree(s) frozen ({new_frozen})")
+
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -196,12 +224,17 @@ def run_gsm8k_eval(task, tokenizer, engine,
 
 # Init the optimizer
 manager = ModelManager()
-optimizer = manager.create_optimizer(model, OptimizerHparams(
+optimizer_hparams = dict(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
-))
+)
+if args.adapter_lr is not None:
+    optimizer_hparams["adapter_lr"] = args.adapter_lr
+if args.adapter_scalar_lr is not None:
+    optimizer_hparams["adapter_scalar_lr"] = args.adapter_scalar_lr
+optimizer = manager.create_optimizer(model, OptimizerHparams(**optimizer_hparams))
 
 # Set the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:

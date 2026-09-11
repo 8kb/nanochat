@@ -32,9 +32,13 @@ import json as json_module
 import argparse
 import contextlib
 
+import torch
+
 from modelcore import ModelManager
+from modelcore.model import Model
 
 from nanochat.architectures import legacy, presets
+from nanochat.architectures.adapters import list_linear_targets
 from nanochat.common import get_peak_flops, get_base_dir
 from nanochat.scaling import derive_training_plan
 from nanochat.checkpoint_manager import find_last_step, arch_of
@@ -170,17 +174,66 @@ def list_checkpoint_tags(explicit):
     return sorted(t for t in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, t)))
 
 
+def _read_checkpoint_meta(tag):
+    """Just meta.json, no weights -- shared by inspect_checkpoint and the --list-targets/
+    --list-adapters PEFT reporting below, all of which only ever need the config."""
+    checkpoint_dir = os.path.join(get_base_dir(), "base_checkpoints", tag)
+    step = find_last_step(checkpoint_dir)
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json_module.load(f), step
+
+
+def _checkpoint_model_config(tag):
+    meta, _ = _read_checkpoint_meta(tag)
+    return legacy.migrate_config(meta["model_config"])
+
+
+def _meta_model(config):
+    """A meta-device Model (shapes/dtypes only, no real weights, no init_weights() -- adapter
+    targets/inventory are purely structural) -- same pattern modelcore.config.validate's
+    _validate_adapters and ModelManager.stats use for adapter-shaped questions that don't need
+    real weight values."""
+    with torch.device("meta"):
+        return Model(config)
+
+
+def report_list_targets(tag):
+    """--list-targets: every module FQN this checkpoint's model could attach an adapter to --
+    what a caller hand-editing a config needs before it can write a real AdapterSpec.target."""
+    from modelcore.peft import find_adapters
+    model = _meta_model(_checkpoint_model_config(tag))
+    adapted = {fqn for fqn, _ in find_adapters(model)}
+    print(f"Adaptable Linear targets for {tag!r}:")
+    for fqn in list_linear_targets(model):
+        print(f"  {fqn}" + ("  (has adapter)" if fqn in adapted else ""))
+
+
+def report_list_adapters(tag):
+    """--list-adapters: this checkpoint's current adapter inventory -- name, target, type,
+    enabled/disabled, param count -- read straight from its meta.json's model_config, no weights
+    loaded."""
+    model = _meta_model(_checkpoint_model_config(tag))
+    from modelcore.peft import find_adapters
+    targets = find_adapters(model)
+    if not targets:
+        print(f"{tag!r} has no adapters.")
+        return
+    print(f"Adapters on {tag!r}:")
+    for fqn, module in targets:
+        for name, delta in module.deltas.items():
+            n_params = sum(p.numel() for p in delta.parameters())
+            status = "enabled" if module.enabled[name] else "disabled"
+            print(f"  {fqn:42s} name={name!r:14s} type={type(delta).__name__:12s} {status:8s} params={n_params:,}")
+
+
 def inspect_checkpoint(tag, args, local_fingerprint):
     """Checkpoint mode: a model that has actually been trained -- read only its meta.json (no
     weights loaded, so this stays instant and GPU-free) and report the same static block as config
     mode, reconstructed from the checkpoint's own saved model_config (not from --arch/--depth,
     and migrated first if it predates modelcore -- see nanochat.architectures.legacy), plus what
     training actually produced."""
-    checkpoint_dir = os.path.join(get_base_dir(), "base_checkpoints", tag)
-    step = find_last_step(checkpoint_dir)
-    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json_module.load(f)
+    meta, step = _read_checkpoint_meta(tag)
 
     raw_config = meta["model_config"]
     config = legacy.migrate_config(raw_config)
@@ -259,6 +312,10 @@ def main():
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--mfu", type=float, default=0.4, help="assumed model FLOPs utilization for the GPU-hours estimate")
     parser.add_argument("--kv-batch-size", type=int, default=1, help="batch size for the reported total KV-cache MB")
+    parser.add_argument("--list-targets", type=str, default=None, metavar="TAG",
+                         help="print every adaptable Linear FQN for a trained checkpoint (reads only meta.json, no weights loaded), then exit -- what a hand-written AdapterSpec.target must name")
+    parser.add_argument("--list-adapters", type=str, default=None, metavar="TAG",
+                         help="print the adapter inventory (name, target, type, enabled, param count) for a trained checkpoint, then exit")
     parser.add_argument("--checkpoints", type=str, nargs="?", const="", default=None,
                          help="inspect already-trained checkpoints instead of hypothetical configs: comma-separated "
                               "model tags, or bare --checkpoints for every tag under base_checkpoints/ (--arch/--depth "
@@ -266,6 +323,13 @@ def main():
                               "checkpoint's own saved config)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+
+    if args.list_targets is not None:
+        report_list_targets(args.list_targets)
+        return
+    if args.list_adapters is not None:
+        report_list_adapters(args.list_adapters)
+        return
 
     if args.dump_config:
         archs = [a.strip() for a in args.arch.split(",")]
