@@ -40,7 +40,7 @@ for picking matched configs before spending GPU-hours. We still track upstream â
 [`docs/upstream-sync.md`](docs/upstream-sync.md) for where every piece of `gpt.py` ended up and how
 to merge a new upstream commit.
 
-## Setup (this fork's dev machine: Apple Silicon, no CUDA)
+## Setup
 
 ```bash
 uv sync --extra cpu --group dev
