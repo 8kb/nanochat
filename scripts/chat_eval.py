@@ -10,7 +10,7 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 
 import argparse
 
-from benchcore import ARC, GSM8K, MMLU, ALL_CHAT_TASKS, HumanEval, BenchManager, chatcore_metric
+from benchcore import ALL_CHAT_TASKS, BenchManager, build_chat_tasks, chatcore_metric
 
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
@@ -41,20 +41,13 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     cache_dir = get_base_dir()
-    task_builders = {
-        'ARC-Easy': lambda: ARC(subset="ARC-Easy", split="test", cache_dir=cache_dir),
-        'ARC-Challenge': lambda: ARC(subset="ARC-Challenge", split="test", cache_dir=cache_dir),
-        'MMLU': lambda: MMLU(subset="all", split="test", cache_dir=cache_dir),
-        'GSM8K': lambda: GSM8K(subset="main", split="test", cache_dir=cache_dir),
-        'HumanEval': lambda: HumanEval(cache_dir=cache_dir),
-    }
-    task_names = list(ALL_CHAT_TASKS) if args.task_name is None else args.task_name.split('|')
+    task_names = None if args.task_name is None else args.task_name.split('|')
+    tasks = build_chat_tasks(task_names, cache_dir=cache_dir)
 
     # Run all the task evaluations sequentially
     manager = BenchManager()
     results = {}
-    for task_name in task_names:
-        task = task_builders[task_name]()
+    for task_name, task in tasks.items():
         acc = manager.chat(
             task, model, tokenizer, generator=engine,
             batch_size=args.batch_size,

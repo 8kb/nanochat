@@ -16,6 +16,7 @@ import torch
 
 from modelcore import ModelManager
 from modelcore.store import FileSystemStore
+from modelcore.store import last_step as _last_step
 
 from nanochat.architectures import legacy
 from nanochat.common import get_base_dir
@@ -39,18 +40,12 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         store.write_model_state(model_data)
         logger.info(f"Saved model parameters to: {os.path.join(checkpoint_dir, f'model_{step:06d}.pt')}")
         # meta_data bundles modelcore's "model_config" key alongside nanochat's own sibling keys
-        # (val_bpb, user_config, dataloader_state, ...) in one dict -- write nanochat's keys
-        # directly (naming/training-loop policy, which this module owns), then let write_config
-        # own the model_config key specifically, so a save always goes through the same code
-        # ModelManager.save_model does.
+        # (val_bpb, user_config, dataloader_state, ...) in one dict -- update_meta (the read-merge-
+        # write mechanism, moved to modelcore.store since tinylab hand-rolled an identical copy)
+        # owns nanochat's own keys, and write_config (unchanged) owns "model_config" specifically,
+        # so a save always goes through the same code ModelManager.save_model does.
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        existing = {}
-        if os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        existing.update({k: v for k, v in meta_data.items() if k != "model_config"})
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
+        store.update_meta(meta_data)
         if "model_config" in meta_data:
             store.write_config(meta_data["model_config"])
         logger.info(f"Saved metadata to: {meta_path}")
@@ -186,12 +181,10 @@ def find_largest_model(checkpoints_dir, arch=None):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.search(r'model_(\d+)\.pt$', f)]
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = max(int(f.split("_")[-1].split(".")[0]) for f in checkpoint_files)
-    return last_step
+    # Naming mechanics (the model_<step>.pt scan) moved to modelcore.store.last_step, since
+    # tinylab hand-rolled an identical copy; kept as its own function name here since call sites
+    # already import it from this module.
+    return _last_step(checkpoint_dir)
 
 
 def arch_of(model_config: dict) -> str:

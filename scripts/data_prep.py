@@ -26,7 +26,7 @@ import time
 
 import numpy as np
 
-from datacore import BestFitCropPacker, BestFitPadPacker, DataManager, EncodedDoc, FileSystemDatasetStore, ParquetDirectorySource
+from datacore import BestFitCropPacker, BestFitPadPacker, DataManager, ExampleTokenSource, FileSystemDatasetStore, ParquetDirectorySource
 
 from nanochat.common import get_base_dir, print0
 from nanochat.dataset import list_parquet_files
@@ -82,31 +82,12 @@ def prepare_base(args, tokenizer):
 
 # -----------------------------------------------------------------------------
 # --kind=sft: the SFT task mixture
-
-class TaskMixtureTokenSource:
-    """Adapts a datacore.ExampleMixture into datacore's own TokenSource protocol: each
-    conversation is rendered via RustBPETokenizer.render_conversation (ids + per-token loss mask)
-    here, in chunks, so DataManager.prepare gets a volume flush boundary every `chunk_size`
-    conversations rather than one giant flush at the very end."""
-
-    def __init__(self, task_mixture, tokenizer, name, max_tokens=2048, chunk_size=2000):
-        self.task_mixture = task_mixture
-        self.tokenizer = tokenizer
-        self.name = name
-        self.max_tokens = max_tokens
-        self.chunk_size = chunk_size
-        self.num_dropped_over_max_tokens = 0
-
-    def token_batches(self):
-        n = len(self.task_mixture)
-        for start in range(0, n, self.chunk_size):
-            end = min(start + self.chunk_size, n)
-            docs = []
-            for i in range(start, end):
-                conversation = self.task_mixture[i]
-                ids, mask = self.tokenizer.render_conversation(conversation, max_tokens=self.max_tokens)
-                docs.append(EncodedDoc(ids=ids, mask=mask))
-            yield f"{self.name}[{start}:{end}]", docs
+#
+# The ExampleMixture -> TokenSource adapter (chunked so DataManager.prepare gets a volume flush
+# boundary every 2000 conversations rather than one giant flush at the end) now lives in
+# datacore.ExampleTokenSource -- tinylab carried an identical copy of it. See prepare_sft's own
+# `render=` lambda below for the one thing that actually varies: which render call turns a
+# conversation into (ids, mask).
 
 
 def _build_sft_mixtures(args):
@@ -115,32 +96,22 @@ def _build_sft_mixtures(args):
     from nanochat.sft_data import SmolTalk
 
     cache_dir = get_base_dir()
+    # max_conversations (smoke tests) caps both mixtures via ExampleMixture's own stop= kwarg --
+    # __len__ clamps stop to each mixture's true length itself, so passing it straight through for
+    # val_mixture (whose true length may be smaller than max_conversations) needs no separate
+    # min(args.max_conversations, len(val_mixture)) either -- see datacore.records.ExampleSet.
     train_tasks = [
         SmolTalk(split="train"),
         *[MMLU(subset="all", split="auxiliary_train", cache_dir=cache_dir) for _ in range(args.mmlu_epochs)],
         *[GSM8K(subset="main", split="train", cache_dir=cache_dir) for _ in range(args.gsm8k_epochs)],
     ]
-    train_mixture = ExampleMixture(train_tasks)
+    train_mixture = ExampleMixture(train_tasks, stop=args.max_conversations)
     val_mixture = ExampleMixture([
         SmolTalk(split="test"),
         MMLU(subset="all", split="test", cache_dir=cache_dir, stop=5200),
         GSM8K(subset="main", split="test", cache_dir=cache_dir, stop=420),
-    ])
-    if args.max_conversations is not None:
-        train_mixture = _Truncated(train_mixture, args.max_conversations)
-        val_mixture = _Truncated(val_mixture, min(args.max_conversations, len(val_mixture)))
+    ], stop=args.max_conversations)
     return train_mixture, val_mixture
-
-
-class _Truncated:
-    """Caps an ExampleSet/ExampleMixture's apparent length for smoke tests, without touching datacore."""
-    def __init__(self, task, limit):
-        self.task = task
-        self.limit = min(limit, len(task))
-    def __len__(self):
-        return self.limit
-    def __getitem__(self, index):
-        return self.task[index]
 
 
 def prepare_sft(args, tokenizer):
@@ -154,9 +125,10 @@ def prepare_sft(args, tokenizer):
           f"(MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}), {len(val_mixture):,} val -> {dataset_dir}")
 
     bos_id = tokenizer.get_bos_token_id()
+    render = lambda conversation: tokenizer.render_conversation(conversation, max_tokens=args.max_tokens_per_conversation)
     sources = {
-        "train": TaskMixtureTokenSource(train_mixture, tokenizer, "train", max_tokens=args.max_tokens_per_conversation),
-        "val": TaskMixtureTokenSource(val_mixture, tokenizer, "val", max_tokens=args.max_tokens_per_conversation),
+        "train": ExampleTokenSource(train_mixture, render, "train"),
+        "val": ExampleTokenSource(val_mixture, render, "val"),
     }
     packer = BestFitPadPacker(bos_token_id=bos_id, padding_id=args.sft_padding_id, buffer_size=args.buffer_size)
     t0 = time.time()

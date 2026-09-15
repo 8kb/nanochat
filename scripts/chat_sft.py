@@ -18,7 +18,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
-from datacore import DataManager, FileSystemDatasetStore
+from datacore import DataManager, DatasetMismatch, FileSystemDatasetStore
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, arch_of
 import torch.distributed as dist
@@ -28,7 +28,7 @@ from nanochat.architectures import legacy
 from nanochat.architectures.adapters import expand_adapters_for_config
 from modelcore import AdapterSpec, ModelManager, OptimizerHparams
 from modelcore.kernels.flash_attn import build_doc_args
-from benchcore import ARC, GSM8K, MMLU, ALL_CHAT_TASKS, CATEGORICAL_CHAT_TASKS, HumanEval, BenchManager, chatcore_metric
+from benchcore import CATEGORICAL_CHAT_TASKS, BenchManager, build_chat_tasks, chatcore_metric
 from scripts.data_prep import default_dataset_name, prepared_dir
 
 # -----------------------------------------------------------------------------
@@ -245,23 +245,23 @@ dataset_name = args.dataset or default_dataset_name("sft", args.max_seq_len, tok
 data_store = FileSystemDatasetStore(prepared_dir(dataset_name))
 data_manager = DataManager()
 try:
-    dataset = data_manager.open(data_store)
+    dataset = data_manager.open(data_store, expect_sequence_len=args.max_seq_len, expect_fingerprint=tokenizer.fingerprint())
 except FileNotFoundError:
     raise SystemExit(
         f"No prepared SFT dataset found for {dataset_name!r}.\nPrepare one first (CPU-only):\n"
         f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
     )
-if dataset.info.sequence_len != args.max_seq_len:
-    raise SystemExit(
-        f"Dataset {dataset_name!r} was prepared with sequence_len={dataset.info.sequence_len}, "
-        f"but --max-seq-len={args.max_seq_len}. Re-prepare it:\n"
-        f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
-    )
-if dataset.info.tokenizer_fingerprint != tokenizer.fingerprint():
+except DatasetMismatch as e:
+    if e.reason == "sequence_len":
+        raise SystemExit(
+            f"Dataset {dataset_name!r} was prepared with sequence_len={e.actual}, "
+            f"but --max-seq-len={e.expected}. Re-prepare it:\n"
+            f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+        )
     raise SystemExit(
         f"Dataset {dataset_name!r} was prepared against tokenizer fingerprint "
-        f"{dataset.info.tokenizer_fingerprint}, but the local tokenizer's fingerprint is "
-        f"{tokenizer.fingerprint()}. Re-prepare against the current tokenizer:\n"
+        f"{e.actual}, but the local tokenizer's fingerprint is "
+        f"{e.expected}. Re-prepare against the current tokenizer:\n"
         f"  python -m scripts.data_prep --kind=sft --dataset={dataset_name} --sequence-len={args.max_seq_len}"
     )
 print0(f"Dataset: {dataset_name} ({dataset.num_sequences('train'):,} train / "
@@ -363,19 +363,12 @@ while True:
         model.eval()
         engine = Engine(orig_model, tokenizer)
         cache_dir = get_base_dir()
-        task_builders = {
-            'ARC-Easy': lambda: ARC(subset="ARC-Easy", split="test", cache_dir=cache_dir),
-            'ARC-Challenge': lambda: ARC(subset="ARC-Challenge", split="test", cache_dir=cache_dir),
-            'MMLU': lambda: MMLU(subset="all", split="test", cache_dir=cache_dir),
-            'GSM8K': lambda: GSM8K(subset="main", split="test", cache_dir=cache_dir),
-            'HumanEval': lambda: HumanEval(cache_dir=cache_dir),
-        }
+        tasks = build_chat_tasks(cache_dir=cache_dir)
         bench_manager = BenchManager()
         task_results = {}
-        for task_name in ALL_CHAT_TASKS:
+        for task_name, task in tasks.items():
             limit = args.chatcore_max_cat if task_name in CATEGORICAL_CHAT_TASKS else args.chatcore_max_sample
             max_problems = None if limit < 0 else limit  # -1 means no limit
-            task = task_builders[task_name]()
             acc = bench_manager.chat(task, orig_model, tokenizer, generator=engine,
                                       batch_size=args.device_batch_size, max_problems=max_problems,
                                       rank=ddp_rank, world_size=ddp_world_size)

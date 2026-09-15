@@ -11,6 +11,7 @@ import json
 import os
 
 from modelcore import ComponentSpec, ModelConfig
+from modelcore import resolve_reference_config as _resolve_reference_config
 
 from nanochat.architectures.derive import (
     compute_kv_slots, compute_window_sizes, gpt_lambda_schedule, has_value_embed, mup_dims,
@@ -134,9 +135,17 @@ def resolve_reference_config(resolved_config: ModelConfig, ref_depth: int) -> Mo
     JSON file) to `resolved_config`. expand() always stamps a `reference` block on its output, so
     this works uniformly regardless of which source resolve_model_config used -- a JSON file with
     no `reference` block (e.g. one written by hand rather than dumped from a preset) is the only
-    case this can't handle; the caller should fall back to --d-ref-scaling-params instead."""
-    assert resolved_config.reference is not None, (
-        f"config has no 'reference' block, so its muP scaling-law reference model can't be "
-        f"re-derived automatically at depth {ref_depth}; pass --d-ref-scaling-params instead"
-    )
-    return expand(resolved_config.reference["preset"], ref_depth, **resolved_config.reference["kwargs"])
+    case this can't handle; the caller should fall back to --d-ref-scaling-params instead.
+
+    Mechanism (re-expanding config.reference via `expand`) now lives in modelcore.config.spec --
+    tinylab carried an identical copy of this exact function. This wrapper exists only to (a) keep
+    this module's existing `presets.resolve_reference_config(config, depth)` call signature and
+    error message, and (b) supply modelcore with *this* repo's own `expand`, since modelcore knows
+    nothing about what presets exist."""
+    try:
+        return _resolve_reference_config(resolved_config, ref_depth, expand)
+    except AssertionError:
+        raise AssertionError(
+            f"config has no 'reference' block, so its muP scaling-law reference model can't be "
+            f"re-derived automatically at depth {ref_depth}; pass --d-ref-scaling-params instead"
+        )

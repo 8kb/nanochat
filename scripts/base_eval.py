@@ -21,7 +21,7 @@ import time
 import argparse
 import torch
 
-from datacore import DataManager, FileSystemDatasetStore
+from datacore import DataManager, DatasetMismatch, FileSystemDatasetStore
 from modelcore import ModelManager
 from benchcore import BenchManager, center, load_core_suite
 
@@ -37,10 +37,12 @@ from scripts.data_prep import default_dataset_name, prepared_dir
 
 def evaluate_core(model, tokenizer, device, max_per_task=-1, rank=0, world_size=1):
     """Evaluate a base model on the CORE benchmark. Returns a dict with results,
-    centered_results, and core_metric -- the same shape base_train.py has always expected."""
-    suite = load_core_suite(get_base_dir(), max_per_task=max_per_task)
+    centered_results, and core_metric -- the same shape base_train.py has always expected.
+    load_core_suite(cache_dir) + BenchManager.core(...) is now BenchManager.core_suite in one call
+    (tinylab carried an identical copy of exactly this two-line wrapper)."""
     bench_manager = BenchManager()
-    report = bench_manager.core(model, tokenizer, suite, device=device, rank=rank, world_size=world_size)
+    report = bench_manager.core_suite(model, tokenizer, cache_dir=get_base_dir(), max_per_task=max_per_task,
+                                       device=device, rank=rank, world_size=world_size)
     return {"results": report.results, "centered_results": report.centered_results, "core_metric": report.core_metric}
 
 # -----------------------------------------------------------------------------
@@ -135,16 +137,16 @@ def main():
         data_store = FileSystemDatasetStore(prepared_dir(dataset_name))
         data_manager = DataManager()
         try:
-            dataset = data_manager.open(data_store)
+            dataset = data_manager.open(data_store, expect_sequence_len=sequence_len)
         except FileNotFoundError:
             raise SystemExit(
                 f"No prepared dataset found for {dataset_name!r}. Run:\n"
                 f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={sequence_len}"
             )
-        if dataset.info.sequence_len != sequence_len:
+        except DatasetMismatch as e:
             raise SystemExit(
-                f"Dataset {dataset_name!r} has sequence_len={dataset.info.sequence_len}, but this "
-                f"checkpoint's model was trained at sequence_len={sequence_len}. Re-prepare it:\n"
+                f"Dataset {dataset_name!r} has sequence_len={e.actual}, but this "
+                f"checkpoint's model was trained at sequence_len={e.expected}. Re-prepare it:\n"
                 f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={sequence_len}"
             )
         token_bytes = data_manager.token_bytes(dataset)

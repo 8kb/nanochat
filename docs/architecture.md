@@ -65,12 +65,13 @@ for the full contract. `nanochat`'s job is producing the dataset (once, offline,
 this fork's checkpoint conventions:
 
 ```python
-from datacore import DataManager, FileSystemDatasetStore
+from datacore import DataManager, DatasetMismatch, FileSystemDatasetStore
 manager = DataManager()
-dataset = manager.open(FileSystemDatasetStore(dataset_dir))   # raises FileNotFoundError if unprepared
-
-assert dataset.info.sequence_len == args.max_seq_len            # hard error otherwise, not a warning
-assert dataset.info.tokenizer_fingerprint == tokenizer.fingerprint()
+# raises FileNotFoundError if unprepared, DatasetMismatch if either expectation disagrees with
+# what's actually on disk -- a hard error either way, not a warning (this repo's own remediation
+# text goes in the except blocks; datacore itself never decides *to* compare, see its AGENTS.md)
+dataset = manager.open(FileSystemDatasetStore(dataset_dir), expect_sequence_len=args.max_seq_len,
+                        expect_fingerprint=tokenizer.fingerprint())
 
 for inputs, targets, state in manager.batches(dataset, "train", args.device_batch_size,
                                                device=device, rank=ddp_rank, world_size=ddp_world_size,
@@ -81,7 +82,9 @@ for inputs, targets, state in manager.batches(dataset, "train", args.device_batc
 `scripts/data_prep.py` is the preparation entrypoint (`--kind=base` for the pretraining corpus via
 `nanochat.dataset`'s ClimbMix identity, `--kind=sft` for the SFT mixture -- `datacore.ExampleMixture`
 of `benchcore.MMLU`/`GSM8K` and `nanochat.sft_data.SmolTalk` -- rendered through
-`RustBPETokenizer.render_conversation`) — see its own docstring and
+`RustBPETokenizer.render_conversation` and adapted to datacore's `TokenSource` protocol via
+`datacore.ExampleTokenSource(mixture, render=..., name=...)`, replacing this module's own
+`TaskMixtureTokenSource` -- tinylab carried an identical copy) — see its own docstring and
 [datacore/docs/architecture.md](https://github.com/8kb/datacore/blob/main/docs/architecture.md) for the on-disk format, the
 cursor-based resumable read order, and why `sequence_len`/tokenizer fingerprint mismatches raise
 rather than warn. `nanochat/dataset.py` keeps only the corpus *identity* (`BASE_URL`, `MAX_SHARD`,
@@ -98,7 +101,10 @@ than `datacore.sources.ParquetDirectorySource`'s one-batch-per-file boundary.
 ...) — and hands the actual model/optimizer bytes to `modelcore` through an `ArtifactStore`:
 
 - `save_checkpoint`/`load_checkpoint` go through `modelcore.store.FileSystemStore` instead of raw
-  `torch.save`/`torch.load`.
+  `torch.save`/`torch.load`. The `meta.json` read-merge-write for this repo's own sibling keys and
+  `find_last_step`'s `model_<step>.pt` scan now delegate to `FileSystemStore.update_meta`/
+  `modelcore.store.last_step` (tinylab carried an identical copy of both) -- naming policy (which
+  directory, which tag, `arch_of`/`find_largest_model`) stays here.
 - `build_model` is `manager.load_model(LegacyCheckpointStore(...), device=..., train=...)`, where
   `LegacyCheckpointStore(FileSystemStore)` overrides `read_config`/`read_model_state` to run an old
   checkpoint through `nanochat.architectures.legacy.migrate_checkpoint` on first read (memoized) —
@@ -110,15 +116,20 @@ than `datacore.sources.ParquetDirectorySource`'s one-batch-per-file boundary.
 On-disk layout and file names are unchanged from before Stage 7 — this is naming/metadata policy
 layered on top of `modelcore`'s artifact format, not a different format.
 
-## `nanochat.engine`: `Engine` on top of `Decoder`
+## `nanochat.engine`: `Engine` on top of `generate_with_tools`
 
-`nanochat/engine.py` keeps everything tokenizer/tool-use-shaped: `RowState`, the calculator
-sandbox (`use_calculator`), and the hardcoded chat special tokens
-(`<|python_start|>`/`<|assistant_end|>`/...). `Engine.generate` drives a
-`modelcore.generate.Decoder` (via `self.manager.new_decoder(...)`) for the actual prefill/KV-cache/
-model-stepping — `Engine` never allocates or clones a `KVCache` itself anymore.
-`sample_next_token`/`generate_naive`/`KVCache` are re-exported from `modelcore` for existing
-`from nanochat.engine import ...` call sites.
+The tool-use decode loop itself (`RowState`, the forced-token deque, terminal-token detection, the
+tool start/end state machine) now lives in `modelcore.generate.generate_with_tools`/`collect_batch`
+(tinylab carried an identical copy of this whole file's `generate`/`generate_batch`) — see
+modelcore's own `docs/architecture.md`. `nanochat/engine.py` keeps everything actually specific to
+this repo's chat format: the calculator sandbox (`use_calculator`), resolving the hardcoded chat
+special tokens (`<|python_start|>`/`<|assistant_end|>`/...) to ids, and building the single
+`modelcore.generate.ToolSpec` (`start_id`/`end_id`/`result_start_id`/`result_end_id`, `run=`
+`Engine._run_calculator` — decode captured ids, call `use_calculator`, re-encode the result)
+`generate_with_tools` is driven by. `Engine.generate`/`generate_batch`'s own signatures are
+unchanged, so `benchcore.protocols.Generator` still resolves against `Engine` unmodified.
+`sample_next_token`/`generate_naive`/`Decoder`/`KVCache` are re-exported from `modelcore` for
+existing `from nanochat.engine import ...` call sites.
 
 ## `nanochat/architectures/`: presets and legacy migration
 
@@ -138,7 +149,11 @@ and `legacy.py` (reading them straight off a stored checkpoint's fields) share o
 of "how do I build the tree", differing only in "where do the numbers come from".
 `resolve_model_config(model_config, depth, ...)` dispatches a `--model-config` value between a
 registered preset name and a path to a materialized JSON tree; `resolve_reference_config` re-
-derives the muP d12 scaling-law reference model from a resolved config's own `reference` block.
+derives the muP d12 scaling-law reference model from a resolved config's own `reference` block --
+the mechanism (re-expanding `config.reference` via a caller-supplied `expand`) now lives in
+`modelcore.config.spec.resolve_reference_config` (tinylab carried an identical copy); this module's
+own `resolve_reference_config` is a thin wrapper supplying *this* repo's own `expand` and error
+message.
 
 **`legacy.py`** — `migrate_checkpoint(config_dict, model_data, log=...) -> (ModelConfig, dict)` and
 the separate `migrate_optimizer_state(...)` (optimizer state loads independently of model state,

@@ -8,16 +8,30 @@ Everything works around token sequences:
 Notes:
 - The engine knows nothing about tokenization, it's purely token id sequences.
 
-The whole thing is made as efficient as possible.
+The tool-use decode loop itself (RowState, the forced-token deque, terminal-token detection, the
+tool start/end state machine) now lives in modelcore.generate.generate_with_tools/collect_batch --
+tinylab carried an identical copy of this whole file's generate()/generate_batch(). What stays here
+is everything actually specific to *this* tool and *this* chat format: use_calculator (the eval()
+sandbox), and resolving this repo's own special-token names to ids for the ToolSpec/terminal_ids
+generate_with_tools takes.
 """
 
-import torch
 import signal
 import warnings
 from contextlib import contextmanager
-from collections import deque
+
+import torch
 from modelcore import ModelManager
+from modelcore.generate import ToolSpec, collect_batch, generate_with_tools
+
+# -----------------------------------------------------------------------------
+# sample_next_token/generate_naive/Decoder live in modelcore.generate -- pure token-id math with
+# no tokenizer or nanochat dependency (Stage 8, see docs/roadmap.md). Re-exported here so
+# `from nanochat.engine import ...` call sites keep working unchanged; KVCache is imported only for
+# that same reason -- Engine itself now only ever touches it through Decoder.
 from modelcore.generate import Decoder, generate_naive, sample_next_token  # noqa: F401 -- re-exported below
+from modelcore.cache import KVCache  # noqa: F401 -- re-exported for existing call sites
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -78,21 +92,6 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
-# sample_next_token/generate_naive/Decoder now live in modelcore.generate -- pure token-id math
-# with no tokenizer or nanochat dependency (Stage 8, see docs/roadmap.md). Imported above and
-# re-exported here so `from nanochat.engine import ...` call sites keep working unchanged; KVCache
-# is imported only for that same reason -- Engine itself now only ever touches it through Decoder.
-from modelcore.cache import KVCache  # noqa: F401 -- re-exported for existing call sites
-# -----------------------------------------------------------------------------
-
-class RowState:
-    # Per-row state tracking during generation
-    def __init__(self, current_tokens=None):
-        self.current_tokens = current_tokens or [] # Current token sequence for this row
-        self.forced_tokens = deque() # Queue of tokens to force inject
-        self.in_python_block = False # Whether we are inside a python block
-        self.python_expr_tokens = [] # Tokens of the current python expression
-        self.completed = False # Whether this row has completed generation
 
 class Engine:
 
@@ -101,13 +100,19 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
         self.manager = manager or ModelManager() # owns KV-cache allocation (model.kv_cache_spec() is not part of Model's public surface -- see modelcore/model.py)
 
-    @torch.inference_mode()
+    def _run_calculator(self, captured_tokens):
+        """ToolSpec.run for the python_start/python_end tool: decode the captured tokens, hand
+        the resulting expression to use_calculator, re-encode the result (or return None -- wrong
+        calculator usage is not fatal, generate_with_tools injects nothing in that case)."""
+        expr = self.tokenizer.decode(captured_tokens)
+        result = use_calculator(expr)
+        if result is None:
+            return None
+        return self.tokenizer.encode(str(result))
+
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
-        device = self.model.get_device()
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
@@ -118,66 +123,12 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # Prefill the prompt once, then decode from an num_samples-row KV cache -- both owned by
-        # modelcore.generate.Decoder (see ModelManager.new_decoder); this method only ever reads
-        # .logits and calls .step(), it never touches a KV cache directly.
-        decoder = self.manager.new_decoder(self.model, tokens, num_samples=num_samples, max_tokens=max_tokens, device=device)
-
-        # Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
-
-        # Main generation loop
-        num_generated = 0
-        while True:
-            # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
-                break
-            # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
-                break
-
-            # Sample the next token for each row
-            next_ids = sample_next_token(decoder.logits, rng, temperature, top_k)  # (B, 1)
-            sampled_tokens = next_ids[:, 0].tolist()
-
-            # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
-            for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
-
-            # Yield the token column
-            yield token_column, token_masks
-            num_generated += 1
-
-            # Prepare logits for next iteration
-            decoder.step(token_column)
+        tool = ToolSpec(python_start, python_end, output_start, output_end, run=self._run_calculator)
+        yield from generate_with_tools(
+            self.model, self.manager, tokens, num_samples=num_samples, max_tokens=max_tokens,
+            temperature=temperature, top_k=top_k, seed=seed,
+            terminal_ids={assistant_end, bos}, tools=[tool],
+        )
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
@@ -187,21 +138,8 @@ class Engine:
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
-        completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
-            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-                if not completed[i]:
-                    if token == assistant_end or token == bos:
-                        completed[i] = True
-                    else:
-                        results[i].append(token)
-                        masks[i].append(mask)
-            # Stop if all rows are completed
-            if all(completed):
-                break
-        return results, masks
+        stream = self.generate(tokens, num_samples, **kwargs)
+        return collect_batch(stream, {assistant_end, bos}, tokens, num_samples)
 
 
 if __name__ == "__main__":

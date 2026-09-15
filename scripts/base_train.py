@@ -25,8 +25,9 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from datacore import DataManager, FileSystemDatasetStore
+from datacore import DataManager, DatasetMismatch, FileSystemDatasetStore
 from modelcore import AdapterSpec, Model, ModelManager, OptimizerHparams
+from modelcore.optim.schedules import lr_multiplier, muon_momentum
 from nanochat.architectures import presets
 from nanochat.architectures.adapters import expand_adapters_for_config
 from nanochat.scaling import derive_training_plan, B_REF
@@ -154,24 +155,28 @@ dataset_dir = prepared_dir(dataset_name)
 data_manager = DataManager()
 data_store = FileSystemDatasetStore(dataset_dir)
 try:
-    dataset = data_manager.open(data_store)
+    # expect_sequence_len/expect_fingerprint: the same two checks every dataset-opening call site
+    # in this repo and tinylab used to hand-write themselves, now datacore's own (opt-in) job --
+    # see datacore/AGENTS.md's "tokenizer fingerprint" invariant for why datacore itself still
+    # never decides *to* compare. Only the remediation text below stays this repo's own.
+    dataset = data_manager.open(data_store, expect_sequence_len=args.max_seq_len, expect_fingerprint=tokenizer_fingerprint)
 except FileNotFoundError:
     raise SystemExit(
         f"No prepared dataset found at {dataset_dir}.\nPrepare one first (CPU-only -- do this "
         f"before starting a GPU run):\n"
         f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
     )
-if dataset.info.sequence_len != args.max_seq_len:
-    raise SystemExit(
-        f"Dataset {dataset_name!r} was prepared with sequence_len={dataset.info.sequence_len}, "
-        f"but --max-seq-len={args.max_seq_len}. Re-prepare it at the matching length:\n"
-        f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
-    )
-if dataset.info.tokenizer_fingerprint != tokenizer_fingerprint:
+except DatasetMismatch as e:
+    if e.reason == "sequence_len":
+        raise SystemExit(
+            f"Dataset {dataset_name!r} was prepared with sequence_len={e.actual}, "
+            f"but --max-seq-len={e.expected}. Re-prepare it at the matching length:\n"
+            f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
+        )
     raise SystemExit(
         f"Dataset {dataset_name!r} was prepared against tokenizer fingerprint "
-        f"{dataset.info.tokenizer_fingerprint}, but the local tokenizer's fingerprint is "
-        f"{tokenizer_fingerprint} -- training on it would silently learn the wrong token "
+        f"{e.actual}, but the local tokenizer's fingerprint is "
+        f"{e.expected} -- training on it would silently learn the wrong token "
         f"meanings. Re-prepare against the current tokenizer:\n"
         f"  python -m scripts.data_prep --kind=base --dataset={dataset_name} --sequence-len={args.max_seq_len}"
     )
@@ -432,32 +437,15 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 
 # -----------------------------------------------------------------------------
 # Set up the LR/momentum/weight-decay schedulers (num_iterations was already derived above, via
-# nanochat.scaling.derive_training_plan, before the optimizer was built)
+# nanochat.scaling.derive_training_plan, before the optimizer was built). The LR-multiplier/Muon-
+# momentum shapes are modelcore.optim.schedules (tinylab carried an identical pair); the cosine
+# weight-decay schedule below has no tinylab equivalent and stays here.
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
-    warmup_iters = args.warmup_steps
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+    return lr_multiplier(it, num_iterations, args.warmup_steps, args.warmdown_ratio, args.final_lr_frac)
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
+    return muon_momentum(it, num_iterations, args.warmdown_ratio)
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
@@ -612,13 +600,10 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+    muon_momentum_value = get_muon_momentum(step)
+    muon_weight_decay_value = get_weight_decay(step)
+    manager.apply_schedule(optimizer, lr_mult=lrm, muon_momentum=muon_momentum_value,
+                            muon_weight_decay=muon_weight_decay_value)
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
