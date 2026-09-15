@@ -58,8 +58,8 @@ wheels = [
 
 [[package]]
 name = "benchcore"
-version = "0.1.1"
-source = { git = "https://github.com/8kb/benchcore?tag=v0.1.1#c896c3083c718ebfd1abdebcf6bc8eb8bb7935b2" }
+version = "0.2.1"
+source = { git = "https://github.com/8kb/benchcore?tag=v0.2.1#f777d1c7a7dee9606b4fda96ecf1f57f0920a558" }
 dependencies = [
     { name = "datacore", extra = ["parquet"] },
     { name = "filelock" },
@@ -444,8 +444,8 @@ wheels = [
 
 [[package]]
 name = "datacore"
-version = "0.2.1"
-source = { git = "https://github.com/8kb/datacore?tag=v0.2.1#a62f3c30f8f0d425a40560f62e139c37bf0b2d24" }
+version = "0.3.0"
+source = { git = "https://github.com/8kb/datacore?tag=v0.3.0#0c3e231784ca4e69ea09ca4d9b51f6401d7f5142" }
 dependencies = [
     { name = "filelock" },
     { name = "numpy" },
@@ -1132,8 +1132,8 @@ wheels = [
 
 [[package]]
 name = "modelcore"
-version = "0.3.0"
-source = { git = "https://github.com/8kb/modelcore?tag=v0.3.0#27c0f0827e2d95628051d7c1011034f6f9e6dc6f" }
+version = "0.4.0"
+source = { git = "https://github.com/8kb/modelcore?tag=v0.4.0#4f43a8af3e983e6f4410ec8c1c29f76f7d065d23" }
 dependencies = [
     { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu') or (extra != 'extra-8-nanochat-cpu' and extra != 'extra-8-nanochat-gpu')" },
@@ -1199,12 +1199,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "benchcore", extras = ["bundle"], git = "https://github.com/8kb/benchcore?tag=v0.1.1" },
-    { name = "datacore", extras = ["torch", "parquet"], git = "https://github.com/8kb/datacore?tag=v0.2.1" },
+    { name = "benchcore", extras = ["bundle"], git = "https://github.com/8kb/benchcore?tag=v0.2.1" },
+    { name = "datacore", extras = ["torch", "parquet"], git = "https://github.com/8kb/datacore?tag=v0.3.0" },
     { name = "filelock", specifier = ">=3.19.0" },
     { name = "hf-transfer", specifier = ">=0.1.9" },
     { name = "kernels", specifier = ">=0.11.7" },
-    { name = "modelcore", extras = ["fa3"], git = "https://github.com/8kb/modelcore?tag=v0.3.0" },
+    { name = "modelcore", extras = ["fa3"], git = "https://github.com/8kb/modelcore?tag=v0.4.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "psutil", specifier = ">=7.1.0" },
     { name = "pyarrow", specifier = ">=21.0.0" },
