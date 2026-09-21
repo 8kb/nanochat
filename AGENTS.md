@@ -140,7 +140,7 @@ These are `modelcore`'s or `datacore`'s own invariants, not this repo's — full
   `ModelManager.load_model` calls `model.init_weights()` even when *loading* a checkpoint, right
   before `load_state_dict(..., assign=True)` overwrites everything else.
 - **A checkpoint's `model_config` has no `"arch"` key any more** — `ModelConfig.to_dict()` stamps
-  `"format": "modelcore.v1"` instead, plus an optional `reference: {"preset": name, "kwargs": {...}}`
+  `"format": "modelcore.v2"` instead, plus an optional `reference: {"preset": name, "kwargs": {...}}`
   block for provenance. `nanochat.checkpoint_manager.arch_of(model_config_dict)` is the
   naming-policy helper that reads either shape: `reference.preset` (defaulting to `"custom"`) for
   a current-format config, or the legacy `"arch"` key (defaulting to `"gpt"`, for checkpoints

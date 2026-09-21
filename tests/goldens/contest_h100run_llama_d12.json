@@ -1418,84 +1418,84 @@
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 0
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 1
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 2
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 3
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 4
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 5
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 6
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 7
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 8
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 9
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 10
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 11
    }
   ],

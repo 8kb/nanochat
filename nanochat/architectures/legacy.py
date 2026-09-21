@@ -62,7 +62,10 @@ def migrate_config(config_dict: dict) -> ModelConfig:
     never looks at. Every *other* arch is a flat, per-layer-derivable config (missing "arch"
     defaults to "gpt", the only architecture old enough to predate that key too)."""
     if "format" in config_dict or config_dict.get("arch") == "composed":
-        return ModelConfig.from_dict(config_dict)  # already a materialized tree; nothing to migrate
+        # Already a materialized tree; nothing to migrate. modelcore.v2 rejects an unknown top-level
+        # key rather than dropping it, so the leftover "arch" stamp is removed here explicitly. A
+        # dict with no "format" (the composed case) is read as v1 and upgraded by modelcore.
+        return ModelConfig.from_dict({k: v for k, v in config_dict.items() if k != "arch"})
     cfg = patch_missing_config_keys(dict(config_dict))
     arch = cfg.pop("arch", "gpt")
     if arch not in _FLAT_ARCH_EXPANDERS:

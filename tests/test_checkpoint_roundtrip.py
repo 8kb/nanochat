@@ -59,7 +59,7 @@ def test_checkpoint_roundtrip_preserves_weights_and_forward_output(tmp_path, mon
 
     reloaded, tokenizer, meta = build_model(checkpoint_dir, step=0, device=torch.device("cpu"), phase="eval")
 
-    assert meta["model_config"]["format"] == "modelcore.v1"
+    assert meta["model_config"]["format"] == "modelcore.v2"
     assert reloaded.config == model.config
 
     original_state = model.state_dict()

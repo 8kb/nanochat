@@ -408,7 +408,9 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": orig_model.config.to_dict(),
+                # The chat format is a property of SFT, not of the architecture, so the base
+                # checkpoint's "base" template becomes "nanochat" here (declarative only for now).
+                "model_config": dataclasses.replace(orig_model.config, template="nanochat").to_dict(),
                 "user_config": user_config, # inputs to the training script
                 # Provenance: which base checkpoint this SFT run started from -- meta["model_tag"]
                 # is always populated by load_model_from_dir (checkpoint_manager.py), whether the

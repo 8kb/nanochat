@@ -697,10 +697,10 @@
   },
   "num_matmul_params": 204872,
   "estimate_flops": 1327536,
-  "estimate_decode_flops_256": 516240,
-  "estimate_prefill_flops_256": 125788160,
+  "estimate_decode_flops_256": 671888,
+  "estimate_prefill_flops_256": 138579968,
   "kv_bytes_per_token": 2048,
-  "kv_read_bytes_256": 212992,
+  "kv_read_bytes_256": 524288,
   "kv_cache_spec": {
    "num_heads": 2,
    "head_dim": 32,
@@ -711,28 +711,28 @@
     "n_head": 2,
     "n_kv_head": 2,
     "head_dim": 32,
-    "window": 128,
+    "window": -1,
     "kv_slot": 0
    },
    {
     "n_head": 2,
     "n_kv_head": 2,
     "head_dim": 32,
-    "window": 128,
+    "window": -1,
     "kv_slot": 1
    },
    {
     "n_head": 2,
     "n_kv_head": 2,
     "head_dim": 32,
-    "window": 128,
+    "window": -1,
     "kv_slot": 2
    },
    {
     "n_head": 2,
     "n_kv_head": 2,
     "head_dim": 32,
-    "window": 32,
+    "window": -1,
     "kv_slot": 3
    }
   ],
@@ -742,7 +742,7 @@
    "n_head": 2,
    "n_kv_head": 2,
    "sequence_len": 32,
-   "window_pattern": "mixed"
+   "window_pattern": -1
   }
  },
  "logits_hash": "b5ef1c61424dd55961487e41097637077a598da9ef2a78215811f45ff1112ace",

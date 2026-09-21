@@ -20,7 +20,8 @@ modelcore                 separate repo (github.com/8kb/modelcore), pinned git d
 
 nanochat/architectures/   everything that knows an architecture *by name*
 ├── derive.py                mup_dims, compute_window_sizes, compute_kv_slots, has_value_embed,
-│                             gpt_lambda_schedule -- the depth-dial derivation rules
+│                             gpt_lambda_schedule, gpt_ffn_hidden, llama_ffn_hidden -- the
+│                             depth-dial derivation rules
 ├── presets.py                expand(name, depth, ...) -> ModelConfig; assemble_gpt/assemble_plain
 └── legacy.py                 migrate_checkpoint/migrate_optimizer_state -- old checkpoint -> current
 
@@ -139,7 +140,15 @@ ever consumes an already-materialized tree.
 **`derive.py`** — the depth-dial derivation rules, each with exactly one implementation:
 `mup_dims` (the muP depth/aspect-ratio/head-dim dial), `compute_window_sizes`, `compute_kv_slots`,
 `has_value_embed` (the old `has_ve`'s alternating-parity rule), `gpt_lambda_schedule` (the
-per-layer resid/x0-lambda init decay).
+per-layer resid/x0-lambda init decay), and `gpt_ffn_hidden`/`llama_ffn_hidden` (the FFN inner-width
+rules — `4 * n_embd`, and Llama's 2/3-of-4x rounded up to a multiple of 256). The FFN rules used to
+be hardcoded inside `modelcore`'s MLP classes; `modelcore.v2`'s `mlp` spec takes the resulting
+*number*, so the rule lives here.
+
+`compute_window_sizes` spells full attention **`-1`**, never `sequence_len`: `sequence_len` is only
+the maximum a model trains at, so a window equal to it would bake the training length into the
+architecture. A "short" window that the 128-token tile rounding pushes to `>= sequence_len` (any
+`sequence_len <= 128`) is full attention too, and is emitted as `-1`.
 
 **`presets.py`** — `expand(name, depth, **kwargs) -> ModelConfig` reproduces exactly what each of
 the four deleted native architecture classes' own `from_depth` + `__init__` used to build, as a
@@ -163,15 +172,17 @@ checkpoints" below for the details.
 ## Old checkpoints
 
 A `model_config` dict with no `"format"` key predates modelcore entirely — everything below
-applies; one that already has `"format": "modelcore.v1"` passes straight through
-`ModelConfig.from_dict` with no migration at all. `LegacyCheckpointStore` always routes through
+applies; one that already has a `"format"` (`"modelcore.v1"` or `"modelcore.v2"`) passes straight
+through `ModelConfig.from_dict` with no migration *here* — modelcore itself upgrades a v1 dict to v2
+on load (`modelcore.config.upgrade`), writing out everything v1 left implicit. `LegacyCheckpointStore` always routes through
 `legacy.migrate_checkpoint` first; it's a fast no-op for the current-format case.
 
 **Config**: missing `"arch"` defaults to `"gpt"` (the only architecture old enough to predate that
 key too); missing `"window_pattern"` defaults to `"L"`. Stage 6's `"composed"` architecture is
 already a materialized tree in exactly modelcore's shape (it predates modelcore only in name,
-stamping `"arch": "composed"` where modelcore stamps `"format"`) — `ModelConfig.from_dict` reads
-it directly, ignoring the leftover `"arch"` key it never looks at. Every other architecture is a
+stamping `"arch": "composed"` where modelcore stamps `"format"`) — `migrate_config` strips the
+leftover `"arch"` key and hands it to `ModelConfig.from_dict`. (modelcore.v2 rejects an unknown
+top-level key rather than silently dropping it, so the strip has to be explicit.) Every other architecture is a
 flat, per-layer-derivable config: `legacy.py` reconstructs the exact materialized tree from the
 checkpoint's own *stored* fields (`n_layer`, `n_head`, `n_kv_head`, `n_embd`, `window_pattern`,
 `kv_share_frac`) via the same `derive.py` helpers `presets.py` uses — not from `--depth`, so a run

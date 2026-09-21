@@ -1248,7 +1248,7 @@
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 3
    },
    {
@@ -1276,7 +1276,7 @@
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 5
    },
    {
@@ -1304,7 +1304,7 @@
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 128,
-    "window": 2048,
+    "window": -1,
     "kv_slot": 5
    }
   ],

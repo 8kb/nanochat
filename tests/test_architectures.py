@@ -12,10 +12,10 @@ import os
 import pytest
 import torch
 
-from modelcore import ModelManager
+from modelcore import ModelConfig, ModelManager
 from modelcore.model import Model
 
-from nanochat.architectures import legacy, presets
+from nanochat.architectures import derive, legacy, presets
 
 GOLDENS_DIR = os.path.join(os.path.dirname(__file__), "goldens")
 TINY_DIR = os.path.join(GOLDENS_DIR, "tiny")
@@ -99,7 +99,10 @@ def test_config_from_dict_matches_pre_refactor_composed_golden(manager, preset):
     proving modelcore's serialization round-trip reproduces the pre-Stage-7 composed-architecture
     path bit-for-bit, independent of nanochat's own depth-dial derivation layer."""
     golden = _load_composed_golden(preset)
-    config = manager.config_from_dict(golden["meta_model_config"])
+    # The golden's config is a Stage-6 "composed" dict: no "format" (read as v1 and upgraded by
+    # modelcore) and a leftover "arch" stamp modelcore.v2 would reject, which legacy.migrate_config
+    # strips -- the production path a composed checkpoint actually takes.
+    config = legacy.migrate_config(golden["meta_model_config"])
     _assert_matches_composed_golden(manager, config, golden)
 
     state = torch.load(os.path.join(TINY_DIR, f"tiny_composed_{preset}", "model_000000.pt"), map_location="cpu")
@@ -141,34 +144,95 @@ def test_expand_llama_kvshare_win_windows_match_compute_window_sizes():
     expected = compute_window_sizes(pattern, n_layer, seq_len)
     actual = [b.params["window"] for b in config.body.params["blocks"]]
     assert actual == expected
-    assert actual[-1] == seq_len  # final layer always forced to full context
+    assert actual[-1] == -1  # final layer always forced to full context (-1, never seq_len)
 
 
 # -----------------------------------------------------------------------------
+# modelcore.v2 materialization: everything modelcore used to default is stated by the preset layer
+
+@pytest.mark.parametrize("preset,kwargs", PRESET_CASES)
+def test_expand_states_every_choice_explicitly(manager, preset, kwargs):
+    config = presets.expand(preset, **kwargs)
+    d = config.to_dict()
+    assert d["format"] == "modelcore.v2" and d["template"] == "base" and d["pad_vocab_size_to"] == 64
+    assert d["shared"]["norm"] == {"#type": "rms_norm", "eps": None}
+    assert d["shared"]["rope"]["over_compute"] == 10
+    for block in d["body"]["blocks"]:
+        assert "mlp" in block and block["mlp"]["hidden_dim"] > 0
+        assert block["window"] == -1 or 0 < block["window"] < config.sequence_len  # never >= sequence_len
+    gpt_like = preset == "gpt"
+    mlp = d["body"]["blocks"][0]["mlp"]
+    if gpt_like:
+        assert mlp == {"#type": "mlp", "activation": "relu2", "hidden_dim": 4 * config.n_embd}
+    else:
+        assert mlp == {"#type": "gated_mlp", "activation": "silu", "hidden_dim": derive.llama_ffn_hidden(config.n_embd)}
+        assert all("kv_slot" in b and "produces_kv" in b for b in d["body"]["blocks"])
+
+
+def test_full_attention_is_minus_one_never_sequence_len():
+    """sequence_len is only the maximum trained at -- a window equal to it would bake the training
+    length into the architecture."""
+    config = presets.expand("llama", depth=4, aspect_ratio=16, head_dim=32, max_seq_len=512, vocab_size=128,
+                            window_pattern="L")
+    assert [b.params["window"] for b in config.body.params["blocks"]] == [-1] * 4
+    config = presets.expand("gpt", depth=4, aspect_ratio=16, head_dim=32, max_seq_len=2048, vocab_size=128,
+                            window_pattern="SSSL")
+    assert [b.params["window"] for b in config.body.params["blocks"]] == [512, 512, 512, -1]
+
+
+def test_ffn_width_rules_live_in_derive_not_modelcore():
+    assert derive.gpt_ffn_hidden(768) == 3072
+    assert derive.llama_ffn_hidden(768) == 2048            # int(2*4*768/3) = 2048, already a multiple of 256
+    assert derive.llama_ffn_hidden(64) == 256               # 170 -> rounded up to 256
+    assert derive.llama_ffn_hidden(640) == 1792             # 1706 -> 1792
+    assert derive.llama_ffn_hidden(640, multiple_of=128) == 1792
+
+
+def test_migrate_config_strips_the_stage6_arch_stamp_from_a_composed_dict():
+    """A "composed" checkpoint predates modelcore only in name: no "format", and an "arch" key
+    modelcore.v2 no longer silently drops. migrate_config must remove it before handing over."""
+    golden = _load_composed_golden("gpt")["meta_model_config"]
+    assert golden.get("arch") == "composed" and "format" not in golden
+    config = legacy.migrate_config(golden)
+    assert config.to_dict()["format"] == "modelcore.v2"
+    with pytest.raises(ValueError, match="unknown top-level key"):
+        ModelConfig.from_dict({**config.to_dict(), "arch": "composed"})  # what modelcore itself now says
+
+
 # derive.compute_window_sizes itself (moved from tests/test_modelcore_components.py at Stage 8 --
 # it's a depth-dial/window-pattern policy rule, not a modelcore component)
 
 def test_compute_window_sizes_full_context():
     from nanochat.architectures.derive import compute_window_sizes
     ws = compute_window_sizes("L", n_layer=4, sequence_len=512)
-    assert ws == [512] * 4
+    assert ws == [-1] * 4  # full context is -1, never sequence_len
 
 
 def test_compute_window_sizes_last_layer_always_full_context():
     from nanochat.architectures.derive import compute_window_sizes
     # Every layer requests a short window, but the final layer is always forced to full context.
     ws = compute_window_sizes("SS", n_layer=3, sequence_len=1024)
-    assert ws[0] < 1024 and ws[1] < 1024
-    assert ws[-1] == 1024
+    assert 0 < ws[0] < 1024 and 0 < ws[1] < 1024
+    assert ws[-1] == -1
 
 
 def test_compute_window_sizes_tiles_pattern_across_layers():
     from nanochat.architectures.derive import compute_window_sizes
     ws = compute_window_sizes("SL", n_layer=4, sequence_len=2048)
-    assert ws[0] < 2048  # S
-    assert ws[1] == 2048  # L
-    assert ws[2] < 2048  # S (pattern repeats)
-    assert ws[3] == 2048  # L, also forced as the last layer
+    assert ws[0] == 512  # S: a quarter of sequence_len
+    assert ws[1] == -1  # L
+    assert ws[2] == 512  # S (pattern repeats)
+    assert ws[3] == -1  # L, also forced as the last layer
+
+
+def test_compute_window_sizes_short_window_never_reaches_sequence_len():
+    """FA3's 128-token tile rounding would make "short" 128 wide -- at sequence_len <= 128 that is
+    the whole sequence, i.e. full attention, so it is spelled -1 like every other full window."""
+    from nanochat.architectures.derive import compute_window_sizes
+    assert compute_window_sizes("SL", n_layer=4, sequence_len=32) == [-1] * 4
+    assert compute_window_sizes("SL", n_layer=4, sequence_len=128) == [-1] * 4
+    assert compute_window_sizes("SL", n_layer=4, sequence_len=1024) == [256, -1, 256, -1]
+    assert compute_window_sizes("SL", n_layer=4, sequence_len=512) == [128, -1, 128, -1]
 
 
 def test_compute_window_sizes_invalid_chars_assert():
@@ -459,7 +523,7 @@ def test_migrate_optimizer_state_is_noop_for_non_gpt_arch():
 def test_migrate_optimizer_state_is_noop_for_current_format():
     n_layer = 4
     data = _old_optimizer_data(n_layer)
-    current_config = {"format": "modelcore.v1"}
+    current_config = {"format": "modelcore.v2"}
     migrated = legacy.migrate_optimizer_state(data, current_config, "gpt", n_layer)
     assert migrated is data
 

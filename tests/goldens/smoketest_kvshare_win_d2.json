@@ -253,10 +253,10 @@
   },
   "num_matmul_params": 4685824,
   "estimate_flops": 28508160,
-  "estimate_decode_flops_256": 9502720,
-  "estimate_prefill_flops_256": 2424373248,
+  "estimate_decode_flops_256": 9633792,
+  "estimate_prefill_flops_256": 2432827392,
   "kv_bytes_per_token": 1024,
-  "kv_read_bytes_256": 262144,
+  "kv_read_bytes_256": 524288,
   "kv_cache_spec": {
    "num_heads": 1,
    "head_dim": 128,
@@ -267,14 +267,14 @@
     "n_head": 1,
     "n_kv_head": 1,
     "head_dim": 128,
-    "window": 128,
+    "window": -1,
     "kv_slot": 0
    },
    {
     "n_head": 1,
     "n_kv_head": 1,
     "head_dim": 128,
-    "window": 128,
+    "window": -1,
     "kv_slot": 0
    }
   ],

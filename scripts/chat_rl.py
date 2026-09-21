@@ -345,7 +345,8 @@ for step in range(num_steps):
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.to_dict()
+        # RL trains in the chat format, so the checkpoint declares it (see chat_sft.py).
+        model_config_kwargs = dataclasses.replace(model.config, template="nanochat").to_dict()
         save_checkpoint(
             checkpoint_dir,
             step,

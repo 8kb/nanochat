@@ -903,42 +903,42 @@
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 0
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 1
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 2
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 3
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 4
    },
    {
     "n_head": 6,
     "n_kv_head": 6,
     "head_dim": 64,
-    "window": 512,
+    "window": -1,
     "kv_slot": 5
    }
   ],

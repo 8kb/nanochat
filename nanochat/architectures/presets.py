@@ -14,8 +14,27 @@ from modelcore import ComponentSpec, ModelConfig
 from modelcore import resolve_reference_config as _resolve_reference_config
 
 from nanochat.architectures.derive import (
-    compute_kv_slots, compute_window_sizes, gpt_lambda_schedule, has_value_embed, mup_dims,
+    compute_kv_slots, compute_window_sizes, gpt_ffn_hidden, gpt_lambda_schedule, has_value_embed,
+    llama_ffn_hidden, mup_dims,
 )
+
+# modelcore.v2 carries every value explicitly (no constructor defaults), so the choices modelcore
+# used to make silently are made here, once, at expansion time. Each is what the model was always
+# trained with -- changing one is a new architecture, not a refactor.
+PAD_VOCAB_SIZE_TO = 64
+ROTARY_OVER_COMPUTE = 10
+SOFTCAP = 15
+BACKOUT_LAMBDA_INIT = 0.2
+# The chat format is a property of SFT, not of the architecture, so every preset is "base"; an SFT
+# run stamps "nanochat" on the checkpoint it writes.
+TEMPLATE = "base"
+
+
+def _shared(head_dim):
+    """rope + the norm every block/embedding/unembedding shares. eps=None is F.rms_norm's own
+    default (the input dtype's machine epsilon) -- exactly what norm() always did."""
+    return {"rope": ComponentSpec("rotary", {"head_dim": head_dim, "over_compute": ROTARY_OVER_COMPUTE}),
+            "norm": ComponentSpec("rms_norm", {"eps": None})}
 
 
 def assemble_gpt(n_layer, n_head, n_kv_head, n_embd, head_dim, sequence_len, vocab_size, window_pattern,
@@ -31,13 +50,15 @@ def assemble_gpt(n_layer, n_head, n_kv_head, n_embd, head_dim, sequence_len, voc
             "layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "window": windows[i],
             "has_value_embed": has_value_embed(i, n_layer),
             "resid_lambda_init": resid_lambda_init, "x0_lambda_init": x0_lambda_init,
+            "mlp": ComponentSpec("mlp", {"activation": "relu2", "hidden_dim": gpt_ffn_hidden(n_embd)}),
         }))
     return ModelConfig(
-        sequence_len=sequence_len, vocab_size=vocab_size, n_embd=n_embd, reference=reference,
-        shared={"rope": ComponentSpec("rotary", {"head_dim": head_dim})},
+        sequence_len=sequence_len, vocab_size=vocab_size, n_embd=n_embd, pad_vocab_size_to=PAD_VOCAB_SIZE_TO,
+        template=TEMPLATE, reference=reference, shared=_shared(head_dim),
         input=ComponentSpec("token_embedding", {"smear": True}),
-        body=ComponentSpec("backout", {"backout_layer": n_layer // 2, "backout_lambda_init": 0.2, "blocks": blocks}),
-        output=ComponentSpec("lm_head", {"softcap": 15}),
+        body=ComponentSpec("backout", {"backout_layer": n_layer // 2, "backout_lambda_init": BACKOUT_LAMBDA_INIT,
+                                        "blocks": blocks}),
+        output=ComponentSpec("lm_head", {"softcap": SOFTCAP}),
     )
 
 
@@ -51,17 +72,18 @@ def assemble_plain(n_layer, n_head, n_kv_head, n_embd, head_dim, sequence_len, v
     kv_slots = compute_kv_slots(n_layer, kv_share_frac) if kv_share_frac is not None else None
     blocks = []
     for i in range(n_layer):
-        params = {"layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "window": windows[i]}
-        if kv_slots is not None:
-            params["kv_slot"] = kv_slots[i]
-            params["produces_kv"] = (kv_slots[i] == i)
+        # kv_slot=None means "own slot at my own layer index" (no sharing); stated, not defaulted.
+        params = {"layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "window": windows[i],
+                  "kv_slot": None if kv_slots is None else kv_slots[i],
+                  "produces_kv": True if kv_slots is None else (kv_slots[i] == i),
+                  "mlp": ComponentSpec("gated_mlp", {"activation": "silu", "hidden_dim": llama_ffn_hidden(n_embd)})}
         blocks.append(ComponentSpec("plain_block", params))
     return ModelConfig(
-        sequence_len=sequence_len, vocab_size=vocab_size, n_embd=n_embd, reference=reference,
-        shared={"rope": ComponentSpec("rotary", {"head_dim": head_dim})},
+        sequence_len=sequence_len, vocab_size=vocab_size, n_embd=n_embd, pad_vocab_size_to=PAD_VOCAB_SIZE_TO,
+        template=TEMPLATE, reference=reference, shared=_shared(head_dim),
         input=ComponentSpec("token_embedding", {"smear": False}),
         body=ComponentSpec("stack", {"blocks": blocks}),
-        output=ComponentSpec("lm_head", {"softcap": 15}),
+        output=ComponentSpec("lm_head", {"softcap": SOFTCAP}),
     )
 
 
