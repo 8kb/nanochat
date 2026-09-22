@@ -80,7 +80,9 @@ python -m scripts.data_prep --kind=sft --sequence-len=2048
 
 # run SFT and eval the model
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+# GSM8K/HumanEval decode one problem at a time by default; CHATEVAL_GEN_BATCH_SIZE=16 batches them
+# (same results at temperature 0, the default) -- this run is uncapped, so it is the one that gains
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft -B "${CHATEVAL_GEN_BATCH_SIZE:-1}"
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"

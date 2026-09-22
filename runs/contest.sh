@@ -34,6 +34,8 @@
 #                             own --depth/--target-flops, see docs/contest.md
 #   EXTRA_SFT_ARGS           appended (last) to every scripts.chat_sft invocation (e.g. to force a
 #                             short rehearsal SFT run via --num-iterations)
+#   CHATEVAL_GEN_BATCH_SIZE  problems per decode batch for GSM8K/HumanEval in chat_eval (default 1
+#                             = one at a time; see the comment where it is set)
 #   EXTRA_CHATEVAL_ARGS      appended (last) to every scripts.chat_eval invocation (e.g.
 #                             --max-problems to keep the local rehearsal fast, or --task-name to
 #                             skip the slower generative tasks)
@@ -78,12 +80,18 @@ EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 EXTRA_SFT_ARGS="${EXTRA_SFT_ARGS:-}"           # appended to every scripts.chat_sft invocation
 # chat_eval.py's --max-problems has no default cap (None = full test set) -- two of its five
 # tasks (GSM8K ~1319 problems, HumanEval ~164) are generative (one autoregressive sample per
-# problem, unbatched within a rank), so at full scale eval alone can badly dominate training cost
+# problem; one at a time within a rank unless CHATEVAL_GEN_BATCH_SIZE says otherwise, see below),
+# so at full scale eval alone can badly dominate training cost
 # for a small contest model: found the hard way when a single architecture's eval ran past 25
 # minutes still partway through GSM8K, well past base+SFT training combined. Capped by default;
 # set CHATEVAL_MAX_PROBLEMS="" (empty, not -1 -- chat_eval.py has no "uncapped" sentinel value,
 # and -1 would evaluate zero problems instead) for the true uncapped full-scale eval.
 CHATEVAL_MAX_PROBLEMS="${CHATEVAL_MAX_PROBLEMS-100}"
+# Problems per decode batch for the generative tasks (chat_eval.py -B). 1 = one at a time, the
+# original loop -- results recorded before batching existed stay reproducible. Larger decodes that
+# many different problems together: identical results at temperature 0 (the default), and the way
+# to make an uncapped CHATEVAL_MAX_PROBLEMS="" affordable. Rows per batch = this x --num-samples.
+CHATEVAL_GEN_BATCH_SIZE="${CHATEVAL_GEN_BATCH_SIZE:-1}"
 EXTRA_CHATEVAL_ARGS="${EXTRA_CHATEVAL_ARGS:-}" # appended (last) to every scripts.chat_eval invocation
 
 log() {
@@ -294,6 +302,7 @@ PYEOF
     MAX_PROBLEMS_ARG=()
     [ -n "$CHATEVAL_MAX_PROBLEMS" ] && MAX_PROBLEMS_ARG=(--max-problems="$CHATEVAL_MAX_PROBLEMS")
     launch_module scripts.chat_eval -i sft -g "$tag" \
+        -B "$CHATEVAL_GEN_BATCH_SIZE" \
         "${MAX_PROBLEMS_ARG[@]}" \
         $EXTRA_CHATEVAL_ARGS \
         2>&1 | tee "$eval_log_file"

@@ -27,7 +27,9 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
-    parser.add_argument('-b', '--batch-size', type=int, default=8, help='Batch size for categorical evaluation')
+    parser.add_argument('-b', '--batch-size', type=int, default=8, help='Problems per forward for categorical evaluation (ARC/MMLU) only')
+    parser.add_argument('-B', '--generative-batch-size', type=int, default=1, help='Problems per decode batch for generative evaluation (GSM8K/HumanEval); 1 = one at a time. Identical results at temperature 0.')
+    parser.add_argument('--eval-workers', type=int, default=1, help='Threads scoring a generative batch\'s completions (HumanEval runs each in a subprocess)')
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
@@ -51,6 +53,8 @@ if __name__ == "__main__":
         acc = manager.chat(
             task, model, tokenizer, generator=engine,
             batch_size=args.batch_size,
+            generative_batch_size=args.generative_batch_size,
+            eval_workers=args.eval_workers,
             num_samples=args.num_samples,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,

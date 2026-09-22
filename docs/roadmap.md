@@ -141,7 +141,8 @@ docs/contest.md's "Lessons from the first real cloud run" for the full list):
 - **`chat_eval` cost more than training.** Its `--max-problems` has no default cap, and two of its
   five tasks (GSM8K, HumanEval) are generative and unbatched — a single architecture's eval ran
   past 25 minutes, more than base+SFT training combined. Fixed with a default cap
-  (`CHATEVAL_MAX_PROBLEMS=100`) in the contest scripts. Separately, `chat_eval` already shards
+  (`CHATEVAL_MAX_PROBLEMS=100`) in the contest scripts — and, later, batched generation
+  (`CHATEVAL_GEN_BATCH_SIZE`, off by default; see docs/contest.md). Separately, `chat_eval` already shards
   across DDP ranks but was launched with plain `python`, wasting 3 of 4 billed GPUs on that step —
   now runs through the same `launch_module` (`torchrun`) helper as `base_train`/`chat_sft`.
 

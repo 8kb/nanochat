@@ -9,25 +9,28 @@ locally in the checkpoint directory. This page is the runbook for the piece that
 renting the GPUs. **Nothing in this repo does that automatically** — provisioning a pod is a
 manual step you take deliberately.
 
-A persistent Network Volume now exists and is pre-staged (see "Attaching the persistent volume"
-below): `3w7toelc6z` ("nanochat-contest-archive"), 50GB Standard tier, **US-KS-2**, holding all
-101 data shards, the tokenizer, the CORE eval bundle, and a full `.venv` (`uv sync --extra gpu`
-already run). A pod that mounts it at `/workspace` skips setup almost entirely. The rest of this
-doc still also describes the plain single-ephemeral-pod workflow (no volume) for a one-off run
-that doesn't want persistent infra, or for GPU types in a different data center than the volume
-(see the DC-mismatch note below).
+**The three network volumes this doc's stages used (`3w7toelc6z` US-KS-2, `w6ndh50xcl` US-GA-2,
+`bc65qw4x8u` EU-NL-1) were drained and deleted on 2026-09-20** to stop $0.35/day of idle storage
+billing. Their checkpoints, results, logs, `wandb/` runs and `nanochat/` checkouts are archived,
+checksum-verified, under `~/runpod-archive/` (see its `MANIFEST.md`); optimizer shards
+(`optim_*`), datasets, `.venv`s and the tokenizer were deliberately not kept. Volume IDs and
+"already staged" claims below (and in the stage write-ups) are historical — a new run starts from
+a fresh volume or the plain single-ephemeral-pod workflow. "Attaching the persistent volume" below
+remains the recipe for a volume you create again: a pod that mounts a pre-staged volume at
+`/workspace` skips setup almost entirely.
 
 Do not skip the dry run in step 3. It costs nothing and tells you exactly what you're about to
 spend before a single GPU-second runs.
 
-## 0. Authenticate `runpodctl` (only needed for attaching an existing network volume)
+## 0. Authenticate `runpodctl` (optional — MCP `create-pod` can attach a volume too)
 
 The RunPod MCP tools (used for everything else in this doc — creating pods, checking GPU stock,
-creating/deleting network volumes) work via OAuth with no key on disk. But attaching an
-*existing* network volume to a new pod isn't exposed by the MCP `create-pod` tool (as of this doc
-— it only supports creating a fresh pod-local volume disk, not referencing a volume ID; the
-underlying RunPod v2 API does support this via `mounts.network[0]`, so it's a gap in the MCP tool
-specifically). That one operation needs `runpodctl` instead, which needs a real
+creating/deleting network volumes) work via OAuth with no key on disk. **Update (2026-09-20):**
+MCP `create-pod` *can* now attach an existing network volume, via
+`mounts: {network: [{volumeId, path}]}` in the body (verified live on CPU relay pods that drained
+the volumes above) — earlier versions of this doc said it couldn't, and that was a gap in an older
+MCP tool build. `runpodctl` (below) is still a working alternative and is what the stage write-ups
+used. It needs a real
 `RUNPOD_API_KEY` — get one at console.runpod.io/user/settings → API Keys, scoped to Pod
 create/get/terminate only (no serverless/templates/registries/billing/secrets/network-volume
 endpoints needed).
@@ -1032,6 +1035,15 @@ rather than scattered across commit messages.
   trap: **`-1` is not an "uncapped" sentinel** — `chat_eval.py` has no such value, and `-1` evaluates
   *zero* problems (`min(len(task), -1)`); the true uncapped form is `CHATEVAL_MAX_PROBLEMS=""`
   (empty string), which omits the flag entirely.
+  **Since then**: the generative tasks can decode *different* problems together —
+  `CHATEVAL_GEN_BATCH_SIZE=16` (default 1 = the original one-at-a-time loop, so recorded ChatCORE
+  numbers stay reproducible) passes `chat_eval -B 16`. Identical results at temperature 0, the
+  default; verified token-for-token against a real d12 SFT checkpoint. It is what makes an uncapped
+  `CHATEVAL_MAX_PROBLEMS=""` affordable, and the cap was itself costing resolution: at n=100 the
+  standard error on ARC-Easy's 47% is ~5pp and GSM8K sits at 0-2%. Rows per batch =
+  `CHATEVAL_GEN_BATCH_SIZE` x `--num-samples`. Speedup on a GPU is unmeasured as of this writing
+  (the check ran on CPU, where decode is not launch-bound) — measure `-B 1` vs `-B 8/16/32` on the
+  next pod before picking a default.
 - **`chat_eval` was also wasting 3 of 4 billed GPUs.** It already shards problems across ranks and
   `all_reduce`s the aggregate (`scripts/chat_eval.py`), but `runs/contest.sh`/`contest_d12.sh` were
   launching it with plain `python` instead of `torchrun` — using 1 of however many GPUs the pod was
@@ -1213,3 +1225,111 @@ specifically excluding validation, CORE eval, sampling, and checkpoint saves. Bo
 values are netto training time, not wall clock — there is no recorded pod wall-clock time for
 either stage. The column headers above (Stage 11's own table) say `tok/sec`/`MFU` rather than
 repeat the ambiguous label.
+
+## Stage 12: first real PEFT (LoRA) run — reused Stage 5's base, full-SFT baseline, LoRA left incomplete
+
+First real-GPU test of the LoRA/DoRA support added to `modelcore`/`nanochat` this session
+(`modelcore` tagged `v0.3.0`; see that repo's own release notes and this repo's `docs/roadmap.md`
+Stage 16). Goal: a `d13`-Chinchilla-ratio base checkpoint plus an ordinary full-fine-tune SFT
+checkpoint from it (the reference), then a LoRA SFT run off the same base for comparison — with
+`--eval-tokens=1,048,576` and a new `--fp8-eval` flag (val-bpb measured directly in fp8 instead of
+converting back to bf16 first) on both.
+
+**Reused Stage 5's base checkpoint rather than retraining** — checked the `nanochat-contest-archive-h100`
+volume (`w6ndh50xcl`) first, per the plan's own pre-spend-gate discipline, and it was still there:
+`contest_fp8d13_chinchilla` (`llama_kvshare_win`, depth 13, `--target-param-data-ratio=20`, `--fp8`,
+step 5573, val bpb 0.833913, CORE 0.1597 — exactly Stage 5's own recorded numbers). Confirms a
+network volume really does outlive the pod that wrote to it, as documented. As Stage 5 itself notes
+("no SFT, no chat_eval"), no SFT checkpoint existed yet, so the ordinary full-fine-tune baseline
+still had to be trained for real.
+
+**Infra**: 2x H100 SXM (Stage 5-7's own GPU) had **zero stock in US-GA-2** — confirmed live via
+`get-gpu-type`, matching Stage 10's identical finding for this same datacenter. **2x H100 NVL**
+(94GB, same volume, no data movement) had stock per the catalog, but both create attempts for
+`gpuCount=2` failed outright ("no longer any instances available") with no pod created (free
+probes); `gpuCount=1` succeeded. Ran the whole stage on **1x H100 NVL**, a real, acknowledged
+deviation from "same as base train" — noted here rather than glossed over, since every dollar/time
+estimate below is a 1-GPU number, not directly comparable to Stage 5-7's 2-GPU ones.
+
+**A real bug found and worked around, not yet fixed**: the base checkpoint's optimizer state was
+saved sharded (ZeRO-2 style) under Stage 5's real `world_size=2` run. Loading it via
+`--load-optimizer`'s default warm-start at this session's `world_size=1` crashed inside
+`adamw_step_fused`'s `lerp_` — a half-sized saved shard (`(16384, 896)`, sharded for 2 ranks) loaded
+into a full-sized expected tensor (`(32768, 896)`, unsharded for 1 rank). `modelcore`'s `MuonAdamW`
+has no world-size-aware resharding on load. Worked around with `--load-optimizer=0` for every run
+this stage; the underlying gap is real and affects any checkpoint resumed at a different GPU count
+than it was saved at, independent of PEFT. Filed as a real "next step," not this stage's job to fix.
+
+**Also found**: the volume's existing prepared SFT dataset (`sft_t2048_e348819205de14ab`, from the
+Stage 6 era) predates the `token_bytes` artifact `evaluate_bpb` now requires unconditionally —
+`chat_sft.py` refused to start. Re-prepared it fresh with the current `data_prep.py`: 789,759
+conversations → 237,453 train / 9,792 val sequences, matching the historical reference count
+exactly (content-deterministic re-prep, same as every prior one in this doc).
+
+**Baseline SFT** (`contest_fp8d13_chinchilla_sft`, `--device-batch-size=64`, `--load-optimizer=0`,
+**bf16, not fp8** — see the correction below): 1 epoch, 927 steps, 34.59 min, peak mem 59.24GB/95.8GB.
+
+| step | 0 | 200 | 400 | 600 | 800 | 927 (final) |
+|---|---|---|---|---|---|---|
+| val bpb | 0.5913 | 0.4351 | 0.4261 | 0.4031 | 0.3770 | **0.3674** |
+
+**Correction, made mid-run, not swept under the rug**: this baseline was launched in bf16. The
+original request's "fp8 is enable by default" was meant to apply to training broadly, not just to
+the new `--fp8-eval` flag's own default value — a scoping mistake caught only after this run had
+already made real progress, at which point restarting would have wasted it for no benefit. Left it
+bf16 and moved on; **the LoRA run below does use `--fp8`**, as always intended.
+
+**LoRA run** (`contest_fp8d13_chinchilla_lora4ep`): `r=16, alpha=32`, `--fp8`, targeting `attn.c_q`
+and `attn.c_proj` on all 13 layers (26 adapters) — **not** the originally-planned `c_q/c_k/c_v/c_proj`:
+this architecture's cross-layer KV sharing means 9 of its 13 layers have `produces_kv=False` and
+carry no `c_k`/`c_v` Linear at all; `expand_adapters` correctly raised rather than silently
+skipping them, and the target list was narrowed to the two projections present on every layer.
+`--load-optimizer` is forced off automatically whenever `--adapters` is given, so the world-size
+bug above didn't need a manual workaround here.
+
+**Batch-size calibration, live, before committing to the full run** — the point of doing this at
+all: `--device-batch-size=64` (fp8+LoRA) used **78.3GB/95.8GB (82%)**, more than the bf16
+full-finetune baseline's 59.24GB at the same batch size. `--device-batch-size=80` OOM'd
+outright (`Tried to allocate 5.00 GiB ... 4.50 GiB is free`). Kept 64. The reason, worth stating
+plainly since it cuts against the naive expectation: **fp8 itself has real memory overhead**
+(quantized backward-pass copies held alongside full-precision master weights) that ate most of
+what LoRA's much-smaller optimizer state would otherwise have freed, on a model this size (146.1M
+scaling params — Stage 5's own figure). At matched batch size, fp8+LoRA ran **faster per step**
+than the bf16 baseline (~1.8s/step, ~295,000 tok/sec, ~38% MFU vs. baseline's ~2.2s/step, ~235,000
+tok/sec, ~30% MFU) — but that ~25% gap is mostly attributable to fp8's faster matmuls, not to LoRA:
+LoRA doesn't reduce backward FLOPs through the frozen backbone (gradients must still flow through
+every frozen layer to reach the adapters and earlier layers), only the optimizer *update* cost for
+frozen params, which is cheap regardless of model size. **On a model this small, LoRA's real,
+unambiguous advantage right now is disk/deployment size (one shared frozen base + many
+megabytes-not-hundreds-of-MB adapters), not training speed or memory** — see the open TODO item on
+memory below; the compute/memory case for LoRA gets stronger as model size grows, which this
+146M-param model doesn't exercise.
+
+Planned for `--num-iterations=3708` (4 epochs of 237,453 sequences at 256 sequences/optimizer-step,
+`--eval-tokens=1048576`). **Stopped by request at step ~940/3708 (~25%, epoch 1.01 of 4) — not
+saved.** `chat_sft.py` only writes a checkpoint at `last_step`, so no LoRA artifact exists from this
+stage; a rerun starts over, it cannot resume from step 940. At matched step counts, the LoRA run
+trailed the full-finetune baseline's val bpb trajectory clearly (LoRA fp8-eval: 0.5983 @ step 0,
+0.4690 @ 400, 0.4569 @ 800; baseline bf16-eval at the same step numbers: 0.5913, 0.4261, 0.3770) —
+expected, given 26 rank-16 adapters have far less capacity per step than updating all ~146M params;
+the open question this run was meant to answer — whether the 4x token budget lets LoRA close some
+or all of that gap by its own step 3708 — was never reached.
+
+ChatCORE was deliberately left off (`--chatcore-every=-1`) for every run this stage — decided to
+add it as a separate pass later, once/if the LoRA run is actually completed, rather than pre-commit
+to it; if it is added, cap `--chatcore-max-sample`/`--chatcore-max-cat` well below their defaults,
+since GSM8K/HumanEval are the single most expensive part of any eval pass for a model this
+undertrained (per Stage 9's "chat_eval cost more than training" lesson) and score ~0% regardless of
+sample count at this scale.
+
+**No checkpoints pulled home** — by request, this stage only needed numbers, not the trained
+weights; everything stays on the volume, already durable there independent of the pod.
+
+**Cost**: ~$5, estimated from pod wall-clock uptime (RunPod's billing API lags real-time, so this
+is the same "approximate on the high side" caveat as every other stage's number) — ~93 minutes on
+1x H100 NVL SECURE ($3.19/hr) plus a few cents of CPU-pod inventory time, no result-pulling pod
+needed this time.
+
+**Open, for discussion, not decided here**: options to cut fp8+LoRA's memory footprint back down
+below the bf16 full-finetune baseline's, so a meaningfully larger batch size (the thing that was
+supposed to be LoRA's edge) actually becomes reachable — see `TODO.md`.

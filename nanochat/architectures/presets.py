@@ -47,7 +47,7 @@ def assemble_gpt(n_layer, n_head, n_kv_head, n_embd, head_dim, sequence_len, voc
     for i in range(n_layer):
         resid_lambda_init, x0_lambda_init = gpt_lambda_schedule(i, n_layer)
         blocks.append(ComponentSpec("gpt_block", {
-            "layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "window": windows[i],
+            "layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "head_dim": head_dim, "window": windows[i],
             "has_value_embed": has_value_embed(i, n_layer),
             "resid_lambda_init": resid_lambda_init, "x0_lambda_init": x0_lambda_init,
             "mlp": ComponentSpec("mlp", {"activation": "relu2", "hidden_dim": gpt_ffn_hidden(n_embd)}),
@@ -73,7 +73,7 @@ def assemble_plain(n_layer, n_head, n_kv_head, n_embd, head_dim, sequence_len, v
     blocks = []
     for i in range(n_layer):
         # kv_slot=None means "own slot at my own layer index" (no sharing); stated, not defaulted.
-        params = {"layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "window": windows[i],
+        params = {"layer_idx": i, "n_head": n_head, "n_kv_head": n_kv_head, "head_dim": head_dim, "window": windows[i],
                   "kv_slot": None if kv_slots is None else kv_slots[i],
                   "produces_kv": True if kv_slots is None else (kv_slots[i] == i),
                   "mlp": ComponentSpec("gated_mlp", {"activation": "silu", "hidden_dim": llama_ffn_hidden(n_embd)})}
