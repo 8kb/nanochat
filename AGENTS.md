@@ -15,6 +15,8 @@ app consumes `ModelManager`, and [docs/upstream-sync.md](docs/upstream-sync.md) 
 anything that used to live in `nanochat/gpt.py` (now deleted — see that doc's "Stage 7" section
 for where its code lives today).
 
+All code, comments, docs, commit messages, and any other text committed to git MUST be in English.
+
 `modelcore`, `datacore`, and `benchcore` are separate repositories
 ([8kb/modelcore](https://github.com/8kb/modelcore), [8kb/datacore](https://github.com/8kb/datacore),
 [8kb/benchcore](https://github.com/8kb/benchcore) — Stage 10 and Stage 15, see docs/roadmap.md),
