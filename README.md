@@ -1,3 +1,9 @@
+> **Archived.** Superseded by [tinylab](https://github.com/8kb/tinylab); everything still live was
+> ported there (depth-dial config generation, `tinylab info`, the `rl` op and the `bpb`/`sample`/
+> `infer`/`tokenizer` bench suites). The record of this repo (roadmap stages 1-16, contest results,
+> lessons) is condensed in `llmllab/docs/history.md` of the llmllab family checkout; the full logs
+> stay here under `docs/`. No further changes will be made.
+
 # nanochat (architecture playground fork)
 
 ![nanochat logo](dev/nanochat.png)
